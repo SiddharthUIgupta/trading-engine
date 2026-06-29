@@ -358,7 +358,15 @@ class TradingRuntime:
 
     def _scan_and_trade_options_orb(self, candidates: list[str], today: date, equity: float) -> None:
         signals_found = 0
+        max_opts = self._settings.max_open_options_positions
         for ticker in candidates:
+            open_opts = len([p for p in self._state_store.get_option_positions() if p.get("quantity", 0) > 0])
+            if open_opts >= max_opts:
+                logger.info(
+                    "Options scan: %d/%d option positions open — at cap, skipping remaining candidates",
+                    open_opts, max_opts,
+                )
+                break
             self._scanned_options_tickers_today.add(ticker)
             try:
                 intraday = self._data_client.get_price_history(ticker, start_date=today, end_date=today, interval="5m")

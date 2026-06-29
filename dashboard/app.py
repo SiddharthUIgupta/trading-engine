@@ -134,30 +134,57 @@ def _run_adhoc_analysis(ticker: str, settings, store: StateStore):
 
 st.title("trading-engine")
 
-# Sidebar refresh — always visible regardless of scroll position, orange color
+# Hidden Streamlit button — the floating HTML button triggers this via JS
+if st.button("↻", key="__float_refresh__"):
+    st.rerun()
+
+# Floating orange button (genuine position:fixed — not a sidebar)
 st.markdown(
     """
     <style>
-    /* Target the sidebar refresh button specifically */
-    [data-testid="stSidebar"] [data-testid="stButton"] button {
-        background-color: #f97316 !important;
-        color: white !important;
-        border: none !important;
-        font-weight: 600 !important;
-        width: 100% !important;
+    /* Collapse the hidden trigger so it takes no visual space */
+    div[data-testid="stButton"]:has(button p:empty),
+    div[data-testid="stButton"]:has(button:empty) {
+        height: 0 !important;
+        overflow: hidden !important;
+        margin: 0 !important;
     }
-    [data-testid="stSidebar"] [data-testid="stButton"] button:hover {
-        background-color: #ea6c0a !important;
-        border: none !important;
+    /* Floating button */
+    #__floating_refresh__ {
+        position: fixed;
+        bottom: 1.75rem;
+        right: 1.75rem;
+        z-index: 99999;
+        background: #f97316;
+        color: white;
+        border: none;
+        border-radius: 2rem;
+        padding: 0.65rem 1.35rem;
+        font-size: 0.95rem;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 4px 14px rgba(249, 115, 22, 0.45);
+        transition: background 0.15s ease, transform 0.1s ease;
+    }
+    #__floating_refresh__:hover {
+        background: #ea6c0a;
+        transform: scale(1.04);
     }
     </style>
+    <button id="__floating_refresh__" onclick="
+    (function() {
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].innerText.trim() === '↻') {
+                btns[i].click();
+                return;
+            }
+        }
+    })();
+    ">↻ Refresh</button>
     """,
     unsafe_allow_html=True,
 )
-with st.sidebar:
-    if st.button("Refresh", key="refresh_sidebar"):
-        st.rerun()
-    st.caption("Click to reload data")
 
 settings = _settings()
 store = _store()

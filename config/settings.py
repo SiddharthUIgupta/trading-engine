@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     # Hard cap on concurrent equity positions. Prevents the scan from exhausting
     # buying power by placing limit orders on every ORB signal in one cycle.
     max_open_equity_positions: int = Field(default=15, alias="MAX_OPEN_EQUITY_POSITIONS")
+    # Hard cap on concurrent options positions (directional calls/puts from the
+    # options ORB track). Without this the track accumulates 30+ positions all
+    # paying theta simultaneously, which bleeds premium on every tick.
+    max_open_options_positions: int = Field(default=8, alias="MAX_OPEN_OPTIONS_POSITIONS")
 
     # --- Low-float momentum scanner (deterministic, no LLM) ---
     # The user's 7-criteria spec — all seven are conjunctive (a candidate
