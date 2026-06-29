@@ -21,11 +21,12 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 from anthropic import Anthropic
 
-from analyst_layer import lesson_store, momentum_scanner, options_structurer, orb_scanner, prefilter, thesis_scanner, universe, vol_analytics, vol_universe
+from analyst_layer import agent_scorer, lesson_store, momentum_scanner, options_structurer, orb_scanner, prefilter, thesis_scanner, universe, vol_analytics, vol_universe
 from analyst_layer.correlation import apply_correlation_adjustment, check_portfolio_correlation
 from analyst_layer.kelly import kelly_fraction_from_pnl_history
 from analyst_layer.market_regime import DailyRegime, assess_daily_regime
@@ -99,6 +100,10 @@ class TradingRuntime:
         # each track checks this before running — capability flags gate infrastructure
         # availability, regime gates whether today's conditions suit the strategy.
         self._daily_regime: DailyRegime | None = None
+        # 60-day daily closes per ticker, reset each pre-market scan. Prevents
+        # redundant data-layer calls when the same ticker appears in both the
+        # correlation guard and the consensus loop, or across multiple candidates.
+        self._price_cache: dict[str, list[float]] = {}
 
     def _assess_market_regime(self, today: date) -> DailyRegime | None:
         """Fetch SPY and VIX daily bars and run the zero-LLM regime assessment.
@@ -175,6 +180,7 @@ class TradingRuntime:
         self._executed_tickers_today.clear()
         self._scanned_options_tickers_today.clear()
         self._scanned_vol_tickers_today.clear()
+        self._price_cache.clear()
 
         self._daily_regime = self._assess_market_regime(today)
 
@@ -464,6 +470,20 @@ class TradingRuntime:
         )
         return capped
 
+    def _get_daily_closes(self, ticker: str, today: date) -> list[float] | None:
+        """Fetch 60-day daily closes, using the session cache to avoid duplicate requests."""
+        if ticker in self._price_cache:
+            return self._price_cache[ticker]
+        try:
+            series = self._data_client.get_price_history(
+                ticker, start_date=today - timedelta(days=60), end_date=today
+            )
+            closes = [b.close for b in series.bars]
+            self._price_cache[ticker] = closes
+            return closes
+        except DataLayerError:
+            return None
+
     def _scan_and_run_consensus(
         self, candidates: list[str], today: date, equity: float, strategy: str = "momentum"
     ) -> None:
@@ -481,22 +501,29 @@ class TradingRuntime:
                 logger.error("Skipping %s: %s", ticker, exc)
                 continue
 
-            self._pending_regimes[ticker] = prefilter.compute_regime(
+            regime = prefilter.compute_regime(
                 [bar.close for bar in price_series.bars],
                 self._settings.filter_sma_short_window,
                 self._settings.filter_sma_long_window,
             )
+            self._pending_regimes[ticker] = regime
             logger.info("%s: cleared screening — running consensus", ticker)
 
-            # Retrieve relevant lessons from past trades in similar setups and
-            # inject into agent prompts so the system learns from experience.
+            # Cache this ticker's closes for correlation check + future reuse
+            proposed_closes = [b.close for b in price_series.bars]
+            self._price_cache[ticker] = proposed_closes
+
+            # Retrieve relevant lessons; prepend agent accuracy track record
             setup_tags = lesson_store.derive_setup_tags(price_series, strategy)
             relevant_lessons = lesson_store.get_relevant_lessons(
                 self._state_store, strategy, setup_tags
             )
-            lessons_text = lesson_store.format_for_prompt(relevant_lessons)
             if relevant_lessons:
                 logger.debug("%s: injecting %d past lessons into consensus", ticker, len(relevant_lessons))
+
+            accuracy_rows = self._state_store.get_agent_accuracy(strategy, regime)
+            accuracy_context = agent_scorer.format_accuracy_context(accuracy_rows)
+            lessons_text = accuracy_context + lesson_store.format_for_prompt(relevant_lessons)
 
             existing_shares = self._broker.get_position_shares(ticker)
 
@@ -506,23 +533,27 @@ class TradingRuntime:
                 pnl_history, self._settings.max_position_size_pct
             )
 
-            # ── Correlation guard ─────────────────────────────────────────────
-            # Fetch price histories of currently held positions to check
-            # whether the proposed ticker duplicates existing exposure.
-            held_positions = self._state_store.get_positions()
+            # ── Correlation guard (parallel fetches, session cache) ───────────
+            active_held = [
+                pos["ticker"] for pos in self._state_store.get_positions()
+                if pos["ticker"] != ticker and pos.get("quantity", 0) > 0
+            ]
             held_closes: dict[str, list[float]] = {}
-            proposed_closes = [b.close for b in price_series.bars]
-            for pos in held_positions:
-                held_ticker = pos["ticker"]
-                if held_ticker == ticker or pos.get("quantity", 0) == 0:
-                    continue
-                try:
-                    held_series = self._data_client.get_price_history(
-                        held_ticker, start_date=today - timedelta(days=60), end_date=today
-                    )
-                    held_closes[held_ticker] = [b.close for b in held_series.bars]
-                except DataLayerError:
-                    pass  # skip if history unavailable — correlation check is best-effort
+            if active_held:
+                def _fetch(ht: str) -> tuple[str, list[float]]:
+                    closes = self._get_daily_closes(ht, today)
+                    if closes is None:
+                        raise DataLayerError(f"no closes for {ht}")
+                    return ht, closes
+
+                with ThreadPoolExecutor(max_workers=min(4, len(active_held))) as pool:
+                    futures = {pool.submit(_fetch, ht): ht for ht in active_held}
+                    for fut in as_completed(futures):
+                        try:
+                            ht, closes = fut.result()
+                            held_closes[ht] = closes
+                        except Exception:
+                            pass  # correlation check is best-effort
 
             max_corr, corr_desc = check_portfolio_correlation(proposed_closes, held_closes)
             kelly_fraction, corr_reason, corr_blocked = apply_correlation_adjustment(
@@ -554,6 +585,27 @@ class TradingRuntime:
                 usage_callback=self._record_usage,
                 lessons=lessons_text,
             )
+
+            # Record signal log so agent accuracy can be scored after the trade closes
+            self._state_store.record_agent_signal_log(
+                ticker=ticker,
+                track=strategy,
+                regime=regime,
+                proposed_action=payload.proposal.action.value,
+                signals=[
+                    {
+                        "agent_name": s.agent_name,
+                        "stance": s.stance.value,
+                        "confidence": s.confidence.value,
+                    }
+                    for s in payload.signals
+                ],
+            )
+            # Record which lessons were active so their scores update after close
+            for lesson in relevant_lessons:
+                if "id" in lesson:
+                    self._state_store.record_lesson_injection(lesson["id"], ticker, strategy)
+
             self._pending_payloads[ticker] = payload
             self._state_store.record_run(payload)
             logger.info(
@@ -1698,6 +1750,10 @@ class TradingRuntime:
                 root_cause=reflection.root_cause,
                 outcome_was_noise=reflection.outcome_was_noise,
             )
+
+            # Score agent signals and lesson injections based on this trade's outcome
+            self._state_store.score_agent_signals(ticker, pnl)
+            self._state_store.score_lesson_injections(ticker, pnl)
 
             if not reflection.outcome_was_noise:
                 for lesson_out in reflection.lessons:

@@ -98,12 +98,15 @@ def get_relevant_lessons(
 
     scored: list[tuple[int, dict]] = []
     for lesson in all_lessons:
+        if lesson.get("score", 1.0) < 0.3:
+            continue  # retired lesson — consistently correlated with losses
         lesson_tags = set(json.loads(lesson.get("setup_tags_json", "[]")))
         overlap = len(lesson_tags & current_tags)
         if overlap > 0:
             scored.append((overlap, lesson))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # Within same overlap tier, higher-scored lessons rank first
+    scored.sort(key=lambda x: (x[0], x[1].get("score", 1.0)), reverse=True)
     return [lesson for _, lesson in scored[:limit]]
 
 
@@ -118,6 +121,8 @@ def format_for_prompt(lessons: list[dict]) -> str:
     for i, lesson in enumerate(lessons, 1):
         date_str = lesson.get("created_at", "")[:10]
         win_loss = "WIN" if lesson.get("outcome_was_win") else "LOSS"
-        lines.append(f"{i}. ({date_str}, {win_loss}) {lesson['lesson']}")
+        score = lesson.get("score", 1.0)
+        score_str = f" score={score:.1f}" if score != 1.0 else ""
+        lines.append(f"{i}. ({date_str}, {win_loss}{score_str}) {lesson['lesson']}")
     lines.append("")
     return "\n".join(lines)

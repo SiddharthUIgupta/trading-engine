@@ -115,6 +115,34 @@ CREATE TABLE IF NOT EXISTS trade_reflections (
     outcome_was_noise INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_signal_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    track TEXT NOT NULL,
+    regime TEXT NOT NULL DEFAULT 'neutral',
+    proposed_action TEXT NOT NULL,
+    outcome TEXT,
+    outcome_pnl REAL,
+    scored_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_signal_detail (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id INTEGER NOT NULL REFERENCES agent_signal_log(id),
+    agent_name TEXT NOT NULL,
+    stance TEXT NOT NULL,
+    confidence TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lesson_injection_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id INTEGER NOT NULL REFERENCES agent_lessons(id),
+    ticker TEXT NOT NULL,
+    track TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -164,6 +192,9 @@ class StateStore:
             option_cols = {row[1] for row in conn.execute("PRAGMA table_info(option_positions)")}
             if "strategy" not in option_cols:
                 conn.execute("ALTER TABLE option_positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'orb_options'")
+            lesson_cols = {row[1] for row in conn.execute("PRAGMA table_info(agent_lessons)")}
+            if "score" not in lesson_cols:
+                conn.execute("ALTER TABLE agent_lessons ADD COLUMN score REAL NOT NULL DEFAULT 1.0")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -566,12 +597,13 @@ class StateStore:
         strategy: str,
         outcome_was_win: bool,
         source_pnl: float,
-    ) -> None:
+    ) -> int:
+        """Returns the inserted lesson id for injection tracking."""
         with closing(self._connect()) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO agent_lessons "
-                "(lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, score, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 1.0, ?)",
                 (
                     lesson,
                     json.dumps(setup_tags),
@@ -581,31 +613,37 @@ class StateStore:
                     datetime.utcnow().isoformat(),
                 ),
             )
+            lesson_id = cursor.lastrowid
             conn.commit()
+        return lesson_id
 
     def get_lessons(self, strategy: str | None = None, limit: int = 200) -> list[dict]:
         with closing(self._connect()) as conn:
             if strategy:
                 cursor = conn.execute(
-                    "SELECT lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, created_at "
+                    "SELECT id, lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, "
+                    "COALESCE(score, 1.0), created_at "
                     "FROM agent_lessons WHERE strategy = ? ORDER BY id DESC LIMIT ?",
                     (strategy, limit),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, created_at "
+                    "SELECT id, lesson, setup_tags_json, strategy, outcome_was_win, source_pnl, "
+                    "COALESCE(score, 1.0), created_at "
                     "FROM agent_lessons ORDER BY id DESC LIMIT ?",
                     (limit,),
                 )
             rows = cursor.fetchall()
         return [
             {
-                "lesson": r[0],
-                "setup_tags_json": r[1],
-                "strategy": r[2],
-                "outcome_was_win": bool(r[3]),
-                "source_pnl": r[4],
-                "created_at": r[5],
+                "id": r[0],
+                "lesson": r[1],
+                "setup_tags_json": r[2],
+                "strategy": r[3],
+                "outcome_was_win": bool(r[4]),
+                "source_pnl": r[5],
+                "score": r[6],
+                "created_at": r[7],
             }
             for r in rows
         ]
@@ -633,5 +671,98 @@ class StateStore:
                     int(outcome_was_noise),
                     datetime.utcnow().isoformat(),
                 ),
+            )
+            conn.commit()
+
+    # ── Agent performance tracking ────────────────────────────────────────────
+
+    def record_agent_signal_log(
+        self, ticker: str, track: str, regime: str, proposed_action: str, signals: list[dict]
+    ) -> int:
+        """Persist signals at consensus time for later scoring. Returns log_id."""
+        now = datetime.utcnow().isoformat()
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "INSERT INTO agent_signal_log (ticker, track, regime, proposed_action, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ticker, track, regime, proposed_action, now),
+            )
+            log_id = cursor.lastrowid
+            for s in signals:
+                conn.execute(
+                    "INSERT INTO agent_signal_detail (log_id, agent_name, stance, confidence) "
+                    "VALUES (?, ?, ?, ?)",
+                    (log_id, s.get("agent_name", "unknown"), s.get("stance", "HOLD"), s.get("confidence", "low")),
+                )
+            conn.commit()
+        return log_id
+
+    def score_agent_signals(self, ticker: str, pnl: float) -> None:
+        """Mark all unscored signal logs for this ticker with the realized outcome."""
+        outcome = "win" if pnl > 0 else "loss"
+        now = datetime.utcnow().isoformat()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE agent_signal_log SET outcome=?, outcome_pnl=?, scored_at=? "
+                "WHERE ticker=? AND outcome IS NULL",
+                (outcome, pnl, now, ticker),
+            )
+            conn.commit()
+
+    def get_agent_accuracy(self, track: str, regime: str) -> list[tuple[str, int, int]]:
+        """Return (agent_name, total_scored, wins) for the given track + regime."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT d.agent_name,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN l.outcome='win' THEN 1 ELSE 0 END) AS wins
+                FROM agent_signal_detail d
+                JOIN agent_signal_log l ON l.id = d.log_id
+                WHERE l.track=? AND l.regime=? AND l.outcome IS NOT NULL
+                GROUP BY d.agent_name
+                """,
+                (track, regime),
+            ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    # ── Lesson validation ─────────────────────────────────────────────────────
+
+    def record_lesson_injection(self, lesson_id: int, ticker: str, track: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO lesson_injection_log (lesson_id, ticker, track, created_at) VALUES (?, ?, ?, ?)",
+                (lesson_id, ticker, track, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def score_lesson_injections(self, ticker: str, pnl: float) -> None:
+        """Update scores of lessons recently injected for this ticker.
+
+        Win: +0.1 (lesson appears predictive)
+        Loss: -0.05 (asymmetric — good lessons don't guarantee every trade wins)
+        Scores are clamped to [0.0, 2.0].
+        """
+        delta = 0.1 if pnl > 0 else -0.05
+        with closing(self._connect()) as conn:
+            lesson_ids = [
+                row[0] for row in conn.execute(
+                    "SELECT DISTINCT lesson_id FROM lesson_injection_log "
+                    "WHERE ticker=? ORDER BY id DESC LIMIT 50",
+                    (ticker,),
+                ).fetchall()
+            ]
+            for lid in lesson_ids:
+                conn.execute(
+                    "UPDATE agent_lessons SET score = MAX(0.0, MIN(2.0, COALESCE(score, 1.0) + ?)) WHERE id=?",
+                    (delta, lid),
+                )
+            conn.commit()
+
+    def update_lesson_score(self, lesson_id: int, delta: float) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE agent_lessons SET score = MAX(0.0, MIN(2.0, COALESCE(score, 1.0) + ?)) WHERE id=?",
+                (delta, lesson_id),
             )
             conn.commit()
