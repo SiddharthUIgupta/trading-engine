@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     # well under rate-limit risk.
     universe_prerank_limit: int = Field(default=50, alias="UNIVERSE_PRERANK_LIMIT")
     max_daily_candidates: int = Field(default=50, alias="MAX_DAILY_CANDIDATES")
+    # Hard cap on concurrent equity positions. Prevents the scan from exhausting
+    # buying power by placing limit orders on every ORB signal in one cycle.
+    max_open_equity_positions: int = Field(default=15, alias="MAX_OPEN_EQUITY_POSITIONS")
 
     # --- Low-float momentum scanner (deterministic, no LLM) ---
     # The user's 7-criteria spec — all seven are conjunctive (a candidate

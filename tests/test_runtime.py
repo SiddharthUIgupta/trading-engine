@@ -148,8 +148,9 @@ def test_reconcile_positions_handles_a_position_that_no_longer_exists_on_the_bro
 
     runtime._reconcile_positions()
 
+    # Position with zero broker quantity is deleted from the DB (not set to 0)
     position = runtime._state_store.get_position("CLOSED")
-    assert position["quantity"] == 0
+    assert position is None
 
 
 # ---- _record_fill: averaging into an existing position ----

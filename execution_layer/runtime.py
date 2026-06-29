@@ -251,7 +251,16 @@ class TradingRuntime:
         is the intended outlet for those, not equities.
         """
         signals_found = 0
+        max_positions = self._settings.max_open_equity_positions
         for ticker in candidates:
+            open_count = len([p for p in self._state_store.get_positions() if p["quantity"] > 0])
+            if open_count >= max_positions:
+                logger.info(
+                    "ORB scan: %d/%d equity positions open — at cap, skipping remaining candidates",
+                    open_count, max_positions,
+                )
+                break
+
             self._scanned_tickers_today.add(ticker)
             try:
                 intraday = self._data_client.get_price_history(ticker, start_date=today, end_date=today, interval="5m")
@@ -854,9 +863,13 @@ class TradingRuntime:
                     "%s: local quantity %d out of sync with broker's %d — reconciling",
                     ticker, position["quantity"], real_qty,
                 )
-                self._state_store.upsert_position(
-                    ticker, real_qty, detail["avg_entry_price"] if detail else position["avg_entry_price"]
-                )
+                if real_qty == 0:
+                    # Order never filled or position fully closed — remove stale record
+                    self._state_store.delete_position(ticker)
+                else:
+                    self._state_store.upsert_position(
+                        ticker, real_qty, detail["avg_entry_price"] if detail else position["avg_entry_price"]
+                    )
 
     def _reconcile_option_positions(self) -> None:
         """Same gap, same fix, options side: a slow-to-fill options order

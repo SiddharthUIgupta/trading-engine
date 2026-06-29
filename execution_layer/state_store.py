@@ -287,6 +287,11 @@ class StateStore:
             row = cursor.fetchone()
         return None if row is None else _row_to_position(row)
 
+    def delete_position(self, ticker: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
+            conn.commit()
+
     def upsert_option_position(
         self,
         contract_symbol: str,
