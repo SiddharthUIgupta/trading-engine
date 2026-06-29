@@ -994,11 +994,21 @@ class TradingRuntime:
         risk profile this track was never validated for.
         """
         today = date.today()
+        # Fetch once — avoid placing a second exit order on a tick when the
+        # first is still pending (would fail with "insufficient qty" from Alpaca)
+        open_orders = self._broker.get_open_orders()
+        pending_sell_tickers = {
+            o["symbol"] for o in open_orders
+            if o.get("side") == "sell" and o.get("status") in ("new", "partially_filled", "accepted")
+        }
         for position in self._state_store.get_positions():
             if self._breaker.is_stock_halted:
                 return
             ticker = position["ticker"]
             if position["quantity"] <= 0 or position["strategy"] != "orb":
+                continue
+            if ticker in pending_sell_tickers:
+                logger.debug("%s: exit order already pending — skipping", ticker)
                 continue
 
             detail = self._broker.get_position_detail(ticker)
