@@ -890,15 +890,18 @@ class TradingRuntime:
                     "%s: local options quantity %d out of sync with broker's %d — reconciling",
                     contract_symbol, position["quantity"], real_qty,
                 )
-                self._state_store.upsert_option_position(
-                    contract_symbol,
-                    position["underlying_symbol"],
-                    position["option_type"],
-                    position["strike"],
-                    position["expiration"],
-                    real_qty,
-                    detail["avg_entry_price"] if detail else position["avg_entry_price"],
-                )
+                if real_qty == 0:
+                    self._state_store.delete_option_position(contract_symbol)
+                else:
+                    self._state_store.upsert_option_position(
+                        contract_symbol,
+                        position["underlying_symbol"],
+                        position["option_type"],
+                        position["strike"],
+                        position["expiration"],
+                        real_qty,
+                        detail["avg_entry_price"] if detail else position["avg_entry_price"],
+                    )
 
     def _check_intraday_exits(self, equity: float) -> None:
         """Default path is plain Python thresholds (execution_layer.exit_rules)

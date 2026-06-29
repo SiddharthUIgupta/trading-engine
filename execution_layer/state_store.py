@@ -292,6 +292,11 @@ class StateStore:
             conn.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
             conn.commit()
 
+    def delete_option_position(self, contract_symbol: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM option_positions WHERE contract_symbol = ?", (contract_symbol,))
+            conn.commit()
+
     def upsert_option_position(
         self,
         contract_symbol: str,
