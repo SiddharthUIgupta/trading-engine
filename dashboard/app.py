@@ -133,8 +133,31 @@ def _run_adhoc_analysis(ticker: str, settings, store: StateStore):
 
 
 st.title("trading-engine")
-if st.button("Refresh"):
-    st.rerun()
+
+# Sidebar refresh — always visible regardless of scroll position, orange color
+st.markdown(
+    """
+    <style>
+    /* Target the sidebar refresh button specifically */
+    [data-testid="stSidebar"] [data-testid="stButton"] button {
+        background-color: #f97316 !important;
+        color: white !important;
+        border: none !important;
+        font-weight: 600 !important;
+        width: 100% !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButton"] button:hover {
+        background-color: #ea6c0a !important;
+        border: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+with st.sidebar:
+    if st.button("Refresh", key="refresh_sidebar"):
+        st.rerun()
+    st.caption("Click to reload data")
 
 settings = _settings()
 store = _store()
