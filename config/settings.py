@@ -40,10 +40,13 @@ class Settings(BaseSettings):
     # --- Hard risk guardrails ---
     max_position_size_pct: float = Field(default=0.05, alias="MAX_POSITION_SIZE_PCT")
     max_daily_drawdown_pct: float = Field(default=0.02, alias="MAX_DAILY_DRAWDOWN_PCT")
-    # Conservative-by-design: bank a modest realized gain rather than risk it
-    # chasing more. Once today's equity is up this many dollars, the engine
-    # stops trading and closes positions for the rest of the day.
+    # Profit target: once today's gain reaches this threshold the engine stops
+    # trading stocks and locks in the gain. Set DAILY_PROFIT_TARGET_PCT in .env
+    # for a equity-scaled target (e.g. 0.005 = 0.5% of day-start equity).
+    # If PCT is set it overrides the flat USD value at the start of each day.
+    # Set to None / omit to disable the profit lock entirely.
     daily_profit_target_usd: float = Field(default=50.0, alias="DAILY_PROFIT_TARGET_USD")
+    daily_profit_target_pct: float | None = Field(default=None, alias="DAILY_PROFIT_TARGET_PCT")
 
     # --- State persistence ---
     state_db_path: Path = Field(default=Path("./state/trading_engine.sqlite3"), alias="STATE_DB_PATH")
@@ -80,7 +83,7 @@ class Settings(BaseSettings):
     momentum_max_float_shares: int = Field(default=20_000_000, alias="MOMENTUM_MAX_FLOAT_SHARES")
     momentum_ema_short_period: int = Field(default=9, alias="MOMENTUM_EMA_SHORT_PERIOD")
     momentum_ema_long_period: int = Field(default=20, alias="MOMENTUM_EMA_LONG_PERIOD")
-    momentum_min_daily_gain_pct: float = Field(default=0.10, alias="MOMENTUM_MIN_DAILY_GAIN_PCT")
+    momentum_min_daily_gain_pct: float = Field(default=0.05, alias="MOMENTUM_MIN_DAILY_GAIN_PCT")
     momentum_clean_body_dominance_threshold: float = Field(
         default=0.55, alias="MOMENTUM_CLEAN_BODY_DOMINANCE_THRESHOLD"
     )
@@ -88,7 +91,7 @@ class Settings(BaseSettings):
     # Relative volume: today's volume vs. its own recent average — the most
     # commonly cited "necessary" criterion in this style of scanner, even
     # more fundamental than VWAP/EMA.
-    momentum_min_relative_volume: float = Field(default=5.0, alias="MOMENTUM_MIN_RELATIVE_VOLUME")
+    momentum_min_relative_volume: float = Field(default=2.0, alias="MOMENTUM_MIN_RELATIVE_VOLUME")
     momentum_volume_lookback_days: int = Field(default=10, alias="MOMENTUM_VOLUME_LOOKBACK_DAYS")
     # Price band: float + daily-gain alone still admit sub-$1 penny stocks
     # and $200+ names that don't behave like the low-float setups this

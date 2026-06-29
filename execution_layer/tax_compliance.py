@@ -7,15 +7,17 @@ cost basis instead) if you buy the same or a "substantially identical"
 security within 30 days before or after the sale.
 
 Scope and limitations (deliberately simple, not a full tax-lot engine):
-  - "Substantially identical" is approximated as "same ticker." Options,
-    or ETFs tracking the same underlying, are NOT detected.
+  - "Substantially identical" for equities = same ticker. check_before_buy
+    BLOCKS the buy; this is a hard stop.
+  - Options on the same underlying are also "substantially identical" per
+    IRS Pub 550. check_option_buy_for_wash WARNS (does not block) — refusing
+    options entry for tax reasons would itself be a risk-management hazard.
+  - ETFs tracking the same underlying are NOT detected.
   - Only trades placed through this system are known. A pre-existing
     position or a loss-sale made through another broker/account is
     invisible to this guard.
-  - check_before_buy BLOCKS the trade by default — it's new, discretionary
-    exposure, so refusing it is the safe default. warn_before_sell only
-    WARNS — refusing to let the system close a losing position for tax
-    bookkeeping reasons would itself be a risk-management hazard.
+  - warn_before_sell WARNS only — refusing to close a losing position for
+    tax bookkeeping reasons would itself be a risk-management hazard.
 """
 from __future__ import annotations
 
@@ -55,6 +57,25 @@ class WashSaleGuard:
                 f"(within the {self._lookback_days}-day lookback window)"
             ),
         )
+
+    def check_option_buy_for_wash(self, underlying: str, today: date) -> str | None:
+        """Buying options on an underlying within 30 days of a loss sale on that
+        equity is a wash sale under IRS 'substantially identical' rules. We warn
+        (not block) — refusing options entry for tax reasons would be a risk hazard.
+        """
+        since = today - timedelta(days=self._lookback_days)
+        loss_sales = self._state_store.get_recent_loss_sales(underlying, since=since)
+        if not loss_sales:
+            return None
+        most_recent = loss_sales[0]
+        warning = (
+            f"buying options on {underlying} may trigger a wash sale: equity loss of "
+            f"{most_recent['realized_pnl']:.2f} realized on {most_recent['sale_date']} "
+            f"(within {self._lookback_days}d window). IRS treats options on same underlying "
+            "as substantially identical. Proceeding — tax consequence only, not a trading risk."
+        )
+        logger.warning(warning)
+        return warning
 
     def warn_before_sell(self, ticker: str, proposed_sale_price: float, today: date) -> str | None:
         position = self._state_store.get_position(ticker)

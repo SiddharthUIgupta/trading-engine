@@ -167,7 +167,10 @@ class TradingRuntime:
     def pre_market_scan(self) -> None:
         equity = self._broker.get_equity()
         today = date.today()
-        self._breaker.start_trading_day(equity=equity, today=today)
+        self._breaker.start_trading_day(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         # Persisted so anything outside this process (e.g. the dashboard) can
         # compute *today's* P&L correctly, instead of assuming the account's
         # original opening balance is "today's starting point" — it isn't,
@@ -354,6 +357,9 @@ class TradingRuntime:
         )
 
     def _open_option_position(self, ticker: str, direction: Action, equity: float, today: date) -> None:
+        wash_warning = self._wash_sale_guard.check_option_buy_for_wash(ticker, today)
+        if wash_warning:
+            self._state_store.record_event(event_type="wash_sale_option_warning", detail=wash_warning)
         try:
             chain = self._data_client.get_option_chain(ticker)
         except DataLayerError as exc:
@@ -1307,6 +1313,9 @@ class TradingRuntime:
         Other structures (strangle, single-leg) use individual limit orders.
         """
         proposal = payload.proposal
+        wash_warning = self._wash_sale_guard.check_option_buy_for_wash(ticker, today)
+        if wash_warning:
+            self._state_store.record_event(event_type="wash_sale_option_warning", detail=wash_warning)
 
         if proposal.structure == StructureType.IRON_CONDOR:
             self._open_iron_condor(ticker, proposal, chain, today)

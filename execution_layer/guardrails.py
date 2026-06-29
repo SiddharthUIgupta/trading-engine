@@ -87,12 +87,20 @@ class CircuitBreaker:
         """
         return self._tripped
 
-    def start_trading_day(self, equity: float, today: date) -> None:
+    def start_trading_day(
+        self, equity: float, today: date, profit_target_pct: float | None = None
+    ) -> None:
         self._day_start_equity = equity
         self._trading_day = today
         self._tripped = False
         self._profit_locked = False
-        logger.info("Trading day %s started with equity=%.2f", today.isoformat(), equity)
+        if profit_target_pct is not None:
+            self.daily_profit_target_usd = equity * profit_target_pct
+        logger.info(
+            "Trading day %s started with equity=%.2f daily_profit_target=%.2f",
+            today.isoformat(), equity,
+            self.daily_profit_target_usd if self.daily_profit_target_usd is not None else 0.0,
+        )
 
     def validate_position_size(self, proposal: TradeProposal, equity: float) -> None:
         if proposal.action != Action.BUY:
