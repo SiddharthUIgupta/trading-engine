@@ -131,10 +131,14 @@ def evaluate_low_float_momentum(
         f"RVOL {relative_volume:.1f}x {'>=' if high_rvol else '<'} {min_relative_volume:.1f}x minimum"
     )
 
-    in_price_band = current_price is not None and price_min <= current_price <= price_max
+    # price_max == 0 means no upper cap (any price stock allowed)
+    above_min = current_price is not None and current_price >= price_min
+    below_max = price_max <= 0 or (current_price is not None and current_price <= price_max)
+    in_price_band = above_min and below_max
     checks_passed += in_price_band
+    cap_str = f"{price_max:.2f}" if price_max > 0 else "∞"
     reasons.append(
-        f"price {current_price:.2f} {'within' if in_price_band else 'outside'} [{price_min:.2f}, {price_max:.2f}]"
+        f"price {current_price:.2f} {'within' if in_price_band else 'outside'} [{price_min:.2f}, {cap_str}]"
         if current_price is not None
         else "price unavailable"
     )

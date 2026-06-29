@@ -132,12 +132,12 @@ def test_check_intraday_exits_holds_strong_gain_while_advancing(runtime_with_pos
 
 
 def test_check_intraday_exits_trailing_stop_fires_on_pullback_from_peak(runtime_with_position: TradingRuntime):
-    """Trailing stop fires when price pulls >1.5% back from the recorded peak.
-    Peak=$112 stored as high_water_mark, current=$110 → drawdown=-1.79% > threshold.
+    """Trailing stop fires when price pulls >7% back from the recorded peak.
+    Peak=$130 stored as high_water_mark, current=$110 → drawdown=-15.4% > 7% threshold.
     """
     runtime_with_position._state_store.upsert_position(
         "AAPL", quantity=10, avg_entry_price=100.0, last_buy_at=date.today().isoformat(),
-        entry_regime="bullish_crossover", high_water_mark=112.0,
+        entry_regime="bullish_crossover", high_water_mark=130.0,
     )
     runtime_with_position._broker.get_position_detail.return_value = {
         "qty": 10.0, "avg_entry_price": 100.0, "current_price": 110.0, "unrealized_plpc": 0.10,

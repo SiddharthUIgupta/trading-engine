@@ -1898,12 +1898,15 @@ class TradingRuntime:
         )
 
     def _trip_breaker(self, reason: str) -> None:
-        """A real risk breach (drawdown) — a true emergency stop. Closes
-        and halts BOTH tracks; pauses the whole scheduler.
+        """Portfolio drawdown breach — stops NEW entries for the rest of the
+        day but does NOT close existing positions. Swing trades need to ride
+        through intraday noise; individual per-position stop-losses (exit_rules)
+        handle the actual exit decisions. The scheduler is NOT paused so
+        intraday_monitoring keeps running and can trigger those per-position stops.
         """
-        self._close_all_and_reconcile(reason)
-        if self._halt_callback is not None:
-            self._halt_callback()
+        logger.error("CIRCUIT BREAKER TRIPPED (new entries halted): %s", reason)
+        self._state_store.record_event(event_type="circuit_breaker_tripped", detail=reason)
+        self._breaker._tripped = True
 
     def _lock_in_profit(self, reason: str) -> None:
         """Hitting the daily $ target is a banked win, not a risk breach

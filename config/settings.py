@@ -39,7 +39,11 @@ class Settings(BaseSettings):
 
     # --- Hard risk guardrails ---
     max_position_size_pct: float = Field(default=0.05, alias="MAX_POSITION_SIZE_PCT")
-    max_daily_drawdown_pct: float = Field(default=0.02, alias="MAX_DAILY_DRAWDOWN_PCT")
+    # Raised from 2% to 5%: swing trades need room to breathe intraday.
+    # Individual per-position stops (EXIT_STOP_LOSS_PCT) are the primary
+    # risk guard; this circuit breaker only stops NEW entries when the whole
+    # portfolio is down 5% in a day, and no longer force-closes existing positions.
+    max_daily_drawdown_pct: float = Field(default=0.05, alias="MAX_DAILY_DRAWDOWN_PCT")
     # Profit target: once today's gain reaches this threshold the engine stops
     # trading stocks and locks in the gain. Set DAILY_PROFIT_TARGET_PCT in .env
     # for a equity-scaled target (e.g. 0.005 = 0.5% of day-start equity).
@@ -96,18 +100,20 @@ class Settings(BaseSettings):
     # Price band: float + daily-gain alone still admit sub-$1 penny stocks
     # and $200+ names that don't behave like the low-float setups this
     # strategy targets.
-    momentum_price_min: float = Field(default=1.0, alias="MOMENTUM_PRICE_MIN")
-    momentum_price_max: float = Field(default=20.0, alias="MOMENTUM_PRICE_MAX")
+    # Min price filters out true sub-$5 micro-caps. No max — quality stocks
+    # trade at any price. Previously capped at $20 which excluded most quality names.
+    momentum_price_min: float = Field(default=5.0, alias="MOMENTUM_PRICE_MIN")
+    momentum_price_max: float = Field(default=0.0, alias="MOMENTUM_PRICE_MAX")  # 0 = no cap
 
     # --- Intraday exit rules (deterministic, no LLM by default) ---
-    exit_stop_loss_pct: float = Field(default=0.02, alias="EXIT_STOP_LOSS_PCT")
-    # No hard profit cap — trailing stop rides winners instead of capping them.
-    # exit_trailing_stop_activation_pct is when the trailing stop kicks in;
-    # exit_trailing_stop_pct is how far behind the peak it trails.
-    # A stock up 3% starts being trailed at 1.5% behind its peak — so a
-    # continuation from +3% to +12% only stops out around +10.5%, not at +3%.
-    exit_trailing_stop_pct: float = Field(default=0.015, alias="EXIT_TRAILING_STOP_PCT")
-    exit_trailing_stop_activation_pct: float = Field(default=0.03, alias="EXIT_TRAILING_STOP_ACTIVATION_PCT")
+    # Per-position stop-loss. Widened from 2% to 7% for swing trading —
+    # 2% is intraday noise, not a meaningful signal that a trade is wrong.
+    exit_stop_loss_pct: float = Field(default=0.07, alias="EXIT_STOP_LOSS_PCT")
+    # Trailing stop activates at 15% gain, trails 7% behind peak.
+    # Widened from 3%/1.5% to give swing trades room to develop and ride
+    # multi-day trends without getting shaken out on normal pullbacks.
+    exit_trailing_stop_pct: float = Field(default=0.07, alias="EXIT_TRAILING_STOP_PCT")
+    exit_trailing_stop_activation_pct: float = Field(default=0.15, alias="EXIT_TRAILING_STOP_ACTIVATION_PCT")
     # LLM exit review only fires when the rule-based checks above all say
     # "hold" AND the position's regime has sharply reversed since entry —
     # and at most once per position per day, logged like any other agent call.
@@ -144,17 +150,18 @@ class Settings(BaseSettings):
     # direction and still expire worthless if the move is too slow. The
     # DTE floor below is what actually prevents that, not just habit.
     options_track_enabled: bool = Field(default=True, alias="OPTIONS_TRACK_ENABLED")
-    options_min_dte: int = Field(default=5, alias="OPTIONS_MIN_DTE")
-    options_max_dte: int = Field(default=10, alias="OPTIONS_MAX_DTE")
+    # 30-45 DTE for swing trading: gives the trade room to work over days
+    # without being destroyed by theta in the final week. Previously 5-10
+    # DTE which was essentially a same-week lottery ticket.
+    options_min_dte: int = Field(default=30, alias="OPTIONS_MIN_DTE")
+    options_max_dte: int = Field(default=45, alias="OPTIONS_MAX_DTE")
     # Much smaller than the 5% equity cap — sized off premium paid (max
     # loss on a long option), not share notional, and one contract already
     # carries embedded leverage the equity cap was never calibrated for.
     options_max_risk_pct: float = Field(default=0.01, alias="OPTIONS_MAX_RISK_PCT")
-    options_stop_loss_pct: float = Field(default=0.40, alias="OPTIONS_STOP_LOSS_PCT")
-    # Force-close regardless of P&L this many trading days before expiration
-    # — avoids riding into the sharp theta/gamma acceleration in the final
-    # days, which the stop-loss alone won't reliably catch in time.
-    options_force_close_days_before_expiration: int = Field(default=2, alias="OPTIONS_FORCE_CLOSE_DAYS_BEFORE_EXPIRATION")
+    options_stop_loss_pct: float = Field(default=0.50, alias="OPTIONS_STOP_LOSS_PCT")
+    # Force-close at 7 DTE to avoid gamma/theta spike in final week.
+    options_force_close_days_before_expiration: int = Field(default=7, alias="OPTIONS_FORCE_CLOSE_DAYS_BEFORE_EXPIRATION")
 
     # --- Vol options track (short premium — Natenberg/tastylive framework) ---
     # CAPABILITY FLAG: set True once when your broker account has options

@@ -223,7 +223,7 @@ def _hold_payload(ticker: str) -> ConsensusPayload:
 
 
 def _option_contract(
-    option_type: OptionType = OptionType.CALL, dte: int = 7, strike: float = 100.0,
+    option_type: OptionType = OptionType.CALL, dte: int = 35, strike: float = 100.0,
     underlying_price: float = 100.0, bid: float = 1.0, ask: float = 1.10,
 ) -> OptionContract:
     return OptionContract(
@@ -351,7 +351,7 @@ def test_check_options_exits_force_closes_near_expiration(runtime: TradingRuntim
 
 
 def test_check_options_exits_stop_loss_triggers(runtime: TradingRuntime):
-    expiration = (date.today() + timedelta(days=7)).isoformat()  # well clear of the force-close floor
+    expiration = (date.today() + timedelta(days=15)).isoformat()  # well clear of the 7-day force-close floor
     runtime._state_store.upsert_option_position(
         "TEST260701C00100000", "TEST", "call", 100.0, expiration, quantity=5, avg_entry_price=2.00,
     )
@@ -368,7 +368,7 @@ def test_check_options_exits_stop_loss_triggers(runtime: TradingRuntime):
 
 
 def test_check_options_exits_no_action_when_healthy(runtime: TradingRuntime):
-    expiration = (date.today() + timedelta(days=7)).isoformat()
+    expiration = (date.today() + timedelta(days=15)).isoformat()
     runtime._state_store.upsert_option_position(
         "TEST260701C00100000", "TEST", "call", 100.0, expiration, quantity=5, avg_entry_price=2.00,
     )
@@ -536,7 +536,7 @@ def test_intraday_monitoring_keeps_checking_options_after_stock_profit_lock(runt
         "qty": 17.0, "avg_entry_price": 0.56, "current_price": 0.60, "unrealized_plpc": 0.07,
     }
     runtime._state_store.upsert_option_position(
-        "SOFI260702C00017500", "SOFI", "call", 17.5, "2026-07-02", quantity=17, avg_entry_price=0.56, opened_at="2026-06-23",
+        "SOFI260731C00017500", "SOFI", "call", 17.5, "2026-07-31", quantity=17, avg_entry_price=0.56, opened_at="2026-06-23",
     )
 
     runtime.intraday_monitoring()
@@ -544,10 +544,10 @@ def test_intraday_monitoring_keeps_checking_options_after_stock_profit_lock(runt
     assert runtime._breaker.is_stock_halted is True
     assert runtime._breaker.is_options_halted is False
     # _check_options_exits must still have run (read this option position's broker detail), not been skipped.
-    runtime._broker.get_position_detail.assert_any_call("SOFI260702C00017500")
+    runtime._broker.get_position_detail.assert_any_call("SOFI260731C00017500")
     # And it must still be open afterward -- nothing forced it closed.
     runtime._broker.submit_option_order.assert_not_called()
-    position = runtime._state_store.get_option_position("SOFI260702C00017500")
+    position = runtime._state_store.get_option_position("SOFI260731C00017500")
     assert position["quantity"] == 17
 
 
