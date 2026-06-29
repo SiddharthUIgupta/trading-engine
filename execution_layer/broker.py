@@ -100,7 +100,7 @@ class AlpacaBroker:
             qty=proposal.quantity,
             side=side,
             time_in_force=TimeInForce.DAY,
-            limit_price=proposal.limit_price,
+            limit_price=float(f"{proposal.limit_price:.2f}"),  # guarantee exactly 2 decimal places; raw floats fail Alpaca's sub-penny check
         )
         order = self._client.submit_order(order_request)
         logger.info(

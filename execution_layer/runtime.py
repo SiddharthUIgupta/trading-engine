@@ -224,6 +224,11 @@ class TradingRuntime:
                 logger.info("ORB equity scan skipped — regime disarmed for today")
             return
         today = date.today()
+        equity = self._broker.get_equity()
+        self._breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         try:
             movers = self._data_client.get_market_movers()
         except DataLayerError as exc:
@@ -235,7 +240,6 @@ class TradingRuntime:
             return
 
         logger.info("=== INTRADAY MOMENTUM SCAN (ORB signal): %d new candidate(s) ===", len(new_candidates))
-        equity = self._broker.get_equity()
         self._scan_and_trade_orb_equities(new_candidates, today, equity)
 
     def _scan_and_trade_orb_equities(self, candidates: list[str], today: date, equity: float) -> None:
@@ -318,6 +322,11 @@ class TradingRuntime:
                 logger.info("ORB options scan skipped — regime disarmed for today (neutral market)")
             return
         today = date.today()
+        equity = self._broker.get_equity()
+        self._breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         try:
             movers = self._data_client.get_market_movers()
         except DataLayerError as exc:
@@ -422,6 +431,10 @@ class TradingRuntime:
 
         logger.info("=== THESIS SCAN: %d new candidate(s) ===", len(new_candidates))
         equity = self._broker.get_equity()
+        self._breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         self._scan_and_run_consensus(new_candidates, today, equity, strategy="thesis")
         self._execute_pending_payloads(today)
 
@@ -799,6 +812,10 @@ class TradingRuntime:
         if self._settings.options_track_enabled or self._settings.vol_options_track_enabled:
             self._reconcile_option_positions()
         equity = self._broker.get_equity()
+        self._breaker.ensure_day_started(
+            equity=equity, today=date.today(),
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         logger.info("Intraday check: equity=%.2f", equity)
         if self._breaker.check_drawdown(equity):
             self._trip_breaker(reason=f"intraday drawdown breach at equity={equity:.2f}")
@@ -1099,6 +1116,10 @@ class TradingRuntime:
 
         logger.info("=== VOL OPTIONS SCAN: %d candidate(s) ===", len(candidates))
         equity = self._broker.get_equity()
+        self._breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
         vix_context = self._fetch_vix_context(today)
         portfolio = self._build_portfolio_greeks(equity)
 

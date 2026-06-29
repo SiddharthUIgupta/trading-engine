@@ -102,6 +102,16 @@ class CircuitBreaker:
             self.daily_profit_target_usd if self.daily_profit_target_usd is not None else 0.0,
         )
 
+    def ensure_day_started(
+        self, equity: float, today: date, profit_target_pct: float | None = None
+    ) -> None:
+        """Idempotent guard for mid-day restarts: starts the trading day only
+        if start_trading_day() was not already called today. Safe to call at
+        the top of every intraday job — no-op when the day is already running.
+        """
+        if self._day_start_equity is None or self._trading_day != today:
+            self.start_trading_day(equity=equity, today=today, profit_target_pct=profit_target_pct)
+
     def validate_position_size(self, proposal: TradeProposal, equity: float) -> None:
         if proposal.action != Action.BUY:
             # The cap bounds NEW exposure. A SELL only reduces exposure — even
