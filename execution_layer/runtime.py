@@ -78,12 +78,16 @@ class TradingRuntime:
         self._pending_payloads: dict[str, ConsensusPayload] = {}
         self._pending_regimes: dict[str, str] = {}
         self._pending_strategies: dict[str, str] = {}
-        self._scanned_tickers_today: set[str] = set()
-        self._executed_tickers_today: set[str] = set()
+        # Pre-seed dedup sets from existing DB positions so that a restart
+        # mid-session doesn't re-buy tickers we already own.
+        existing_tickers = {p["ticker"] for p in state_store.get_positions() if p["quantity"] > 0}
+        self._scanned_tickers_today: set[str] = set(existing_tickers)
+        self._executed_tickers_today: set[str] = set(existing_tickers)
         # Independent from _scanned_tickers_today (the equity momentum track's
         # dedup set) — a ticker passing both screens on the same day can get
         # an equity buy AND an options buy; they're not coupled by default.
-        self._scanned_options_tickers_today: set[str] = set()
+        existing_option_underlyings = {p["underlying_symbol"] for p in state_store.get_option_positions() if p.get("quantity", 0) > 0}
+        self._scanned_options_tickers_today: set[str] = set(existing_option_underlyings)
         # Vol track runs once daily per ticker (premium-selling, not intraday signal)
         self._scanned_vol_tickers_today: set[str] = set()
         self._exit_agent = IntradayExitAgent(
