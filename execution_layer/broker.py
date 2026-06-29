@@ -198,7 +198,7 @@ class AlpacaBroker:
             order_class=OrderClass.MLEG,
             qty=contracts,
             time_in_force=TimeInForce.DAY,
-            limit_price=round(-net_credit, 2),  # negative = credit per Alpaca mleg convention
+            limit_price=float(f"{-net_credit:.2f}"),  # negative = credit per Alpaca mleg convention; string-format guarantees exactly 2 decimal places
             legs=leg_requests,
         )
         order = self._client.submit_order(order_request)

@@ -1122,6 +1122,16 @@ class TradingRuntime:
             if ticker in existing_vol_tickers:
                 logger.info("%s: vol scan skipped — existing vol_short position or pending order", ticker)
                 continue
+            # Dedup across both daily scans (morning + afternoon): once a ticker
+            # has been attempted today — whether it succeeded, failed, or was blocked —
+            # don't retry it. Failed mleg orders leave qty=0 in state, which the
+            # existing_vol_tickers check above intentionally excludes (an expired
+            # unfilled order should allow re-entry tomorrow). This separate set
+            # captures the within-day "already tried" state.
+            if ticker in self._scanned_vol_tickers_today:
+                logger.info("%s: vol scan skipped — already attempted today", ticker)
+                continue
+            self._scanned_vol_tickers_today.add(ticker)
             try:
                 vol_snapshot = self._data_client.get_volatility_snapshot(ticker)
                 chain = self._data_client.get_option_chain(ticker)
@@ -1302,90 +1312,22 @@ class TradingRuntime:
             self._open_iron_condor(ticker, proposal, chain, today)
             return
 
-        # All other structures: individual limit orders per leg
-        legs: list[tuple[OptionContract, Action]] = []
-
-        if proposal.structure == StructureType.SHORT_STRANGLE:
-            call = self._find_option_contract(chain, OptionType.CALL, proposal.expiration, proposal.short_call_strike)
-            put = self._find_option_contract(chain, OptionType.PUT, proposal.expiration, proposal.short_put_strike)
-            if call:
-                legs.append((call, Action.SELL))
-            if put:
-                legs.append((put, Action.SELL))
-
-        elif proposal.structure in (StructureType.SHORT_PUT, StructureType.SHORT_PUT_SPREAD):
-            put = self._find_option_contract(chain, OptionType.PUT, proposal.expiration, proposal.single_strike)
-            if put:
-                legs.append((put, Action.SELL))
-
-        elif proposal.structure in (StructureType.SHORT_CALL, StructureType.SHORT_CALL_SPREAD):
-            call = self._find_option_contract(chain, OptionType.CALL, proposal.expiration, proposal.single_strike)
-            if call:
-                legs.append((call, Action.SELL))
-
-        else:
-            logger.info("%s: structure %s not yet supported in vol execution", ticker, proposal.structure.value)
-            return
-
-        if not legs:
-            logger.error(
-                "%s: no matching contracts found in chain for %s (exp=%s)",
-                ticker, proposal.structure.value, proposal.expiration,
-            )
-            return
-
-        for contract, side in legs:
-            limit_price = contract.bid if side == Action.SELL else contract.ask
-            if limit_price <= 0:
-                logger.warning(
-                    "%s: %s contract %s has zero bid/ask — skipping leg",
-                    ticker, side.value, contract.contract_symbol,
-                )
-                continue
-            try:
-                self._breaker.assert_options_trading_allowed()
-                result = self._broker.submit_option_order(
-                    contract.contract_symbol, side=side,
-                    contracts=proposal.quantity, limit_price=limit_price,
-                )
-                logger.info(
-                    "%s: vol %s %s @ %.2f → %s",
-                    ticker, side.value, contract.contract_symbol,
-                    limit_price, result.get("order_status", "unknown"),
-                )
-                self._record_option_order_event(
-                    contract.contract_symbol, side, proposal.quantity, limit_price, result
-                )
-                self._record_option_fill(
-                    contract.contract_symbol, ticker, contract.option_type.value,
-                    contract.strike, contract.expiration.isoformat(),
-                    side, proposal.quantity, today, strategy="vol_short",
-                )
-                self._state_store.record_event(
-                    event_type="vol_options_opened",
-                    detail=(
-                        f"{ticker}: {side.value} {contract.option_type.value} {contract.strike:.2f} "
-                        f"exp={contract.expiration} DTE={contract.dte} "
-                        f"structure={proposal.structure.value}"
-                    ),
-                )
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked vol options order for %s (%s): %s", ticker, contract.contract_symbol, exc)
-                self._trip_breaker(reason=str(exc))
-                return
-            except Exception as exc:  # noqa: BLE001
-                # Broker-level rejection (e.g. account not approved for naked shorts,
-                # market closed, or margin insufficient). Log and abort the whole
-                # structure — a half-entered strangle is worse than no position.
-                logger.error(
-                    "%s: broker rejected %s order for %s — aborting structure: %s",
-                    ticker, side.value, contract.contract_symbol, exc,
-                )
-                self._state_store.record_event(
-                    event_type="vol_options_broker_rejected",
-                    detail=f"{ticker}: {side.value} {contract.contract_symbol} — {exc}",
-                )
-                return
+        # All non-iron-condor structures require naked short legs (Level 4).
+        # This account is Level 3 — only defined-risk spreads are permitted.
+        # Block execution rather than let Alpaca reject leg-by-leg and leave
+        # partial orphaned positions in the account.
+        logger.warning(
+            "%s: vol structure %s requires naked shorts (Level 4) — blocked. "
+            "Only iron condors are executed on this Level 3 account.",
+            ticker, proposal.structure.value,
+        )
+        self._state_store.record_event(
+            event_type="vol_options_blocked_level4",
+            detail=(
+                f"{ticker}: {proposal.structure.value} blocked — requires Level 4 approval. "
+                "Re-run vol consensus to get an iron condor instead."
+            ),
+        )
 
     def _open_iron_condor(
         self,
@@ -1496,6 +1438,8 @@ class TradingRuntime:
                 event_type="vol_options_broker_rejected",
                 detail=f"{ticker}: iron condor mleg — {exc}",
             )
+            # Clean up any partial positions that may have been left open
+            self._close_orphaned_option_legs(ticker)
 
     def _check_vol_options_exits(self, equity: float) -> None:
         """tastylive's three management rules for short premium positions:
@@ -1599,6 +1543,54 @@ class TradingRuntime:
                 logger.error("Circuit breaker blocked vol options exit for %s: %s", contract_symbol, exc)
                 self._trip_breaker(reason=str(exc))
                 return
+
+    def _close_orphaned_option_legs(self, underlying: str) -> None:
+        """Safety net after a failed mleg submission.
+
+        Cancels any pending option orders for this underlying and closes any
+        open option positions in Alpaca that shouldn't exist — prevents the
+        account from being left with naked long legs from a partially-built
+        iron condor where the mleg was rejected after individual legs somehow
+        opened (e.g. legacy code path, broker partial-fill edge case).
+        """
+        # Cancel pending orders for this underlying first
+        for order in self._broker.get_open_orders():
+            if order.get("legs"):
+                for leg in order["legs"]:
+                    parsed = parse_occ_symbol(leg.get("symbol") or "") if leg.get("symbol") else None
+                    if parsed and parsed.underlying_symbol == underlying:
+                        try:
+                            self._broker.cancel_order(order["order_id"])
+                            logger.info("Cancelled pending option order %s for orphan cleanup (%s)", order["order_id"], underlying)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Could not cancel order %s during orphan cleanup: %s", order["order_id"], exc)
+                        break  # one cancel per order
+
+        # Close any open positions for this underlying in Alpaca
+        for pos in self._state_store.get_option_positions():
+            if pos["underlying_symbol"] != underlying or pos["quantity"] == 0:
+                continue
+            detail = self._broker.get_position_detail(pos["contract_symbol"])
+            if detail is None or detail["qty"] == 0:
+                continue
+            qty = abs(int(detail["qty"]))
+            side = Action.SELL if detail["qty"] > 0 else Action.BUY
+            try:
+                self._breaker.assert_options_trading_allowed()
+                result = self._broker.submit_option_order(
+                    pos["contract_symbol"], side=side,
+                    contracts=qty, limit_price=detail["current_price"],
+                )
+                logger.warning(
+                    "Closed orphaned %s option leg %s (qty=%d) after failed mleg → %s",
+                    underlying, pos["contract_symbol"], qty, result.get("order_status", "unknown"),
+                )
+                self._state_store.record_event(
+                    event_type="orphaned_leg_closed",
+                    detail=f"{pos['contract_symbol']}: closed {side.value} x{qty} after failed iron condor mleg",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to close orphaned leg %s: %s", pos["contract_symbol"], exc)
 
     def _should_escalate_to_llm(self, ticker: str, position: dict, today: date) -> bool:
         if not self._settings.intraday_llm_escalation_enabled:

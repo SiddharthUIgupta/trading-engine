@@ -286,37 +286,40 @@ def vol_runtime(tmp_path: Path) -> TradingRuntime:
 # ── vol_options_scan_and_trade tests ─────────────────────────────────────────
 
 @patch("execution_layer.runtime.run_vol_consensus")
-def test_vol_scan_aapl_submits_two_sell_legs_for_short_strangle(mock_consensus, vol_runtime: TradingRuntime):
-    """Happy path: APPROVED SHORT_STRANGLE → sell call + sell put, both recorded."""
-    mock_consensus.return_value = _aapl_approved_payload()
+def test_vol_scan_blocks_short_strangle_naked_shorts(mock_consensus, vol_runtime: TradingRuntime):
+    """SHORT_STRANGLE requires naked shorts (Level 4) — must be blocked on this
+    Level 3 account. No orders should be submitted and a blocked event recorded.
+    """
+    mock_consensus.return_value = _aapl_approved_payload()  # returns SHORT_STRANGLE
 
     vol_runtime.vol_options_scan_and_trade()
 
-    # Two legs submitted: short call + short put
-    assert vol_runtime._broker.submit_option_order.call_count == 2
-    calls = vol_runtime._broker.submit_option_order.call_args_list
-    sides = {c.kwargs["side"] for c in calls}
-    symbols = {c.args[0] for c in calls}
-    assert sides == {Action.SELL}
-    assert _CALL_CONTRACT_SYMBOL in symbols
-    assert _PUT_CONTRACT_SYMBOL in symbols
+    # No individual option orders — naked shorts are blocked
+    vol_runtime._broker.submit_option_order.assert_not_called()
+    # A blocked event must be recorded so the issue is visible in logs/dashboard
+    events = vol_runtime._state_store.get_events(event_type_like="vol_options_blocked_level4%")
+    assert len(events) >= 1
+    assert "short_strangle" in events[0]["detail"]
 
 
 @patch("execution_layer.runtime.run_vol_consensus")
 def test_vol_scan_aapl_positions_tagged_as_vol_short(mock_consensus, vol_runtime: TradingRuntime):
-    """Both legs must be stored with strategy='vol_short' so the right exit
-    rules apply and they're not conflated with the ORB long options track.
+    """Iron condor legs must be stored with strategy='vol_short' so the right
+    exit rules apply and they're not conflated with the ORB long options track.
     """
-    mock_consensus.return_value = _aapl_approved_payload()
+    mock_consensus.return_value = _aapl_iron_condor_payload()
 
     vol_runtime.vol_options_scan_and_trade()
 
-    call_pos = vol_runtime._state_store.get_option_position(_CALL_CONTRACT_SYMBOL)
-    put_pos = vol_runtime._state_store.get_option_position(_PUT_CONTRACT_SYMBOL)
-    assert call_pos is not None
-    assert put_pos is not None
-    assert call_pos["strategy"] == "vol_short"
-    assert put_pos["strategy"] == "vol_short"
+    # Iron condors submit via mleg (submit_spread_order), not individual legs
+    vol_runtime._broker.submit_spread_order.assert_called_once()
+    # Both short legs recorded as vol_short (_CALL_CONTRACT_SYMBOL = short call, _PUT_CONTRACT_SYMBOL = short put)
+    short_call_pos = vol_runtime._state_store.get_option_position(_CALL_CONTRACT_SYMBOL)
+    short_put_pos = vol_runtime._state_store.get_option_position(_PUT_CONTRACT_SYMBOL)
+    assert short_call_pos is not None
+    assert short_put_pos is not None
+    assert short_call_pos["strategy"] == "vol_short"
+    assert short_put_pos["strategy"] == "vol_short"
 
 
 @patch("execution_layer.runtime.run_vol_consensus")
