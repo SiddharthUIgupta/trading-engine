@@ -1,0 +1,11 @@
+[
+  {
+    "ticker": "HOFT",
+    "entry_date": "2026-06-12",
+    "entry_price": 15.550000190734863,
+    "exit_date": "2026-06-12",
+    "exit_price": 15.239000186920165,
+    "exit_reason": "stop-loss",
+    "return_pct": -0.020000000000000035
+  }
+]
