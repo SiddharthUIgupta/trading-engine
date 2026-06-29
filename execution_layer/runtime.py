@@ -1974,7 +1974,10 @@ class TradingRuntime:
 
         for position in option_positions:
             contract_symbol = position["contract_symbol"]
-            fill_price = self._broker.get_last_fill_price(contract_symbol) or position["avg_entry_price"]
+            raw_fill = self._broker.get_last_fill_price(contract_symbol)
+            # Negative fill prices are impossible for an option sale and indicate
+            # a mleg net-credit price was picked up by mistake — treat as 0 (expired/worthless).
+            fill_price = max(raw_fill, 0.0) if raw_fill is not None else position["avg_entry_price"]
             self._state_store.record_realized_option_sale(
                 contract_symbol=contract_symbol, underlying_symbol=position["underlying_symbol"],
                 sale_date=today, contracts=position["quantity"], sale_price=fill_price,
