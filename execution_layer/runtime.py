@@ -303,6 +303,8 @@ class TradingRuntime:
         except CircuitBreakerTripped as exc:
             logger.error("Circuit breaker blocked ORB equity order for %s: %s", ticker, exc)
             self._trip_breaker(reason=str(exc))
+        except Exception as exc:  # noqa: BLE001 — unknown asset, de-listed ticker, or broker-side reject; skip and continue
+            logger.warning("%s: ORB equity order failed (skipping ticker): %s", ticker, exc)
 
     # ---- Options track: Opening Range Breakout signal, expressed via
     # calls/puts instead of shares. Independently toggleable from the
