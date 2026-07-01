@@ -44,6 +44,7 @@ from analyst_layer.pricing import estimate_cost_usd
 from analyst_layer.schemas import Action, AgentSignal, Confidence, ConsensusPayload, OrderType, RiskReview, RiskVerdict, StructureType, TradeProposal, VolConsensusPayload
 from analyst_layer.vol_graph import run_vol_consensus
 from config.settings import Settings
+from data_layer.akshare_client import MacroSnapshot, get_macro_snapshot
 from data_layer.exceptions import DataLayerError
 from data_layer.models import OptionContract, OptionType
 from data_layer.occ_symbol import parse_occ_symbol
@@ -147,6 +148,7 @@ class TradingRuntime:
         # each track checks this before running — capability flags gate infrastructure
         # availability, regime gates whether today's conditions suit the strategy.
         self._daily_regime: DailyRegime | None = None
+        self._macro_snapshot: MacroSnapshot = MacroSnapshot()
         # 60-day daily closes per ticker, reset each pre-market scan. Prevents
         # redundant data-layer calls when the same ticker appears in both the
         # correlation guard and the consensus loop, or across multiple candidates.
@@ -201,6 +203,23 @@ class TradingRuntime:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Macro news assessment failed — proceeding without it: %s", exc)
+
+        # ── AkShare macro indicators ──────────────────────────────────────────
+        # Hard economic numbers (CPI, PMI, NFP) fetched once per day in pre-market.
+        # Stored on self so _scan_and_run_consensus can inject them into agent prompts.
+        try:
+            self._macro_snapshot = get_macro_snapshot()
+            if not self._macro_snapshot.is_empty():
+                tone = self._macro_snapshot.derive_macro_tone()
+                logger.info(
+                    "AkShare macro snapshot: CPI=%s PMI_mfg=%s NFP=%s tone=%s",
+                    self._macro_snapshot.cpi_current,
+                    self._macro_snapshot.pmi_mfg_current,
+                    self._macro_snapshot.non_farm_current,
+                    tone,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("AkShare macro fetch failed — continuing without it: %s", exc)
 
         # ── SPY + VIX technical data ──────────────────────────────────────────
         try:
@@ -1144,7 +1163,8 @@ class TradingRuntime:
             accuracy_context = agent_scorer.format_accuracy_context(accuracy_rows)
             vw_win_prob = self._vw_bandit.predict_context(strategy, regime)
             vw_context = agent_scorer.format_vw_context(vw_win_prob, self._vw_bandit.example_count)
-            lessons_text = accuracy_context + vw_context + lesson_store.format_for_prompt(relevant_lessons)
+            macro_context = self._macro_snapshot.format_for_prompt()
+            lessons_text = accuracy_context + vw_context + macro_context + lesson_store.format_for_prompt(relevant_lessons)
 
             existing_shares = self._broker.get_position_shares(ticker)
 

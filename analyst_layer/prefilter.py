@@ -87,6 +87,79 @@ def _range_position(bars: list[PriceBar], window: int) -> float | None:
     return (bars[-1].close - low_n) / (high_n - low_n)
 
 
+def _kbar(bars: list[PriceBar]) -> tuple[float, float] | None:
+    """Candlestick body metrics from qlib Alpha158.
+
+    KBAR = (close - open) / (high - low):  body size as fraction of full range.
+      Near ±1 = strong directional day (close at extreme of range).
+      Near  0  = indecisive candle (doji / spinning top).
+    KSFT = (2*close - high - low) / (high - low):  close position in the range.
+      Positive = closed in upper half (bullish bias); negative = lower half.
+
+    Returns (kbar, ksft) of the most recent bar, or None if the bar has no range.
+    """
+    if not bars:
+        return None
+    b = bars[-1]
+    rng = b.high - b.low
+    if rng < 1e-9:
+        return None
+    kbar = (b.close - b.open) / rng
+    ksft = (2 * b.close - b.high - b.low) / rng
+    return kbar, ksft
+
+
+def _volume_pressure(bars: list[PriceBar], window: int) -> tuple[float, float] | None:
+    """Up/down volume pressure ratio from qlib Alpha158 (VSUMP / VSUMN).
+
+    VSUMP = fraction of window volume traded on up-close days.
+    VSUMN = fraction of window volume traded on down-close days.
+
+    VSUMP > 0.65 → buyers dominating volume (bullish).
+    VSUMN > 0.65 → sellers dominating volume (bearish distribution).
+    """
+    if len(bars) < window + 1:
+        return None
+    recent = bars[-(window + 1):]
+    vol_up = vol_down = 0.0
+    total_vol = 0.0
+    for i in range(1, len(recent)):
+        v = recent[i].volume
+        total_vol += v
+        if recent[i].close > recent[i - 1].close:
+            vol_up += v
+        elif recent[i].close < recent[i - 1].close:
+            vol_down += v
+    if total_vol == 0:
+        return None
+    return vol_up / total_vol, vol_down / total_vol
+
+
+def _amihud_illiquidity(bars: list[PriceBar], window: int) -> float | None:
+    """Amihud (2002) illiquidity ratio — from qlib Alpha158.
+
+    ILLIQ = mean(|daily_return| / dollar_volume) × 10^6
+
+    High ILLIQ = price moves a lot per dollar traded = illiquid.
+    Liquid stocks (low ILLIQ) have tight spreads and good execution quality.
+    We flag stocks above a threshold to warn agents of execution risk.
+    """
+    if len(bars) < window + 1:
+        return None
+    recent = bars[-(window + 1):]
+    ratios = []
+    for i in range(1, len(recent)):
+        b = recent[i]
+        dollar_vol = b.close * b.volume
+        if dollar_vol == 0:
+            continue
+        ret = abs(b.close / recent[i - 1].close - 1)
+        ratios.append(ret / dollar_vol)
+    if not ratios:
+        return None
+    return (sum(ratios) / len(ratios)) * 1_000_000
+
+
 def _return_volume_corr(bars: list[PriceBar], window: int) -> float | None:
     """Rolling correlation of daily returns vs log-volume changes over `window` days.
 
@@ -220,5 +293,40 @@ def evaluate_ticker(
     if rv_corr is not None and abs(rv_corr) >= 0.30:
         label = "volume confirming direction" if rv_corr > 0 else "volume rising on down days (distribution signal)"
         reasons.append(f"return-volume correlation {rv_corr:+.2f} over 20 days — {label}")
+
+    # ── Alpha158: candlestick body (KBAR / KSFT) ─────────────────────────────
+    kbar_result = _kbar(bars)
+    if kbar_result is not None:
+        kbar, ksft = kbar_result
+        if abs(kbar) >= 0.70:
+            direction = "bullish" if kbar > 0 else "bearish"
+            reasons.append(
+                f"strong {direction} candle body: KBAR={kbar:+.2f} (close vs open spans {abs(kbar):.0%} of day's range)"
+            )
+        if abs(ksft) >= 0.60:
+            half = "upper" if ksft > 0 else "lower"
+            reasons.append(
+                f"close in {half} half of day's range: KSFT={ksft:+.2f} (indicates {half}-half momentum)"
+            )
+
+    # ── Alpha158: volume directional pressure (VSUMP / VSUMN) ────────────────
+    pressure = _volume_pressure(bars, window=15)
+    if pressure is not None:
+        vsump, vsumn = pressure
+        if vsump >= 0.65:
+            reasons.append(
+                f"bullish volume pressure: {vsump:.0%} of 15-day volume traded on up-close days (VSUMP)"
+            )
+        elif vsumn >= 0.65:
+            reasons.append(
+                f"bearish volume pressure: {vsumn:.0%} of 15-day volume traded on down-close days (VSUMN — distribution)"
+            )
+
+    # ── Alpha158: Amihud illiquidity ─────────────────────────────────────────
+    illiq = _amihud_illiquidity(bars, window=20)
+    if illiq is not None and illiq > 0.5:
+        reasons.append(
+            f"elevated illiquidity (ILLIQ={illiq:.3f}): price moves sharply per dollar traded — watch execution slippage"
+        )
 
     return FilterSignal(passed=bool(reasons), regime=regime, reasons=reasons or ["no threshold crossed"])
