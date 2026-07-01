@@ -45,6 +45,7 @@ from analyst_layer.schemas import Action, AgentSignal, Confidence, ConsensusPayl
 from analyst_layer.vol_graph import run_vol_consensus
 from config.settings import Settings
 from data_layer.akshare_client import MacroSnapshot, get_macro_snapshot
+from execution_layer.guardrails import GlobalRiskState
 from data_layer.exceptions import DataLayerError
 from data_layer.models import OptionContract, OptionType
 from data_layer.occ_symbol import parse_occ_symbol
@@ -80,6 +81,7 @@ class TradingRuntime:
         watchlist: list[str],
         halt_callback: Callable[[], None] | None = None,
         wash_sale_guard: WashSaleGuard | None = None,
+        global_risk_state: GlobalRiskState | None = None,
     ) -> None:
         self._settings = settings
         self._data_client = data_client
@@ -149,6 +151,7 @@ class TradingRuntime:
         # availability, regime gates whether today's conditions suit the strategy.
         self._daily_regime: DailyRegime | None = None
         self._macro_snapshot: MacroSnapshot = MacroSnapshot()
+        self._global_risk_state: GlobalRiskState | None = global_risk_state
         # 60-day daily closes per ticker, reset each pre-market scan. Prevents
         # redundant data-layer calls when the same ticker appears in both the
         # correlation guard and the consensus loop, or across multiple candidates.
@@ -245,6 +248,30 @@ class TradingRuntime:
                 event_type="daily_regime_assessed",
                 detail=regime.log_summary(),
             )
+
+            # Push today's VIX into all breakers for dynamic position sizing
+            vix = regime.vix_current
+            for breaker in (
+                self._intraday_breaker, self._options_breaker,
+                self._thesis_breaker, self._swing_breaker,
+            ):
+                if hasattr(breaker, "set_vix"):
+                    breaker.set_vix(vix)
+
+            # Update global risk monitor (weekly + trailing drawdown checks)
+            if self._global_risk_state is not None:
+                try:
+                    equity = self._broker.get_account_equity()
+                    halted, reason = self._global_risk_state.update(equity, today)
+                    if halted:
+                        self._state_store.record_event(
+                            event_type="global_risk_halt", detail=reason
+                        )
+                        logger.error("GlobalRisk halt triggered: %s", reason)
+                    logger.info("GlobalRisk status: %s", self._global_risk_state.status())
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("GlobalRisk update failed: %s", exc)
+
             return regime
         except DataLayerError as exc:
             logger.warning(
@@ -1165,6 +1192,23 @@ class TradingRuntime:
             vw_context = agent_scorer.format_vw_context(vw_win_prob, self._vw_bandit.example_count)
             macro_context = self._macro_snapshot.format_for_prompt()
             lessons_text = accuracy_context + vw_context + macro_context + lesson_store.format_for_prompt(relevant_lessons)
+
+            # Apply robust circuit breaker size multiplier on top of Kelly
+            # (consecutive loss soft brake × VIX scaling × global halt → 0)
+            breaker_for_strategy = (
+                self._intraday_breaker if strategy in _INTRADAY_STRATEGIES
+                else self._options_breaker if strategy in _OPTIONS_STRATEGIES
+                else self._thesis_breaker if strategy in _THESIS_STRATEGIES
+                else self._swing_breaker
+            )
+            if hasattr(breaker_for_strategy, "get_size_multiplier"):
+                size_mult = breaker_for_strategy.get_size_multiplier()
+                if size_mult < 1.0:
+                    logger.info(
+                        "%s: circuit breaker size multiplier %.0f%% applied (Kelly %.4f → %.4f)",
+                        ticker, size_mult * 100, kelly_fraction, kelly_fraction * size_mult,
+                    )
+                kelly_fraction = kelly_fraction * size_mult
 
             existing_shares = self._broker.get_position_shares(ticker)
 
@@ -2518,6 +2562,21 @@ class TradingRuntime:
                     regime=regime_at_entry,
                     signals=agent_signals,
                     pnl=pnl,
+                )
+
+            # Update robust circuit breaker consecutive loss counter
+            strategy_breaker = (
+                self._intraday_breaker if strategy in _INTRADAY_STRATEGIES
+                else self._options_breaker if strategy in _OPTIONS_STRATEGIES
+                else self._thesis_breaker if strategy in _THESIS_STRATEGIES
+                else self._swing_breaker
+            )
+            if hasattr(strategy_breaker, "record_trade_outcome"):
+                strategy_breaker.record_trade_outcome(pnl > 0)
+                logger.debug(
+                    "%s: recorded %s trade outcome → %s",
+                    ticker, "WIN" if pnl > 0 else "LOSS",
+                    strategy_breaker.status_summary() if hasattr(strategy_breaker, "status_summary") else "",
                 )
 
             if not reflection.outcome_was_noise:

@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     # risk guard; this circuit breaker only stops NEW entries when the whole
     # portfolio is down 5% in a day, and no longer force-closes existing positions.
     max_daily_drawdown_pct: float = Field(default=0.05, alias="MAX_DAILY_DRAWDOWN_PCT")
+    # Weekly drawdown limit — halts ALL strategies from Monday open until next
+    # Monday if cumulative weekly loss exceeds this fraction of week-start equity.
+    max_weekly_drawdown_pct: float = Field(default=0.08, alias="MAX_WEEKLY_DRAWDOWN_PCT")
+    # Trailing drawdown limit — halts ALL strategies if account drops this far
+    # from its all-time equity peak. Requires manual reset() to resume.
+    max_trailing_drawdown_pct: float = Field(default=0.20, alias="MAX_TRAILING_DRAWDOWN_PCT")
+    # Soft brake: after this many consecutive losses on a strategy, halve its
+    # position sizing until the next win. Resets automatically on a winning trade.
+    consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
     # Profit target: once today's gain reaches this threshold the engine stops
     # trading stocks and locks in the gain. Set DAILY_PROFIT_TARGET_PCT in .env
     # for a equity-scaled target (e.g. 0.005 = 0.5% of day-start equity).

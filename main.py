@@ -18,7 +18,7 @@ from config.settings import get_settings
 from data_layer.openbb_client import OpenBBDataClient
 from execution_layer import alerting
 from execution_layer.broker import AlpacaBroker
-from execution_layer.guardrails import CircuitBreaker
+from execution_layer.guardrails import GlobalRiskState, RobustCircuitBreaker
 from execution_layer.runtime import TradingRuntime
 from execution_layer.scheduler import build_scheduler
 from execution_layer.state_store import StateStore
@@ -70,33 +70,45 @@ def main() -> None:
     anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
     data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
     broker = AlpacaBroker.from_settings(settings)
-    intraday_breaker = CircuitBreaker(
+    global_risk = GlobalRiskState(
+        max_weekly_drawdown_pct=settings.max_weekly_drawdown_pct,
+        max_trailing_drawdown_pct=settings.max_trailing_drawdown_pct,
+    )
+    intraday_breaker = RobustCircuitBreaker(
         max_position_size_pct=settings.max_position_size_pct,
         max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
         capital_limit_pct=settings.intraday_capital_pct,
         daily_profit_target_usd=settings.daily_profit_target_usd,
         name="intraday",
+        consecutive_loss_limit=settings.consecutive_loss_limit,
+        global_state=global_risk,
     )
-    options_breaker = CircuitBreaker(
+    options_breaker = RobustCircuitBreaker(
         max_position_size_pct=settings.max_position_size_pct,
         max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
         capital_limit_pct=settings.options_capital_pct,
         daily_profit_target_usd=settings.daily_profit_target_usd,
         name="options",
+        consecutive_loss_limit=settings.consecutive_loss_limit,
+        global_state=global_risk,
     )
-    thesis_breaker = CircuitBreaker(
+    thesis_breaker = RobustCircuitBreaker(
         max_position_size_pct=settings.max_position_size_pct,
         max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
         capital_limit_pct=settings.thesis_capital_pct,
         daily_profit_target_usd=settings.daily_profit_target_usd,
         name="thesis",
+        consecutive_loss_limit=settings.consecutive_loss_limit,
+        global_state=global_risk,
     )
-    swing_breaker = CircuitBreaker(
+    swing_breaker = RobustCircuitBreaker(
         max_position_size_pct=settings.max_position_size_pct,
         max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
         capital_limit_pct=settings.swing_capital_pct,
         daily_profit_target_usd=settings.daily_profit_target_usd,
         name="swing",
+        consecutive_loss_limit=settings.consecutive_loss_limit,
+        global_state=global_risk,
     )
     state_store = StateStore(settings.state_db_path)
 
@@ -118,6 +130,7 @@ def main() -> None:
         state_store=state_store,
         anthropic_client=anthropic_client,
         watchlist=WATCHLIST,
+        global_risk_state=global_risk,
     )
     scheduler = build_scheduler(runtime)
     runtime._halt_callback = scheduler.pause
