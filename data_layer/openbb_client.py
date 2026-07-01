@@ -38,44 +38,6 @@ from data_layer.sentiment_lexicon import score_headlines
 
 logger = logging.getLogger(__name__)
 
-# Market-cap-agnostic quality universe for the thesis and swing tracks.
-# Spans mega-cap tech, mid-cap growth, healthcare, financials, consumer,
-# energy, and defense. The thesis pre-filter (pullback %, shrink-volume)
-# and the swing scanner (SMA/RSI/ADV) winnow this down each session —
-# agents only run on names that clear those mechanical screens.
-# Replaces the old aggressive_small_caps + undervalued_growth screeners
-# which biased toward small-cap value traps with no catalyst.
-_QUALITY_UNIVERSE: list[str] = [
-    # Mega cap tech / AI
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "ORCL", "NFLX",
-    # Semiconductors
-    "AMD", "QCOM", "MU", "AMAT", "TXN", "LRCX", "KLAC", "ARM", "MRVL", "ON", "INTC",
-    # Cloud / Software
-    "CRM", "ADBE", "NOW", "INTU", "WDAY", "VEEV", "SNOW", "DDOG", "MDB", "HUBS", "ZM",
-    # Cybersecurity
-    "PANW", "CRWD", "FTNT", "ZS", "OKTA", "NET",
-    # AI / Data infrastructure
-    "PLTR", "AI", "PATH", "GTLB", "CFLT",
-    # Healthcare / Biotech
-    "LLY", "UNH", "ABBV", "MRK", "AMGN", "GILD", "REGN", "VRTX", "ISRG", "TMO",
-    "DHR", "DXCM", "IDXX", "SYK", "ELV", "HCA",
-    # Financials
-    "JPM", "BAC", "GS", "MS", "BLK", "V", "MA", "AXP", "COF", "SCHW", "PYPL", "SQ",
-    # Consumer / Retail
-    "COST", "WMT", "HD", "TGT", "NKE", "LULU", "SBUX", "MCD", "CMG",
-    "BKNG", "ABNB", "UBER", "LYFT",
-    # Energy
-    "XOM", "CVX", "COP", "EOG", "SLB",
-    # Industrials / Defense / Space
-    "CAT", "DE", "HON", "RTX", "LMT", "NOC", "GE", "AXON", "ROP", "SPCE",
-    # Media / Entertainment / Streaming
-    "DIS", "SPOT", "RBLX", "TTD",
-    # EV / Clean Energy
-    "RIVN", "LCID", "ENPH", "SEDG", "FSLR",
-    # Broad market ETFs — captured here so swing scanner can use SPY/QQQ
-    "SPY", "QQQ", "IWM",
-]
-
 _RETRYABLE = retry(
     reraise=True,
     stop=stop_after_attempt(3),
@@ -356,22 +318,43 @@ class OpenBBDataClient:
         return list(seen.values())
 
     def get_thesis_universe(self) -> list[ThesisCandidate]:
-        """Builds thesis/swing candidates from a quality, market-cap-agnostic universe.
+        """Scans the full market via OpenBB discovery screens — no hardcoded list.
 
-        Downloads 1 year of daily OHLCV for _QUALITY_UNIVERSE in a single
-        batched yfinance call, then computes price, 52-week high/low, MA50,
-        and MA200 for each ticker. The thesis pre-filter (pullback %) and
-        swing scanner (SMA/RSI/ADV) winnow this down — agents only run on
-        names that pass those mechanical screens.
-
-        Replaces the old aggressive_small_caps + undervalued_growth screeners
-        which returned small-cap value traps with no catalyst.
+        Pulls gainers, most-active, losers, undervalued_growth, and
+        aggressive_small_caps screens. Together these cover the entire US
+        equity market: whatever is moving today across any market cap shows up.
+        Batch-fetches 1 year of OHLCV for all unique symbols, then computes
+        price, 52-week high/low, MA50, MA200 for the thesis and swing
+        pre-filters to evaluate.
         """
         import yfinance as yf
 
+        obb = self._client()
+        symbols: set[str] = set()
+        for screen_fn in (
+            obb.equity.discovery.gainers,
+            obb.equity.discovery.active,
+            obb.equity.discovery.losers,
+            obb.equity.discovery.undervalued_growth,
+            obb.equity.discovery.aggressive_small_caps,
+        ):
+            try:
+                records = screen_fn(provider="yfinance").to_df().reset_index().to_dict(orient="records")
+                for row in records:
+                    sym = str(row.get("symbol", "")).strip().upper()
+                    if sym and sym.isalpha() and len(sym) <= 5:
+                        symbols.add(sym)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Thesis universe: screen failed (skipping): %s", exc)
+
+        if not symbols:
+            raise ProviderFetchError("thesis universe: all discovery screens failed")
+
+        logger.info("Thesis universe: %d symbols from market screens", len(symbols))
+
         try:
             raw = yf.download(
-                _QUALITY_UNIVERSE,
+                sorted(symbols),
                 period="1y",
                 auto_adjust=True,
                 progress=False,
@@ -383,21 +366,18 @@ class OpenBBDataClient:
         if raw.empty:
             raise ProviderFetchError("thesis universe: yfinance returned empty data")
 
-        try:
-            closes = raw["Close"]
-            highs = raw["High"]
-            lows = raw["Low"]
-        except KeyError as exc:
-            raise ProviderFetchError(f"thesis universe: unexpected yfinance columns: {exc}") from exc
+        closes = raw["Close"]
+        highs = raw["High"]
+        lows = raw["Low"]
 
         candidates: list[ThesisCandidate] = []
-        for symbol in _QUALITY_UNIVERSE:
+        for symbol in sorted(symbols):
             try:
                 sym_closes = closes[symbol].dropna()
                 if len(sym_closes) < 20:
                     continue
                 current_price = float(sym_closes.iloc[-1])
-                if current_price < 5.0:  # skip penny stocks / delisted
+                if current_price < 5.0:
                     continue
                 year_high = float(highs[symbol].dropna().max())
                 year_low = float(lows[symbol].dropna().min())
@@ -421,7 +401,7 @@ class OpenBBDataClient:
         if not candidates:
             raise ProviderFetchError("thesis universe: no valid candidates after price fetch")
 
-        logger.info("Thesis universe: %d quality candidates built from %d symbols", len(candidates), len(_QUALITY_UNIVERSE))
+        logger.info("Thesis universe: %d candidates ready for pre-filter", len(candidates))
         return candidates
 
     @_RETRYABLE
