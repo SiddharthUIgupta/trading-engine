@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # Soft brake: after this many consecutive losses on a strategy, halve its
     # position sizing until the next win. Resets automatically on a winning trade.
     consecutive_loss_limit: int = Field(default=3, alias="CONSECUTIVE_LOSS_LIMIT")
+    # Pre-market gap scanner (9:05 AM ET job)
+    gap_scan_min_pct: float = Field(default=0.05, alias="GAP_SCAN_MIN_PCT")
+    gap_scan_max_candidates: int = Field(default=5, alias="GAP_SCAN_MAX_CANDIDATES")
     # Profit target: once today's gain reaches this threshold the engine stops
     # trading stocks and locks in the gain. Set DAILY_PROFIT_TARGET_PCT in .env
     # for a equity-scaled target (e.g. 0.005 = 0.5% of day-start equity).

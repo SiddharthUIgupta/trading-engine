@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # Strategy sets — used to route positions to the right circuit breaker.
 _INTRADAY_STRATEGIES: frozenset[str] = frozenset({"momentum", "orb_equity", "news"})
 _OPTIONS_STRATEGIES: frozenset[str] = frozenset({"orb_options", "vol_options"})
-_THESIS_STRATEGIES: frozenset[str] = frozenset({"thesis", "recovery"})
+_THESIS_STRATEGIES: frozenset[str] = frozenset({"thesis", "recovery", "gap"})
 _SWING_STRATEGIES: frozenset[str] = frozenset({"swing"})
 
 
@@ -830,6 +830,45 @@ class TradingRuntime:
                 self._scan_and_run_consensus(news_bullish, today, equity, strategy="news")
 
         self._execute_pending_payloads(today)
+
+    # ---- Pre-market gap scanner: runs at 9:05 AM ET, queues for 9:30 open ----
+    def gap_scan_and_queue(self) -> None:
+        """Finds stocks with a meaningful pre-market gap (≥5%) and queues them
+        for execution at the 9:30 open via _pending_payloads.
+
+        Catches moves like META's 10% earnings gap that the 8:15 thesis scan
+        misses because the catalyst arrives after close. No orders are placed
+        here — market_open_execution() executes everything at 9:30.
+        """
+        if not self._settings.thesis_track_enabled or self._thesis_breaker.is_stock_halted:
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._thesis_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+
+        from analyst_layer.gap_scanner import scan_premarket_gaps
+        candidates = scan_premarket_gaps(
+            watchlist=self._watchlist,
+            min_gap_pct=getattr(self._settings, "gap_scan_min_pct", 0.05),
+            gap_up_only=True,
+            max_candidates=getattr(self._settings, "gap_scan_max_candidates", 5),
+        )
+        if not candidates:
+            logger.info("Gap scan: no stocks gapping ≥%.0f%% pre-market",
+                        getattr(self._settings, "gap_scan_min_pct", 0.05) * 100)
+            return
+
+        logger.info("=== GAP SCAN: %d candidate(s) for 9:30 execution ===", len(candidates))
+        for c in candidates:
+            logger.info("  %s: %+.1f%% pre-market (prev_close=%.2f → pre=%.2f)",
+                        c.symbol, c.gap_pct * 100, c.prev_close, c.premarket_price)
+
+        symbols = [c.symbol for c in candidates if c.symbol not in self._scanned_tickers_today]
+        if symbols:
+            self._scan_and_run_consensus(symbols, today, equity, strategy="gap")
 
     # ---- Swing trade track: multi-week holds, once-daily scan at market open ----
     def swing_scan_and_trade(self) -> None:

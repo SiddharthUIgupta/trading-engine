@@ -30,6 +30,14 @@ def build_scheduler(runtime: TradingRuntime) -> BackgroundScheduler:
         misfire_grace_time=300,
     )
     scheduler.add_job(
+        runtime.gap_scan_and_queue,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=5, timezone=EXCHANGE_TZ),
+        id="gap_scan_and_queue",
+        misfire_grace_time=120,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
         runtime.market_open_execution,
         trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=30, timezone=EXCHANGE_TZ),
         id="market_open_execution",
