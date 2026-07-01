@@ -281,12 +281,18 @@ with tab_controls:
         except Exception:
             all_log_lines = []
 
+        def _utc_iso_to_log_ts(iso: str) -> str:
+            """Convert a UTC ISO timestamp to the local-time string used in log lines."""
+            dt_utc = datetime.fromisoformat(iso)
+            dt_local = dt_utc.astimezone()   # convert UTC → server local time
+            return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+
         def _log_lines_between(from_ts: str, to_ts: str | None) -> list[str]:
-            """Return filtered log lines between two UTC ISO timestamps."""
-            # Log lines start with "YYYY-MM-DD HH:MM:SS" in local server time (UTC).
-            # Convert ISO timestamps to comparable prefixes.
-            from_cmp = from_ts[:19].replace("T", " ")
-            to_cmp = to_ts[:19].replace("T", " ") if to_ts else None
+            """Return filtered log lines between two UTC ISO timestamps.
+            Log lines use server local time, so we convert before comparing.
+            """
+            from_cmp = _utc_iso_to_log_ts(from_ts)
+            to_cmp = _utc_iso_to_log_ts(to_ts) if to_ts else None
             out = []
             for line in all_log_lines:
                 if len(line) < 19 or line[10] != " ":
@@ -305,10 +311,10 @@ with tab_controls:
         for i, entry in enumerate(history):
             next_ts = history[i + 1]["fired_at"] if i + 1 < len(history) else None
             lines = _log_lines_between(entry["fired_at"], next_ts)
-            fired_dt = datetime.fromisoformat(entry["fired_at"])
+            fired_dt_local = datetime.fromisoformat(entry["fired_at"]).astimezone()
             table_rows.append({
                 "#": i + 1,
-                "Time (UTC)": fired_dt.strftime("%H:%M:%S"),
+                "Time": fired_dt_local.strftime("%H:%M:%S"),
                 "Scan": entry["label"],
                 "Log lines": len(lines),
             })
@@ -320,8 +326,8 @@ with tab_controls:
         for i, entry in reversed(list(enumerate(history))):
             next_ts = history[i + 1]["fired_at"] if i + 1 < len(history) else None
             lines = _log_lines_between(entry["fired_at"], next_ts)
-            fired_dt = datetime.fromisoformat(entry["fired_at"])
-            header = f"#{i+1}  {entry['label']}  —  {fired_dt.strftime('%H:%M:%S')} UTC  ({len(lines)} lines)"
+            fired_dt_local = datetime.fromisoformat(entry["fired_at"]).astimezone()
+            header = f"#{i+1}  {entry['label']}  —  {fired_dt_local.strftime('%H:%M:%S')}  ({len(lines)} lines)"
             with st.expander(header, expanded=(i == len(history) - 1)):
                 if lines:
                     st.code("\n".join(lines), language=None)
