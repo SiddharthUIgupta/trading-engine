@@ -1,0 +1,18 @@
+[Unit]
+Description=Autonomous Trading Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sidgupta3391
+WorkingDirectory=/home/sidgupta3391/trading-engine
+EnvironmentFile=/home/sidgupta3391/trading-engine/.env
+ExecStart=/home/sidgupta3391/trading-engine/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/sidgupta3391/trading-engine/logs/trading_engine.log
+StandardError=append:/home/sidgupta3391/trading-engine/logs/trading_engine.log
+
+[Install]
+WantedBy=multi-user.target

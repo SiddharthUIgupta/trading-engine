@@ -22,14 +22,18 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from anthropic import Anthropic
 
-from analyst_layer import agent_scorer, lesson_store, momentum_scanner, options_structurer, orb_scanner, prefilter, thesis_scanner, universe, vol_analytics, vol_universe
+from analyst_layer import agent_scorer, lesson_store, momentum_scanner, options_structurer, orb_scanner, prefilter, swing_scanner, thesis_scanner, universe, vol_analytics, vol_universe
+from analyst_layer.vw_bandit import VWSignalBandit
 from analyst_layer.correlation import apply_correlation_adjustment, check_portfolio_correlation
 from analyst_layer.kelly import kelly_fraction_from_pnl_history
+from analyst_layer.macro_news_agent import assess_macro_sentiment
 from analyst_layer.market_regime import DailyRegime, assess_daily_regime
+from analyst_layer.recovery_scanner import evaluate_recovery_candidate
 from analyst_layer.reflection_agent import ReflectionAgent
 from analyst_layer.agents.greeks_risk_officer import PortfolioGreeks
 from analyst_layer.agents.intraday_exit_agent import IntradayExitAgent
@@ -37,14 +41,14 @@ from analyst_layer.agents.risk_officer_agent import AccountContext
 from analyst_layer.agents.vol_regime_agent import VixContext
 from analyst_layer.graph import run_consensus
 from analyst_layer.pricing import estimate_cost_usd
-from analyst_layer.schemas import Action, ConsensusPayload, StructureType, TradeProposal, VolConsensusPayload
+from analyst_layer.schemas import Action, AgentSignal, Confidence, ConsensusPayload, OrderType, RiskReview, RiskVerdict, StructureType, TradeProposal, VolConsensusPayload
 from analyst_layer.vol_graph import run_vol_consensus
 from config.settings import Settings
 from data_layer.exceptions import DataLayerError
 from data_layer.models import OptionContract, OptionType
 from data_layer.occ_symbol import parse_occ_symbol
 from data_layer.openbb_client import OpenBBDataClient
-from execution_layer import exit_rules
+from execution_layer import alerting, exit_rules
 from execution_layer.broker import AlpacaBroker
 from execution_layer.guardrails import CircuitBreaker, CircuitBreakerTripped, execute_global_shutdown
 from execution_layer.state_store import StateStore
@@ -53,13 +57,23 @@ from execution_layer.tax_compliance import WashSaleGuard
 logger = logging.getLogger(__name__)
 
 
+# Strategy sets — used to route positions to the right circuit breaker.
+_INTRADAY_STRATEGIES: frozenset[str] = frozenset({"momentum", "orb_equity", "news"})
+_OPTIONS_STRATEGIES: frozenset[str] = frozenset({"orb_options", "vol_options"})
+_THESIS_STRATEGIES: frozenset[str] = frozenset({"thesis", "recovery"})
+_SWING_STRATEGIES: frozenset[str] = frozenset({"swing"})
+
+
 class TradingRuntime:
     def __init__(
         self,
         settings: Settings,
         data_client: OpenBBDataClient,
         broker: AlpacaBroker,
-        circuit_breaker: CircuitBreaker,
+        intraday_breaker: CircuitBreaker,
+        options_breaker: CircuitBreaker,
+        thesis_breaker: CircuitBreaker,
+        swing_breaker: CircuitBreaker,
         state_store: StateStore,
         anthropic_client: Anthropic,
         watchlist: list[str],
@@ -69,7 +83,12 @@ class TradingRuntime:
         self._settings = settings
         self._data_client = data_client
         self._broker = broker
-        self._breaker = circuit_breaker
+        self._intraday_breaker = intraday_breaker
+        self._options_breaker = options_breaker
+        self._thesis_breaker = thesis_breaker
+        self._swing_breaker = swing_breaker
+        # Backward-compat alias used by equity-intraday methods (momentum, ORB equity).
+        self._breaker = intraday_breaker
         self._state_store = state_store
         self._anthropic = anthropic_client
         self._watchlist = watchlist
@@ -83,6 +102,24 @@ class TradingRuntime:
         existing_tickers = {p["ticker"] for p in state_store.get_positions() if p["quantity"] > 0}
         self._scanned_tickers_today: set[str] = set(existing_tickers)
         self._executed_tickers_today: set[str] = set(existing_tickers)
+        # Re-hydrate thesis pending payloads from today's run_history so a crash
+        # between 8:15am scan and 9:30am execution doesn't silently drop all
+        # approved BUY decisions.
+        today_str = date.today().isoformat()
+        for run in state_store.get_run_history(limit=100):
+            if run.get("created_at", "")[:10] != today_str:
+                continue
+            if not run.get("is_executable"):
+                continue
+            try:
+                payload = ConsensusPayload.model_validate(run["payload"])
+            except Exception:  # noqa: BLE001
+                continue
+            ticker = payload.proposal.ticker
+            if ticker not in self._executed_tickers_today:
+                self._pending_payloads[ticker] = payload
+                self._pending_regimes[ticker] = "unknown"
+                self._pending_strategies[ticker] = "thesis"
         # Independent from _scanned_tickers_today (the equity momentum track's
         # dedup set) — a ticker passing both screens on the same day can get
         # an equity buy AND an options buy; they're not coupled by default.
@@ -90,6 +127,12 @@ class TradingRuntime:
         self._scanned_options_tickers_today: set[str] = set(existing_option_underlyings)
         # Vol track runs once daily per ticker (premium-selling, not intraday signal)
         self._scanned_vol_tickers_today: set[str] = set()
+        # Swing track: dedup against already-open swing positions (held for weeks)
+        existing_swing_tickers = {
+            p["ticker"] for p in state_store.get_positions()
+            if p.get("strategy") == "swing" and p["quantity"] > 0
+        }
+        self._scanned_swing_tickers_today: set[str] = set(existing_swing_tickers)
         self._exit_agent = IntradayExitAgent(
             anthropic_client, settings.anthropic_subagent_model, usage_callback=self._record_usage
         )
@@ -108,13 +151,58 @@ class TradingRuntime:
         # redundant data-layer calls when the same ticker appears in both the
         # correlation guard and the consensus loop, or across multiple candidates.
         self._price_cache: dict[str, list[float]] = {}
+        # VW contextual bandit — online logistic regression that learns win
+        # probability from track × regime × agent signal patterns. Persisted to
+        # disk alongside the state DB; warm-started from DB history on first run.
+        vw_model_path = settings.state_db_path.parent / "vw_bandit.model"
+        self._vw_bandit = VWSignalBandit(model_path=vw_model_path)
+        if not vw_model_path.exists():
+            historical_logs = state_store.get_scored_signal_logs(limit=2000)
+            if historical_logs:
+                self._vw_bandit.warm_start(historical_logs)
 
     def _assess_market_regime(self, today: date) -> DailyRegime | None:
-        """Fetch SPY and VIX daily bars and run the zero-LLM regime assessment.
+        """Fetch SPY/VIX bars and run the regime assessment.
 
-        Returns None on any data failure — callers treat None as 'use safe defaults'
-        (arm directional tracks, disarm vol selling).
+        Optionally runs the macro news agent first — the LLM generates search
+        queries tailored to today's date, fetches headlines, and scores overall
+        market sentiment. That sentiment then adjusts the effective VIX used in
+        the threshold decisions (bullish news → lower effective VIX, potentially
+        arming thesis/recovery near boundary; bearish news → raise it).
+
+        Returns None on data failure — callers treat None as 'use safe defaults'.
         """
+        # ── Optional macro news pre-assessment ───────────────────────────────
+        macro_sentiment: str | None = None
+        macro_confidence: float = 0.0
+        macro_themes: list[str] = []
+        news_ticker_signals: list[dict] = []
+        if self._settings.macro_news_enabled:
+            try:
+                macro = assess_macro_sentiment(
+                    client=self._anthropic,
+                    model=self._settings.anthropic_subagent_model,
+                    today=today,
+                )
+                macro_sentiment = macro.sentiment
+                macro_confidence = macro.confidence
+                macro_themes = list(macro.key_themes)
+                news_ticker_signals = [
+                    {"ticker": s.ticker, "catalyst": s.catalyst, "direction": s.direction}
+                    for s in macro.news_tickers
+                ]
+                self._state_store.record_event(
+                    event_type="macro_news_assessed",
+                    detail=(
+                        f"sentiment={macro_sentiment} confidence={macro_confidence:.2f} "
+                        f"themes={macro_themes} headlines={macro.headlines_read} "
+                        f"tickers={[s['ticker'] for s in news_ticker_signals]}"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Macro news assessment failed — proceeding without it: %s", exc)
+
+        # ── SPY + VIX technical data ──────────────────────────────────────────
         try:
             spy_series = self._data_client.get_price_history(
                 "SPY", start_date=today - timedelta(days=60), end_date=today
@@ -123,7 +211,16 @@ class TradingRuntime:
                 "^VIX", start_date=today - timedelta(days=45), end_date=today
             )
             spy_closes = [b.close for b in spy_series.bars]
-            regime = assess_daily_regime(spy_closes, vix_series.bars)
+            regime = assess_daily_regime(
+                spy_closes,
+                vix_series.bars,
+                macro_sentiment=macro_sentiment,
+                macro_confidence=macro_confidence,
+                macro_themes=macro_themes,
+                macro_vix_adjustment=self._settings.macro_news_vix_adjustment,
+                macro_min_confidence=self._settings.macro_news_min_confidence,
+                news_ticker_signals=news_ticker_signals,
+            )
             logger.info("%s", regime.log_summary())
             self._state_store.record_event(
                 event_type="daily_regime_assessed",
@@ -135,6 +232,89 @@ class TradingRuntime:
                 "Market regime assessment failed — tracks fall back to safe defaults: %s", exc
             )
             return None
+
+    # ── Per-agent capital helpers ─────────────────────────────────────────────
+
+    def _get_deployed_notional(
+        self, strategies: frozenset[str], include_options: bool = False
+    ) -> float:
+        """Sum of open position notional (cost basis) for the given strategies.
+        Options use the 100-share multiplier.
+        """
+        total = 0.0
+        if not include_options:
+            for pos in self._state_store.get_positions():
+                if pos["quantity"] > 0 and pos.get("strategy", "momentum") in strategies:
+                    total += pos["quantity"] * pos["avg_entry_price"]
+        else:
+            for pos in self._state_store.get_option_positions():
+                if pos.get("quantity", 0) > 0 and pos.get("strategy", "orb_options") in strategies:
+                    total += pos["quantity"] * pos["avg_entry_price"] * 100
+        return total
+
+    def _get_total_deployed_notional(self) -> float:
+        """Total deployed across ALL agents — used for shared-pool enforcement."""
+        equity_total = sum(
+            p["quantity"] * p["avg_entry_price"]
+            for p in self._state_store.get_positions()
+            if p["quantity"] > 0
+        )
+        options_total = sum(
+            p["quantity"] * p["avg_entry_price"] * 100
+            for p in self._state_store.get_option_positions()
+            if p.get("quantity", 0) > 0
+        )
+        return equity_total + options_total
+
+    def _compute_today_pnl(
+        self, strategies: frozenset[str], include_options: bool = False
+    ) -> float:
+        """Compute today-only P&L for the given agent strategies.
+
+        = realized P&L from positions closed today
+        + unrealized P&L on positions opened today (from broker live prices).
+        Pre-existing overnight positions are excluded.
+        """
+        today_str = date.today().isoformat()
+        pnl = 0.0
+
+        # Realized from equity sells today
+        for s in self._state_store.get_all_realized_sales(limit=200):
+            if s["sale_date"] == today_str:
+                pnl += s["realized_pnl"]
+
+        if include_options:
+            for s in self._state_store.get_all_realized_option_sales(limit=200):
+                if s["sale_date"] == today_str:
+                    pnl += s["realized_pnl"]
+
+        # Unrealized on positions opened today
+        try:
+            broker_by_symbol = {p["symbol"]: p for p in self._broker.get_all_positions()}
+            if not include_options:
+                for pos in self._state_store.get_positions():
+                    if (
+                        pos.get("strategy", "momentum") in strategies
+                        and pos["last_buy_at"]
+                        and pos["last_buy_at"][:10] == today_str
+                        and pos["ticker"] in broker_by_symbol
+                    ):
+                        bp = broker_by_symbol[pos["ticker"]]
+                        pnl += (bp["current_price"] - bp["avg_entry_price"]) * bp["qty"]
+            else:
+                for pos in self._state_store.get_option_positions():
+                    if (
+                        pos.get("strategy", "orb_options") in strategies
+                        and pos.get("opened_at")
+                        and pos["opened_at"][:10] == today_str
+                        and pos["contract_symbol"] in broker_by_symbol
+                    ):
+                        bp = broker_by_symbol[pos["contract_symbol"]]
+                        pnl += (bp["current_price"] - bp["avg_entry_price"]) * bp["qty"] * 100
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch live positions for P&L computation: %s", exc)
+
+        return pnl
 
     def refresh_vol_universe(self) -> None:
         """Screen a dynamic candidate pool for options liquidity and update
@@ -171,14 +351,11 @@ class TradingRuntime:
     def pre_market_scan(self) -> None:
         equity = self._broker.get_equity()
         today = date.today()
-        self._breaker.start_trading_day(
-            equity=equity, today=today,
-            profit_target_pct=self._settings.daily_profit_target_pct,
-        )
-        # Persisted so anything outside this process (e.g. the dashboard) can
-        # compute *today's* P&L correctly, instead of assuming the account's
-        # original opening balance is "today's starting point" — it isn't,
-        # after the first day.
+        for breaker in (self._intraday_breaker, self._options_breaker, self._thesis_breaker, self._swing_breaker):
+            breaker.start_trading_day(
+                equity=equity, today=today,
+                profit_target_pct=self._settings.daily_profit_target_pct,
+            )
         self._state_store.record_event(event_type="day_start_equity", detail=f"{equity:.2f}")
         self._pending_payloads.clear()
         self._pending_regimes.clear()
@@ -187,6 +364,7 @@ class TradingRuntime:
         self._executed_tickers_today.clear()
         self._scanned_options_tickers_today.clear()
         self._scanned_vol_tickers_today.clear()
+        self._scanned_swing_tickers_today.clear()
         self._price_cache.clear()
 
         self._daily_regime = self._assess_market_regime(today)
@@ -238,51 +416,141 @@ class TradingRuntime:
         except DataLayerError as exc:
             logger.error("Momentum scan: market movers fetch failed: %s", exc)
             return
+        movers_by_symbol = {m.symbol: m for m in movers}
         candidates = [m.symbol for m in movers]
         new_candidates = [c for c in candidates if c not in self._scanned_tickers_today]
         if not new_candidates:
             return
 
         logger.info("=== INTRADAY MOMENTUM SCAN (ORB signal): %d new candidate(s) ===", len(new_candidates))
-        self._scan_and_trade_orb_equities(new_candidates, today, equity)
+        self._scan_and_trade_orb_equities(new_candidates, today, equity, movers_by_symbol)
 
-    def _scan_and_trade_orb_equities(self, candidates: list[str], today: date, equity: float) -> None:
-        """Long-only: a confirmed short breakdown is a real ORB signal,
-        but this system has no short-selling infrastructure (margin
-        requirements, unbounded loss profile, none of the existing
-        guardrail math accounts for it) — the options track already
-        expresses ORB's bearish signals safely via buying puts, which
-        is the intended outlet for those, not equities.
+    def _scan_and_trade_orb_equities(
+        self, candidates: list[str], today: date, equity: float,
+        movers_by_symbol: dict | None = None,
+    ) -> None:
+        """SPY direction router:
+        - SPY green → take long ORB breakouts as equity entries.
+        - SPY red  → skip equity longs, but route confirmed short ORB breakdowns
+          to put options (buying puts on a breakdown on a down-market day is a
+          higher-quality signal than the general options scan, which sprays
+          candidates regardless of macro direction).
+        Equity short-selling is never done here — undefined risk, no margin infra.
         """
-        signals_found = 0
-        max_positions = self._settings.max_open_equity_positions
+        spy_positive: bool = True
+        if self._settings.orb_require_spy_positive:
+            try:
+                spy_intraday = self._data_client.get_price_history("SPY", start_date=today, end_date=today, interval="5m")
+                if spy_intraday.bars:
+                    spy_positive = spy_intraday.bars[-1].close >= spy_intraday.bars[0].open
+                    if not spy_positive:
+                        bearish_mode = self._settings.orb_spy_red_puts_enabled
+                        logger.info(
+                            "ORB scan: SPY red today — %s",
+                            "routing short breakdowns to puts" if bearish_mode else "skipping all entries",
+                        )
+            except DataLayerError:
+                pass  # SPY fetch failed → proceed as if green
+
+        long_signals = 0
+        short_signals = 0
+        max_equity = self._settings.max_open_equity_positions
+        max_opts = self._settings.max_open_options_positions
+
         for ticker in candidates:
-            open_count = len([p for p in self._state_store.get_positions() if p["quantity"] > 0])
-            if open_count >= max_positions:
-                logger.info(
-                    "ORB scan: %d/%d equity positions open — at cap, skipping remaining candidates",
-                    open_count, max_positions,
-                )
-                break
+            # Position cap — depends on which direction we're trading
+            if spy_positive:
+                open_count = len([p for p in self._state_store.get_positions() if p["quantity"] > 0])
+                if open_count >= max_equity:
+                    logger.info("ORB scan: %d/%d equity positions open — at cap", open_count, max_equity)
+                    break
+            elif self._settings.orb_spy_red_puts_enabled:
+                open_opts = len([p for p in self._state_store.get_option_positions() if p.get("quantity", 0) > 0])
+                if open_opts >= max_opts:
+                    logger.info("ORB bearish scan: %d/%d option positions open — at cap", open_opts, max_opts)
+                    break
+            else:
+                break  # SPY red, puts disabled — nothing to do
+
+            # Pre-screen: upside gap filter is only meaningful for long entries.
+            # On red SPY days we skip it — downside gaps and flat opens can both
+            # produce valid short breakdowns.
+            if spy_positive and movers_by_symbol:
+                mover = movers_by_symbol.get(ticker)
+                if mover is not None and mover.percent_change < self._settings.orb_min_gap_pct * 100:
+                    logger.debug(
+                        "%s: ORB pre-screen skip — change %.1f%% < gap threshold %.1f%%",
+                        ticker, mover.percent_change, self._settings.orb_min_gap_pct * 100,
+                    )
+                    self._scanned_tickers_today.add(ticker)
+                    continue
 
             self._scanned_tickers_today.add(ticker)
+
+            # Float filter only relevant for equity longs
+            if spy_positive and self._settings.orb_max_float_shares > 0:
+                try:
+                    shares_float = self._data_client.get_shares_float(ticker)
+                    if shares_float > self._settings.orb_max_float_shares:
+                        logger.debug("%s: ORB skip — float %dM > cap %dM",
+                                     ticker, shares_float // 1_000_000,
+                                     self._settings.orb_max_float_shares // 1_000_000)
+                        continue
+                except DataLayerError:
+                    pass
+
             try:
                 intraday = self._data_client.get_price_history(ticker, start_date=today, end_date=today, interval="5m")
             except DataLayerError as exc:
-                logger.debug("%s: skipped for ORB equity scan (%s)", ticker, exc)
+                logger.debug("%s: skipped for ORB scan (%s)", ticker, exc)
                 continue
 
-            signal = orb_scanner.evaluate_orb(intraday, opening_range_minutes=15, volume_confirmation_multiple=1.5)
-            if signal.direction != "long":
-                continue
+            # Prior close for gap filter — only needed for the long/upside-gap check
+            prior_close: float | None = None
+            if spy_positive:
+                try:
+                    daily_closes = self._get_daily_closes(ticker, today)
+                    if daily_closes and len(daily_closes) >= 2:
+                        prior_close = daily_closes[-2]
+                except Exception:
+                    pass
 
-            signals_found += 1
-            logger.info("%s: ORB long signal (%s)", ticker, "; ".join(signal.reasons))
-            self._open_orb_equity_position(ticker, signal, equity, today)
+            signal = orb_scanner.evaluate_orb(
+                intraday,
+                opening_range_minutes=15,
+                volume_confirmation_multiple=self._settings.orb_volume_confirmation_multiple,
+                prior_close=prior_close,
+                min_gap_pct=self._settings.orb_min_gap_pct if spy_positive else None,
+            )
+
+            if spy_positive:
+                if signal.direction != "long":
+                    if signal.gap_pct is not None and signal.gap_pct < self._settings.orb_min_gap_pct:
+                        logger.debug("%s: ORB skipped — gap %.1f%% below %.1f%% threshold",
+                                     ticker, (signal.gap_pct or 0) * 100, self._settings.orb_min_gap_pct * 100)
+                    continue
+                long_signals += 1
+                logger.info("%s: ORB long signal — gap=%.1f%% (%s)",
+                            ticker, (signal.gap_pct or 0) * 100, "; ".join(signal.reasons))
+                self._open_orb_equity_position(ticker, signal, equity, today)
+            else:
+                # SPY red: only act on confirmed short breakdowns
+                if signal.direction != "short":
+                    continue
+                if ticker in self._scanned_options_tickers_today:
+                    continue  # already handled by the regular options scan
+                short_signals += 1
+                logger.info("%s: ORB short breakdown on red SPY — buying puts (%s)",
+                            ticker, "; ".join(signal.reasons))
+                self._scanned_options_tickers_today.add(ticker)
+                self._open_option_position(ticker, Action.SELL, equity, today)
 
         self._state_store.record_event(
             event_type="momentum_orb_scan_summary",
-            detail=f"{signals_found} long ORB signal(s) found across {len(candidates)} candidates",
+            detail=(
+                f"{long_signals} long equity signal(s), {short_signals} bearish put signal(s) "
+                f"across {len(candidates)} candidates (SPY={'green' if spy_positive else 'red'})"
+            ),
         )
 
     def _open_orb_equity_position(self, ticker: str, signal, equity: float, today: date) -> None:
@@ -309,6 +577,28 @@ class TradingRuntime:
             self._record_order_event(ticker, proposal, result)
             self._record_fill(ticker, proposal, today, entry_regime="bullish_crossover", strategy="orb")
             self._state_store.upsert_position(ticker, int(self._broker.get_position_shares(ticker)), current_price, stop_price=stop_price, target_price=target_price)
+            # Write a run_history entry so _run_reflection can produce lessons for ORB trades.
+            gap_str = f", gap {signal.gap_pct:.1%}" if getattr(signal, "gap_pct", None) is not None else ""
+            orb_payload = ConsensusPayload(
+                ticker=ticker,
+                signals=[AgentSignal(
+                    agent_name="orb_scanner",
+                    ticker=ticker,
+                    stance=Action.BUY,
+                    confidence=Confidence.MEDIUM,
+                    rationale=f"ORB breakout: range {signal.opening_range_low:.2f}–{signal.opening_range_high:.2f}{gap_str}",
+                    generated_at=datetime.now(timezone.utc),
+                )],
+                proposal=proposal,
+                risk_review=RiskReview(
+                    verdict=RiskVerdict.APPROVED,
+                    reasons=["ORB scanner: gap, volume, and SPY filters passed"],
+                    max_position_size_pct_checked=self._settings.max_position_size_pct,
+                    max_daily_drawdown_pct_checked=self._settings.max_daily_drawdown_pct,
+                    reviewed_at=datetime.now(timezone.utc),
+                ),
+            )
+            self._state_store.record_run(orb_payload)
 
             new_equity = self._broker.get_equity()
             if self._breaker.check_profit_target(new_equity):
@@ -332,13 +622,13 @@ class TradingRuntime:
     # volume confirmation — a much more honest signal source. ----
     def options_scan_and_trade(self) -> None:
         orb_opt_armed = self._daily_regime.arm_orb_options if self._daily_regime else True
-        if not self._settings.options_track_enabled or not orb_opt_armed or self._breaker.is_options_halted:
+        if not self._settings.options_track_enabled or not orb_opt_armed or self._options_breaker.is_options_halted:
             if self._settings.options_track_enabled and not orb_opt_armed:
                 logger.info("ORB options scan skipped — regime disarmed for today (neutral market)")
             return
         today = date.today()
         equity = self._broker.get_equity()
-        self._breaker.ensure_day_started(
+        self._options_breaker.ensure_day_started(
             equity=equity, today=today,
             profit_target_pct=self._settings.daily_profit_target_pct,
         )
@@ -421,7 +711,7 @@ class TradingRuntime:
             return
 
         try:
-            self._breaker.assert_options_trading_allowed()
+            self._options_breaker.assert_options_trading_allowed()
             result = self._broker.submit_option_order(
                 contract.contract_symbol, side=Action.BUY, contracts=contracts, limit_price=contract.ask
             )
@@ -433,42 +723,280 @@ class TradingRuntime:
             )
 
             new_equity = self._broker.get_equity()
-            if self._breaker.check_profit_target(new_equity):
-                self._lock_in_profit(reason=f"daily profit target reached after options trade on {ticker}, equity={new_equity:.2f}")
+            if self._options_breaker.check_profit_target(new_equity):
+                self._lock_in_profit(reason=f"daily profit target reached after options trade on {ticker}, equity={new_equity:.2f}", breaker=self._options_breaker)
         except CircuitBreakerTripped as exc:
             logger.error("Circuit breaker blocked options order for %s: %s", ticker, exc)
-            self._trip_breaker(reason=str(exc))
+            self._trip_agent(self._options_breaker, reason=str(exc))
 
     # ---- Runs once daily — fundamentals don't change intraday ----
     def thesis_scan_and_trade(self) -> None:
         thesis_armed = self._daily_regime.arm_thesis if self._daily_regime else True
-        if not self._settings.thesis_track_enabled or not thesis_armed or self._breaker.is_stock_halted:
-            if self._settings.thesis_track_enabled and not thesis_armed:
-                logger.info("Thesis scan skipped — regime disarmed (VIX > 30, fear environment)")
+        any_enabled = self._settings.thesis_track_enabled or self._settings.recovery_track_enabled
+        if not any_enabled or not thesis_armed or self._thesis_breaker.is_stock_halted:
+            if any_enabled and not thesis_armed:
+                logger.info("Thesis/recovery scan skipped — regime disarmed (VIX > 30, fear environment)")
             return
         today = date.today()
-        candidates = self._build_thesis_candidates(today)
-        new_candidates = [c for c in candidates if c not in self._scanned_tickers_today]
-        if not new_candidates:
-            return
-
-        logger.info("=== THESIS SCAN: %d new candidate(s) ===", len(new_candidates))
         equity = self._broker.get_equity()
-        self._breaker.ensure_day_started(
+        self._thesis_breaker.ensure_day_started(
             equity=equity, today=today,
             profit_target_pct=self._settings.daily_profit_target_pct,
         )
-        self._scan_and_run_consensus(new_candidates, today, equity, strategy="thesis")
+
+        # Fetch discovery universe once — shared between thesis and recovery screens
+        try:
+            universe = self._data_client.get_thesis_universe()
+        except DataLayerError as exc:
+            logger.error("Thesis/recovery universe fetch failed: %s", exc)
+            return
+
+        if self._settings.thesis_track_enabled:
+            thesis_candidates = self._build_thesis_candidates(today, universe=universe)
+            new_thesis = [c for c in thesis_candidates if c not in self._scanned_tickers_today]
+            if new_thesis:
+                logger.info("=== THESIS SCAN: %d new candidate(s) ===", len(new_thesis))
+                self._scan_and_run_consensus(new_thesis, today, equity, strategy="thesis")
+
+        if self._settings.recovery_track_enabled:
+            recovery_candidates = self._build_recovery_candidates(today, universe=universe)
+            new_recovery = [c for c in recovery_candidates if c not in self._scanned_tickers_today]
+            if new_recovery:
+                logger.info("=== RECOVERY SCAN: %d new candidate(s) ===", len(new_recovery))
+                self._scan_and_run_consensus(new_recovery, today, equity, strategy="recovery")
+
+        # News-driven tickers: bullish catalysts discovered by macro_news_agent.
+        # Bypass the technical pull-back screens — the news catalyst IS the entry
+        # signal. Still goes through the full LLM consensus + risk officer.
+        if self._daily_regime and self._daily_regime.news_ticker_signals:
+            news_bullish = [
+                s["ticker"] for s in self._daily_regime.news_ticker_signals
+                if s.get("direction") == "bullish" and s["ticker"] not in self._scanned_tickers_today
+            ]
+            if news_bullish:
+                logger.info(
+                    "=== NEWS-DRIVEN SCAN: %d ticker(s) with bullish catalysts from macro news agent ===",
+                    len(news_bullish),
+                )
+                for sig in self._daily_regime.news_ticker_signals:
+                    if sig.get("direction") == "bullish" and sig["ticker"] in news_bullish:
+                        logger.info("  %s: %s", sig["ticker"], sig.get("catalyst", ""))
+                self._scan_and_run_consensus(news_bullish, today, equity, strategy="news")
+
         self._execute_pending_payloads(today)
 
-    def _build_thesis_candidates(self, today: date) -> list[str]:
+    # ---- Swing trade track: multi-week holds, once-daily scan at market open ----
+    def swing_scan_and_trade(self) -> None:
+        """Runs once daily at 9:35am ET (after prices stabilize at open).
+
+        Entry: intact uptrend (price > SMA20 > SMA50) + RSI in [35, 65] + min ADV $5M.
+        Bearish news tickers from today's macro assessment are excluded.
+        Positions already at the cap are skipped without scanning.
+
+        Exit is handled by _check_swing_exits in intraday_monitoring:
+          - 8% hard stop from avg entry
+          - Trailing stop (12% activation, 7% trail)
+          - Max hold (21 calendar days)
+          - Adverse news catalyst for the specific ticker
+        """
+        if not self._settings.swing_track_enabled or self._swing_breaker.is_stock_halted:
+            return
+
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._swing_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+
+        # Position cap: count existing open swing positions (held from prior days too)
+        existing_swing = {
+            p["ticker"] for p in self._state_store.get_positions()
+            if p.get("strategy") == "swing" and p["quantity"] > 0
+        }
+        remaining_slots = self._settings.swing_max_open_positions - len(existing_swing)
+        if remaining_slots <= 0:
+            logger.info(
+                "Swing scan: %d/%d positions open — at cap, skipping scan",
+                len(existing_swing), self._settings.swing_max_open_positions,
+            )
+            return
+
+        # Tickers with bearish news from today's macro assessment are blocked
+        bearish_news = set()
+        if self._daily_regime and self._daily_regime.news_ticker_signals:
+            bearish_news = {
+                s["ticker"] for s in self._daily_regime.news_ticker_signals
+                if s.get("direction") == "bearish"
+            }
+
+        # Universe: thesis discovery pool + static watchlist, deduped
+        try:
+            raw_universe = self._data_client.get_thesis_universe()
+            universe_symbols = [c.symbol for c in raw_universe]
+        except DataLayerError as exc:
+            logger.warning("Swing scan: thesis universe fetch failed, falling back to watchlist: %s", exc)
+            universe_symbols = list(self._watchlist)
+
+        all_symbols = list(dict.fromkeys(universe_symbols + list(self._watchlist)))
+
+        passed: list[tuple[str, float]] = []
+        for symbol in all_symbols:
+            if symbol in existing_swing or symbol in self._scanned_swing_tickers_today:
+                continue
+            if symbol in bearish_news:
+                logger.debug("%s: swing scan skipped — bearish news catalyst today", symbol)
+                continue
+            self._scanned_swing_tickers_today.add(symbol)
+
+            try:
+                series = self._data_client.get_price_history(
+                    symbol, start_date=today - timedelta(days=65), end_date=today
+                )
+            except DataLayerError as exc:
+                logger.debug("%s: swing scan price fetch failed — %s", symbol, exc)
+                continue
+
+            signal = swing_scanner.evaluate_swing_candidate(series)
+            if signal.passed:
+                logger.info("%s: swing scan PASSED (%s)", symbol, "; ".join(signal.reasons))
+                self._price_cache[symbol] = [b.close for b in series.bars]
+                passed.append((symbol, signal.score))
+            else:
+                logger.debug("%s: swing scan failed — %s", symbol, signal.reasons[0] if signal.reasons else "")
+
+        passed.sort(key=lambda pair: pair[1], reverse=True)
+        candidates = [ticker for ticker, _ in passed[:remaining_slots]]
+
+        self._state_store.record_event(
+            event_type="swing_scan_summary",
+            detail=(
+                f"passed={len(passed)}/{len(all_symbols)} candidates, "
+                f"capped to {len(candidates)} (slots remaining={remaining_slots})"
+            ),
+        )
+
+        if not candidates:
+            return
+
+        logger.info("=== SWING SCAN: %d new candidate(s) ===", len(candidates))
+        self._scan_and_run_consensus(candidates, today, equity, strategy="swing")
+        self._execute_pending_payloads(today)
+
+    def _check_swing_exits(self, equity: float) -> None:
+        """Per-position exit checks for swing positions.
+
+        Three rules:
+          1. Hard stop: current_price < avg_entry * (1 - swing_stop_loss_pct)
+          2. Max hold: entry date + swing_max_hold_days exceeded
+          3. Adverse news: ticker appears in today's bearish macro news signals
+
+        Trailing stop is also applied via exit_rules.evaluate_exit using swing parameters.
+        All four checks are independent — the first one triggered exits the position.
+        """
+        today = date.today()
+        for position in self._state_store.get_positions():
+            if self._swing_breaker.is_stock_halted:
+                return
+            ticker = position["ticker"]
+            if position["quantity"] <= 0 or position.get("strategy") != "swing":
+                continue
+
+            detail = self._broker.get_position_detail(ticker)
+            if detail is None or detail["qty"] <= 0:
+                continue
+
+            current_price = detail["current_price"]
+            avg_entry = position["avg_entry_price"]
+            if avg_entry <= 0:
+                continue
+
+            should_exit = False
+            reason = ""
+
+            # 1. Hard stop (8%)
+            loss_pct = (avg_entry - current_price) / avg_entry
+            if loss_pct >= self._settings.swing_stop_loss_pct:
+                should_exit = True
+                reason = (
+                    f"swing stop hit: entry {avg_entry:.2f}, current {current_price:.2f} "
+                    f"({loss_pct:.1%} loss >= {self._settings.swing_stop_loss_pct:.0%} limit)"
+                )
+
+            # 2. Max hold days exceeded
+            if not should_exit and position.get("last_buy_at"):
+                try:
+                    entry_date = date.fromisoformat(position["last_buy_at"][:10])
+                    hold_days = (today - entry_date).days
+                    if hold_days > self._settings.swing_max_hold_days:
+                        should_exit = True
+                        reason = (
+                            f"swing max hold exceeded: {hold_days}d > "
+                            f"{self._settings.swing_max_hold_days}d limit"
+                        )
+                except ValueError:
+                    pass
+
+            # 3. Adverse news catalyst for this ticker
+            if not should_exit and self._daily_regime and self._daily_regime.news_ticker_signals:
+                for sig in self._daily_regime.news_ticker_signals:
+                    if sig.get("ticker") == ticker and sig.get("direction") == "bearish":
+                        should_exit = True
+                        reason = f"adverse news catalyst: {sig.get('catalyst', 'bearish news signal')}"
+                        break
+
+            # 4. Trailing stop via exit_rules
+            if not should_exit:
+                self._state_store.update_high_water_mark(ticker, current_price)
+                high_water_mark = max(position.get("high_water_mark") or avg_entry, current_price)
+                decision = exit_rules.evaluate_exit(
+                    avg_entry_price=avg_entry,
+                    current_price=current_price,
+                    high_water_mark=high_water_mark,
+                    stop_loss_pct=self._settings.swing_stop_loss_pct,
+                    take_profit_pct=None,
+                    trailing_stop_pct=self._settings.swing_trailing_stop_pct,
+                    trailing_stop_activation_pct=self._settings.swing_trailing_stop_activation_pct,
+                )
+                if decision.should_exit:
+                    should_exit = True
+                    reason = f"swing trailing stop: {decision.reason}"
+
+            if not should_exit:
+                continue
+
+            logger.info("%s: swing exit — %s", ticker, reason)
+            proposal = TradeProposal(
+                ticker=ticker, action=Action.SELL,
+                quantity=int(detail["qty"]), limit_price=current_price,
+            )
+            self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
+            try:
+                self._swing_breaker.assert_not_tripped()
+                result = self._broker.submit_order(proposal)
+                logger.info("%s: swing exit order result=%s", ticker, result)
+                self._record_order_event(ticker, proposal, result)
+                self._record_fill(ticker, proposal, today)
+                equity = self._broker.get_equity()
+                if self._swing_breaker.check_profit_target(equity):
+                    self._lock_in_profit(
+                        reason=f"daily profit target reached after swing exit of {ticker}, equity={equity:.2f}",
+                        breaker=self._swing_breaker,
+                    )
+                    return
+            except CircuitBreakerTripped as exc:
+                logger.error("Circuit breaker blocked swing exit for %s: %s", ticker, exc)
+                self._trip_agent(self._swing_breaker, reason=str(exc))
+                return
+
+    def _build_thesis_candidates(self, today: date, universe: list | None = None) -> list[str]:
         """Scans OpenBB's aggressive_small_caps/undervalued_growth discovery
         screens for names pulled back from their 52-week high, capped at
-        `thesis_max_daily_candidates`. Deliberately not gated by the momentum
-        scanner's float/volume/price-action criteria — opposite use case.
+        `thesis_max_daily_candidates`. `universe` can be pre-fetched and shared
+        with `_build_recovery_candidates` to avoid a duplicate API call.
         """
         try:
-            candidates = self._data_client.get_thesis_universe()
+            candidates = universe if universe is not None else self._data_client.get_thesis_universe()
         except DataLayerError as exc:
             logger.error("Thesis universe fetch failed: %s", exc)
             return []
@@ -509,6 +1037,55 @@ class TradingRuntime:
         self._state_store.record_event(
             event_type="thesis_scan_summary",
             detail=f"passed={len(passed)}/{len(candidates)} thesis-universe candidates, capped to {len(capped)}",
+        )
+        return capped
+
+    def _build_recovery_candidates(self, today: date, universe: list | None = None) -> list[str]:
+        """Screens the same discovery universe as thesis for market-recovery plays:
+        stocks that pulled back 15–40% from their 60-day high but now show
+        positive 5-day momentum, price above MA20, and rising volume.
+
+        Uses price history fetched for each candidate (60-day daily) — the same
+        data `_get_daily_closes` caches, so follow-on correlation checks are free.
+        """
+        try:
+            raw_universe = universe if universe is not None else self._data_client.get_thesis_universe()
+        except DataLayerError as exc:
+            logger.error("Recovery universe fetch failed: %s", exc)
+            return []
+
+        passed: list[tuple[str, float]] = []
+        for candidate in raw_universe:
+            ticker = candidate.symbol
+            # Don't scan tickers already evaluated by the thesis screen this session
+            if ticker in self._scanned_tickers_today:
+                continue
+            try:
+                series = self._data_client.get_price_history(
+                    ticker, start_date=today - timedelta(days=65), end_date=today
+                )
+            except DataLayerError as exc:
+                logger.debug("%s: recovery price fetch failed — %s", ticker, exc)
+                continue
+
+            signal = evaluate_recovery_candidate(
+                series,
+                min_pullback_pct=self._settings.recovery_min_pullback_pct,
+                max_pullback_pct=self._settings.recovery_max_pullback_pct,
+                volume_pickup_ratio=self._settings.recovery_volume_pickup_ratio,
+            )
+            if signal.passed:
+                logger.info("%s: recovery scan PASSED (%s)", ticker, "; ".join(signal.reasons))
+                self._price_cache[ticker] = [b.close for b in series.bars]
+                passed.append((ticker, signal.score))
+            else:
+                logger.debug("%s: recovery scan failed — %s", ticker, signal.reasons[0] if signal.reasons else "")
+
+        passed.sort(key=lambda pair: pair[1], reverse=True)
+        capped = [ticker for ticker, _ in passed[: self._settings.recovery_max_daily_candidates]]
+        self._state_store.record_event(
+            event_type="recovery_scan_summary",
+            detail=f"passed={len(passed)}/{len(raw_universe)} candidates, capped to {len(capped)}",
         )
         return capped
 
@@ -565,7 +1142,9 @@ class TradingRuntime:
 
             accuracy_rows = self._state_store.get_agent_accuracy(strategy, regime)
             accuracy_context = agent_scorer.format_accuracy_context(accuracy_rows)
-            lessons_text = accuracy_context + lesson_store.format_for_prompt(relevant_lessons)
+            vw_win_prob = self._vw_bandit.predict_context(strategy, regime)
+            vw_context = agent_scorer.format_vw_context(vw_win_prob, self._vw_bandit.example_count)
+            lessons_text = accuracy_context + vw_context + lesson_store.format_for_prompt(relevant_lessons)
 
             existing_shares = self._broker.get_position_shares(ticker)
 
@@ -767,9 +1346,13 @@ class TradingRuntime:
     # ---- Phase 2: Market-open execution ----
     def market_open_execution(self) -> None:
         logger.info("=== MARKET-OPEN EXECUTION ===")
-        if self._breaker.is_stock_halted:
-            logger.warning("Stock trading halted for today (tripped=%s, profit_locked=%s) — skipping execution.",
-                            self._breaker.is_tripped, self._breaker.is_profit_locked)
+        # Skip only if ALL equity agents are halted (intraday AND thesis).
+        if self._intraday_breaker.is_stock_halted and self._thesis_breaker.is_stock_halted:
+            logger.warning(
+                "All equity agents halted (intraday: tripped=%s/locked=%s, thesis: tripped=%s/locked=%s) — skipping.",
+                self._intraday_breaker.is_tripped, self._intraday_breaker.is_profit_locked,
+                self._thesis_breaker.is_tripped, self._thesis_breaker.is_profit_locked,
+            )
             return
         self._execute_pending_payloads(date.today())
 
@@ -778,17 +1361,21 @@ class TradingRuntime:
         once at 9:30) and momentum_scan_and_trade (dynamic mode, fires
         every intraday tick) — `_executed_tickers_today` stops the latter
         from re-submitting an order for a ticker it already acted on
-        earlier in the day.
+        earlier in the day. Routes each ticker to the breaker that owns its strategy.
         """
-        if self._breaker.is_stock_halted:
-            return
         equity = self._broker.get_equity()
         for ticker, payload in self._pending_payloads.items():
             if ticker in self._executed_tickers_today:
                 continue
-            if self._breaker.is_stock_halted:
-                logger.info("Stock trading halted mid-batch — skipping remaining tickers.")
-                break
+            strategy = self._pending_strategies.get(ticker, "momentum")
+            breaker = (
+                self._thesis_breaker if strategy in _THESIS_STRATEGIES
+                else self._swing_breaker if strategy in _SWING_STRATEGIES
+                else self._intraday_breaker
+            )
+            if breaker.is_stock_halted:
+                logger.info("[%s] %s: agent halted, skipping.", breaker.name, ticker)
+                continue
             self._executed_tickers_today.add(ticker)
             if not payload.is_executable:
                 logger.info("%s: not executable (verdict=%s) — skipping.", ticker, payload.risk_review.verdict.value)
@@ -805,8 +1392,8 @@ class TradingRuntime:
                 self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
 
             try:
-                self._breaker.assert_not_tripped()
-                self._breaker.validate_position_size(proposal, equity)
+                breaker.assert_not_tripped()
+                breaker.validate_position_size(proposal, equity)
                 result = self._broker.submit_order(proposal)
                 logger.info("%s: order result=%s", ticker, result)
                 self._record_order_event(ticker, proposal, result)
@@ -815,47 +1402,83 @@ class TradingRuntime:
                     proposal,
                     today,
                     entry_regime=self._pending_regimes.get(ticker),
-                    strategy=self._pending_strategies.get(ticker),
+                    strategy=strategy,
                 )
 
                 equity = self._broker.get_equity()
-                if self._breaker.check_profit_target(equity):
-                    self._lock_in_profit(reason=f"daily profit target reached after trading {ticker}, equity={equity:.2f}")
+                if breaker.check_profit_target(equity):
+                    self._lock_in_profit(
+                        reason=f"daily profit target reached after trading {ticker}, equity={equity:.2f}",
+                        breaker=breaker,
+                    )
                     break
             except CircuitBreakerTripped as exc:
                 logger.error("Circuit breaker blocked order for %s: %s", ticker, exc)
-                self._trip_breaker(reason=str(exc))
-                break
+                self._trip_agent(breaker, reason=str(exc))
 
     # ---- Phase 3: Intraday monitoring ----
     def intraday_monitoring(self) -> None:
-        if self._breaker.is_tripped:
-            return  # real risk breach -- a true full halt, nothing runs
+        # All 3 breakers must be halted before we skip reconciliation — if any
+        # agent is still active, we need fresh position state.
+        all_halted = (
+            self._intraday_breaker.is_halted
+            and self._options_breaker.is_halted
+            and self._thesis_breaker.is_halted
+            and self._swing_breaker.is_halted
+        )
+        if all_halted:
+            return
         self._reconcile_positions()
         if self._settings.options_track_enabled or self._settings.vol_options_track_enabled:
             self._reconcile_option_positions()
+        today = date.today()
         equity = self._broker.get_equity()
-        self._breaker.ensure_day_started(
-            equity=equity, today=date.today(),
-            profit_target_pct=self._settings.daily_profit_target_pct,
-        )
+        for breaker in (self._intraday_breaker, self._options_breaker, self._thesis_breaker, self._swing_breaker):
+            breaker.ensure_day_started(
+                equity=equity, today=today,
+                profit_target_pct=self._settings.daily_profit_target_pct,
+            )
         logger.info("Intraday check: equity=%.2f", equity)
-        if self._breaker.check_drawdown(equity):
-            self._trip_breaker(reason=f"intraday drawdown breach at equity={equity:.2f}")
-            return
-        # Profit target is checked only while stocks aren't already halted —
-        # check_profit_target() re-flags True on every call once banked, so
-        # without this guard a later tick would re-trigger _lock_in_profit
-        # again for no reason.
-        if not self._breaker.is_stock_halted and self._breaker.check_profit_target(equity):
-            self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}")
-        if not self._breaker.is_stock_halted:
+
+        # ── Per-agent drawdown checks (each agent trips independently) ────────
+        if not self._intraday_breaker.is_halted:
+            intraday_pnl = self._compute_today_pnl(_INTRADAY_STRATEGIES, include_options=False)
+            if self._intraday_breaker.check_drawdown(intraday_pnl):
+                self._trip_agent(self._intraday_breaker, reason=f"intraday drawdown breach (today_pnl={intraday_pnl:.2f})")
+            elif self._intraday_breaker.check_profit_target(equity):
+                self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._intraday_breaker)
+
+        if not self._thesis_breaker.is_halted:
+            thesis_pnl = self._compute_today_pnl(_THESIS_STRATEGIES, include_options=False)
+            if self._thesis_breaker.check_drawdown(thesis_pnl):
+                self._trip_agent(self._thesis_breaker, reason=f"thesis drawdown breach (today_pnl={thesis_pnl:.2f})")
+            elif self._thesis_breaker.check_profit_target(equity):
+                self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._thesis_breaker)
+
+        if not self._options_breaker.is_halted:
+            options_pnl = self._compute_today_pnl(_OPTIONS_STRATEGIES, include_options=True)
+            if self._options_breaker.check_drawdown(options_pnl):
+                self._trip_agent(self._options_breaker, reason=f"options drawdown breach (today_pnl={options_pnl:.2f})")
+            elif self._options_breaker.check_profit_target(equity):
+                self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._options_breaker)
+
+        if not self._swing_breaker.is_halted:
+            swing_pnl = self._compute_today_pnl(_SWING_STRATEGIES, include_options=False)
+            if self._swing_breaker.check_drawdown(swing_pnl):
+                self._trip_agent(self._swing_breaker, reason=f"swing drawdown breach (today_pnl={swing_pnl:.2f})")
+            elif self._swing_breaker.check_profit_target(equity):
+                self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._swing_breaker)
+
+        # ── Per-agent exit checks ─────────────────────────────────────────────
+        if not self._intraday_breaker.is_stock_halted:
             self._check_intraday_exits(equity)
             self._check_orb_exits(equity)
-        if self._settings.options_track_enabled and not self._breaker.is_options_halted:
+        if self._settings.options_track_enabled and not self._options_breaker.is_options_halted:
             self._check_options_exits(equity)
-        if self._settings.vol_options_track_enabled and not self._breaker.is_options_halted:
+        if self._settings.vol_options_track_enabled and not self._options_breaker.is_options_halted:
             self._check_vol_options_exits(equity)
+        if self._settings.swing_track_enabled:
+            self._check_swing_exits(equity)
 
     def _reconcile_positions(self) -> None:
         """Catches the case `submit_order`'s fill-poll doesn't: a limit
@@ -922,8 +1545,8 @@ class TradingRuntime:
             if self._breaker.is_stock_halted:
                 return
             ticker = position["ticker"]
-            if position["quantity"] <= 0 or position["strategy"] == "orb":
-                continue  # ORB positions use their own fixed-price stop/target + EOD close — see _check_orb_exits
+            if position["quantity"] <= 0 or position["strategy"] in ("orb", "swing"):
+                continue  # ORB: fixed-price stops via _check_orb_exits; swing: regime+news exits via _check_swing_exits
 
             detail = self._broker.get_position_detail(ticker)
             if detail is None or detail["qty"] <= 0:
@@ -985,7 +1608,7 @@ class TradingRuntime:
         bracket; thesis gets a wide stop, no fixed target, and a trailing
         stop that only engages once it's already up significantly.
         """
-        if strategy == "thesis":
+        if strategy in ("thesis", "recovery"):
             return {
                 "stop_loss_pct": self._settings.thesis_stop_loss_pct,
                 "take_profit_pct": None,
@@ -1033,6 +1656,7 @@ class TradingRuntime:
 
             should_exit = False
             reason = ""
+            entry_price = position["avg_entry_price"] or 0.0
             if position["last_buy_at"] != today.isoformat():
                 should_exit = True
                 reason = f"ORB position held past its entry day ({position['last_buy_at']}) — force-closing, day-trade only"
@@ -1042,6 +1666,18 @@ class TradingRuntime:
             elif position["target_price"] is not None and current_price >= position["target_price"]:
                 should_exit = True
                 reason = f"target hit: {current_price:.2f} >= {position['target_price']:.2f}"
+            else:
+                # Failed-breakout cut: ORB signals resolve fast — within the first 30-60 minutes
+                # the stock should be making progress toward the target. If it's past 2pm ET
+                # and the stock is flat or negative vs entry, the breakout has failed.
+                # Cut the position for a scratch/tiny loss rather than holding into close.
+                et_now = datetime.now(ZoneInfo("America/New_York"))
+                if et_now.hour >= 14 and entry_price > 0 and current_price <= entry_price:
+                    should_exit = True
+                    reason = (
+                        f"ORB failed-breakout cut: past 2pm ET, "
+                        f"price {current_price:.2f} at/below entry {entry_price:.2f}"
+                    )
 
             if not should_exit:
                 continue
@@ -1075,7 +1711,7 @@ class TradingRuntime:
         """
         today = date.today()
         for position in self._state_store.get_option_positions():
-            if self._breaker.is_options_halted:
+            if self._options_breaker.is_options_halted:
                 return
             contract_symbol = position["contract_symbol"]
             # vol_short positions use their own tastylive exit rules — see _check_vol_options_exits
@@ -1102,13 +1738,29 @@ class TradingRuntime:
             elif premium_drawdown_pct >= self._settings.options_stop_loss_pct:
                 should_exit = True
                 reason = f"premium down {premium_drawdown_pct:.1%} >= {self._settings.options_stop_loss_pct:.1%} stop-loss"
+            else:
+                # Same-day exit: ORB signal resolves intraday. If it's past 3pm ET
+                # and the option opened today is already down ≥ intraday stop threshold,
+                # the breakout has failed — exit now rather than carrying theta overnight.
+                et_now = datetime.now(ZoneInfo("America/New_York"))
+                opened_today = (position.get("opened_at") or "")[:10] == today.isoformat()
+                if (
+                    opened_today
+                    and et_now.hour >= 15
+                    and premium_drawdown_pct >= self._settings.options_intraday_stop_pct
+                ):
+                    should_exit = True
+                    reason = (
+                        f"ORB intraday exit: breakout stalled, premium down "
+                        f"{premium_drawdown_pct:.1%} after 3pm ET"
+                    )
 
             if not should_exit:
                 continue
             logger.info("%s: options exit — %s", contract_symbol, reason)
 
             try:
-                self._breaker.assert_options_trading_allowed()
+                self._options_breaker.assert_options_trading_allowed()
                 contracts = int(detail["qty"])
                 result = self._broker.submit_option_order(
                     contract_symbol, side=Action.SELL, contracts=contracts, limit_price=current_price
@@ -1122,12 +1774,12 @@ class TradingRuntime:
                 )
 
                 equity = self._broker.get_equity()
-                if self._breaker.check_profit_target(equity):
-                    self._lock_in_profit(reason=f"daily profit target reached after options exit of {contract_symbol}, equity={equity:.2f}")
+                if self._options_breaker.check_profit_target(equity):
+                    self._lock_in_profit(reason=f"daily profit target reached after options exit of {contract_symbol}, equity={equity:.2f}", breaker=self._options_breaker)
                     return
             except CircuitBreakerTripped as exc:
                 logger.error("Circuit breaker blocked options exit for %s: %s", contract_symbol, exc)
-                self._trip_breaker(reason=str(exc))
+                self._trip_agent(self._options_breaker, reason=str(exc))
                 return
 
     # ---- Vol options track (short premium — Natenberg/tastylive) ----
@@ -1143,7 +1795,7 @@ class TradingRuntime:
         universe used by the ORB tracks.
         """
         vol_armed = self._daily_regime.arm_vol if self._daily_regime else False
-        if not self._settings.vol_options_track_enabled or not vol_armed or self._breaker.is_options_halted:
+        if not self._settings.vol_options_track_enabled or not vol_armed or self._options_breaker.is_options_halted:
             if self._settings.vol_options_track_enabled and not vol_armed:
                 logger.info("Vol options scan skipped — regime disarmed (VIX conditions unfavorable)")
             return
@@ -1156,7 +1808,7 @@ class TradingRuntime:
 
         logger.info("=== VOL OPTIONS SCAN: %d candidate(s) ===", len(candidates))
         equity = self._broker.get_equity()
-        self._breaker.ensure_day_started(
+        self._options_breaker.ensure_day_started(
             equity=equity, today=today,
             profit_target_pct=self._settings.daily_profit_target_pct,
         )
@@ -1184,7 +1836,7 @@ class TradingRuntime:
                         existing_vol_tickers.add(parsed.underlying_symbol)
 
         for ticker in candidates:
-            if self._breaker.is_options_halted:
+            if self._options_breaker.is_options_halted:
                 return
             if ticker in existing_vol_tickers:
                 logger.info("%s: vol scan skipped — existing vol_short position or pending order", ticker)
@@ -1468,7 +2120,7 @@ class TradingRuntime:
         ]
 
         try:
-            self._breaker.assert_options_trading_allowed()
+            self._options_breaker.assert_options_trading_allowed()
             result = self._broker.submit_spread_order(
                 legs=spread_legs,
                 contracts=proposal.quantity,
@@ -1524,7 +2176,7 @@ class TradingRuntime:
         for position in self._state_store.get_option_positions():
             if position.get("strategy") != "vol_short":
                 continue
-            if self._breaker.is_options_halted:
+            if self._options_breaker.is_options_halted:
                 return
             contract_symbol = position["contract_symbol"]
             if position["quantity"] == 0:
@@ -1564,7 +2216,7 @@ class TradingRuntime:
             qty = abs(int(detail["qty"]))  # positive count for the BUY-to-close order
 
             try:
-                self._breaker.assert_options_trading_allowed()
+                self._options_breaker.assert_options_trading_allowed()
                 result = self._broker.submit_option_order(
                     contract_symbol, side=Action.BUY, contracts=qty, limit_price=cost_to_close
                 )
@@ -1604,14 +2256,15 @@ class TradingRuntime:
                 )
 
                 equity = self._broker.get_equity()
-                if self._breaker.check_profit_target(equity):
+                if self._options_breaker.check_profit_target(equity):
                     self._lock_in_profit(
-                        reason=f"daily profit target reached after vol options exit of {contract_symbol}, equity={equity:.2f}"
+                        reason=f"daily profit target reached after vol options exit of {contract_symbol}, equity={equity:.2f}",
+                        breaker=self._options_breaker,
                     )
                     return
             except CircuitBreakerTripped as exc:
                 logger.error("Circuit breaker blocked vol options exit for %s: %s", contract_symbol, exc)
-                self._trip_breaker(reason=str(exc))
+                self._trip_agent(self._options_breaker, reason=str(exc))
                 return
 
     def _close_orphaned_option_legs(self, underlying: str) -> None:
@@ -1646,7 +2299,7 @@ class TradingRuntime:
             qty = abs(int(detail["qty"]))
             side = Action.SELL if detail["qty"] > 0 else Action.BUY
             try:
-                self._breaker.assert_options_trading_allowed()
+                self._options_breaker.assert_options_trading_allowed()
                 result = self._broker.submit_option_order(
                     pos["contract_symbol"], side=side,
                     contracts=qty, limit_price=detail["current_price"],
@@ -1745,6 +2398,7 @@ class TradingRuntime:
                 high_water_mark=max(prior_hwm, proposal.limit_price),
                 strategy=strategy,
             )
+            alerting.alert_buy(ticker=ticker, shares=int(shares), price=avg_price, strategy=strategy or "unknown")
         else:
             prior_position = self._state_store.get_position(ticker)
             if prior_position is not None:
@@ -1794,12 +2448,33 @@ class TradingRuntime:
                 logger.debug("_run_reflection: no BUY run found for %s — skipping", ticker)
                 return
 
+            # Build rich market_context from BUY payload + stored entry regime
+            buy_payload = next(
+                (r["payload"] for r in runs if r["payload"].get("proposal", {}).get("action") == "BUY"),
+                {},
+            )
+            regime_at_entry = self._state_store.get_entry_regime(ticker) or "unknown"
+            market_context = {
+                "strategy": strategy,
+                "regime_at_entry": regime_at_entry,
+                "entry_price": buy_payload.get("proposal", {}).get("limit_price"),
+                "shares": buy_payload.get("proposal", {}).get("quantity"),
+                "risk_verdict": buy_payload.get("risk_review", {}).get("verdict"),
+                "risk_reasons": "; ".join(buy_payload.get("risk_review", {}).get("reasons", [])),
+                "entry_date": next(
+                    (r["created_at"] for r in runs if r["payload"].get("proposal", {}).get("action") == "BUY"),
+                    "unknown",
+                ),
+                "realized_pnl": f"${pnl:+.2f}",
+                "outcome": "win" if pnl > 0 else "loss",
+            }
+
             reflection = self._reflection_agent.reflect(
                 strategy=strategy,
                 agent_signals=agent_signals,
                 outcome_pnl=pnl,
                 outcome_win=pnl > 0,
-                market_context={"strategy": strategy, "realized_pnl": f"${pnl:+.2f}"},
+                market_context=market_context,
             )
             if reflection is None:
                 return
@@ -1816,6 +2491,14 @@ class TradingRuntime:
             # Score agent signals and lesson injections based on this trade's outcome
             self._state_store.score_agent_signals(ticker, pnl)
             self._state_store.score_lesson_injections(ticker, pnl)
+            # Update VW bandit with the full signal pattern for this closed trade
+            if agent_signals:
+                self._vw_bandit.learn(
+                    track=strategy,
+                    regime=regime_at_entry,
+                    signals=agent_signals,
+                    pnl=pnl,
+                )
 
             if not reflection.outcome_was_noise:
                 for lesson_out in reflection.lessons:
@@ -1872,6 +2555,13 @@ class TradingRuntime:
                 contract_symbol, underlying_symbol, option_type, strike, expiration,
                 int(qty), avg_price, opened_at=today.isoformat(), strategy=strategy,
             )
+            alerting.alert_option_buy(
+                contract_symbol=contract_symbol,
+                underlying=underlying_symbol,
+                contracts=int(qty),
+                premium=avg_price,
+                strategy=strategy,
+            )
         else:
             prior = self._state_store.get_option_position(contract_symbol)
             if prior is not None and sale_price is not None:
@@ -1888,6 +2578,97 @@ class TradingRuntime:
                 int(qty), avg_price, strategy=strategy,
             )
 
+    # ---- Pre-close: EOD exit for stalled ORB positions ----
+    def pre_close_orb_exit(self) -> None:
+        """At 3:30pm ET, close any ORB equity position that is flat or losing.
+
+        ORB is an intraday signal — if the breakout hasn't paid off by 90 minutes
+        before close, it is not going to. Holding overnight turns an intraday
+        momentum trade into an unintended swing trade with overnight gap risk.
+        Winning ORB positions (above entry) are left alone for the existing
+        trailing stop to manage.
+        """
+        if self._intraday_breaker.is_stock_halted:
+            return
+        today = date.today()
+        for position in self._state_store.get_positions():
+            if position.get("strategy") != "orb":
+                continue
+            if position.get("quantity", 0) <= 0:
+                continue
+            ticker = position["ticker"]
+            avg_entry = position.get("avg_entry_price", 0)
+            if avg_entry <= 0:
+                continue
+
+            detail = self._broker.get_position_detail(ticker)
+            if detail is None or detail.get("qty", 0) <= 0:
+                continue
+
+            current_price = detail.get("current_price", 0)
+            if current_price <= 0:
+                continue
+
+            gain_pct = (current_price - avg_entry) / avg_entry
+            if gain_pct >= self._settings.orb_swing_convert_pct:
+                # Strong winner — check SPY is green, then convert to a swing hold
+                spy_green = True
+                try:
+                    spy_intraday = self._data_client.get_price_history(
+                        "SPY", start_date=today, end_date=today, interval="5m"
+                    )
+                    if spy_intraday.bars:
+                        spy_green = spy_intraday.bars[-1].close >= spy_intraday.bars[0].open
+                except DataLayerError:
+                    pass  # can't check SPY → be optimistic and hold
+
+                if spy_green:
+                    swing_stop = avg_entry * (1 - self._settings.swing_stop_loss_pct)
+                    self._state_store.upsert_position(
+                        ticker, position["quantity"], avg_entry,
+                        stop_price=swing_stop, target_price=None, strategy="swing",
+                    )
+                    logger.info(
+                        "%s: ORB → swing conversion — up %.1f%%, SPY green, "
+                        "holding overnight with stop %.2f",
+                        ticker, gain_pct * 100, swing_stop,
+                    )
+                    continue
+                else:
+                    logger.debug(
+                        "%s: ORB winner (%.1f%%) but SPY red — closing same-day",
+                        ticker, gain_pct * 100,
+                    )
+            elif gain_pct > 0:
+                logger.debug(
+                    "%s: ORB pre-close check — up %.1f%% (below %.0f%% swing threshold), "
+                    "trailing stop handles exit",
+                    ticker, gain_pct * 100, self._settings.orb_swing_convert_pct * 100,
+                )
+                continue
+
+            # Position is flat or losing (or winner on red SPY day) — exit now, don't hold overnight
+            qty = int(detail["qty"])
+            proposal = TradeProposal(ticker=ticker, action=Action.SELL, quantity=qty, limit_price=current_price)
+            logger.info("%s: ORB pre-close exit — current %.2f below entry %.2f, closing before EOD",
+                        ticker, current_price, avg_entry)
+            try:
+                self._breaker.assert_not_tripped()
+                result = self._broker.submit_order(proposal)
+                self._record_order_event(ticker, proposal, result)
+                pnl = self._state_store.record_realized_sale(
+                    ticker=ticker, sale_date=today, quantity=qty,
+                    sale_price=current_price, cost_basis=avg_entry,
+                )
+                self._trigger_reflection(ticker, "orb", pnl)
+                self._state_store.delete_position(ticker)
+            except CircuitBreakerTripped as exc:
+                logger.error("Circuit breaker blocked pre-close exit for %s: %s", ticker, exc)
+                self._trip_breaker(reason=str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s: pre-close ORB exit failed: %s", ticker, exc)
+
     # ---- Phase 4: Post-market logging ----
     def post_market_logging(self) -> None:
         logger.info("=== POST-MARKET LOGGING ===")
@@ -1901,7 +2682,10 @@ class TradingRuntime:
             event_type="post_market_summary",
             detail=(
                 f"positions={len(positions)} runs_logged={len(history)} "
-                f"breaker_tripped={self._breaker.is_tripped} profit_locked={self._breaker.is_profit_locked} "
+                f"intraday_breaker(tripped={self._intraday_breaker.is_tripped},locked={self._intraday_breaker.is_profit_locked}) "
+                f"options_breaker(tripped={self._options_breaker.is_tripped},locked={self._options_breaker.is_profit_locked}) "
+                f"thesis_breaker(tripped={self._thesis_breaker.is_tripped},locked={self._thesis_breaker.is_profit_locked}) "
+                f"swing_breaker(tripped={self._swing_breaker.is_tripped},locked={self._swing_breaker.is_profit_locked}) "
                 f"claude_cost_usd={cost_summary['total_cost_usd']:.4f}"
             ),
         )
@@ -1922,6 +2706,26 @@ class TradingRuntime:
                 row["cost_usd"],
             )
 
+        try:
+            today_str = date.today().isoformat()
+            equity_pnl = sum(
+                r["realized_pnl"]
+                for r in self._state_store.get_all_realized_sales(limit=100)
+                if r["sale_date"] == today_str
+            )
+            options_pnl = sum(
+                r["realized_pnl"]
+                for r in self._state_store.get_all_realized_option_sales(limit=100)
+                if r["sale_date"] == today_str
+            )
+            alerting.alert_daily_summary(
+                equity=self._broker.get_equity(),
+                realized_pnl=equity_pnl + options_pnl,
+                open_positions=len(positions),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- internals ----
     def _record_usage(self, agent_name: str, model: str, usage) -> None:
         cost = estimate_cost_usd(model, usage)
@@ -1935,25 +2739,32 @@ class TradingRuntime:
             estimated_cost_usd=cost,
         )
 
-    def _trip_breaker(self, reason: str) -> None:
-        """Portfolio drawdown breach — stops NEW entries for the rest of the
-        day but does NOT close existing positions. Swing trades need to ride
-        through intraday noise; individual per-position stop-losses (exit_rules)
-        handle the actual exit decisions. The scheduler is NOT paused so
-        intraday_monitoring keeps running and can trigger those per-position stops.
+    def _trip_agent(self, breaker: CircuitBreaker, reason: str) -> None:
+        """Drawdown breach for a specific agent — stops that agent's new entries
+        for the rest of the day. Does NOT close existing positions (swing trades
+        ride through intraday noise; per-position stop-losses handle exit). Other
+        agents continue operating independently.
         """
-        logger.error("CIRCUIT BREAKER TRIPPED (new entries halted): %s", reason)
-        self._state_store.record_event(event_type="circuit_breaker_tripped", detail=reason)
-        self._breaker._tripped = True
+        logger.error("[%s] CIRCUIT BREAKER TRIPPED (new entries halted): %s", breaker.name, reason)
+        self._state_store.record_event(event_type="circuit_breaker_tripped", detail=f"[{breaker.name}] {reason}")
+        breaker._tripped = True
+        alerting.alert_circuit_breaker(reason=f"[{breaker.name}] {reason}")
 
-    def _lock_in_profit(self, reason: str) -> None:
-        """Hitting the daily $ target is a banked win, not a risk breach
-        — by design (per explicit instruction), this stops STOCKS only.
-        Options keep trading on their own already-bounded per-trade risk
-        limits, so the scheduler is deliberately NOT paused here — only
-        the stock-side methods self-gate via is_stock_halted.
+    def _trip_breaker(self, reason: str) -> None:
+        """Legacy alias — trips the intraday breaker. Kept for call sites that
+        haven't been migrated to _trip_agent yet.
+        """
+        self._trip_agent(self._intraday_breaker, reason)
+
+    def _lock_in_profit(self, reason: str, breaker: CircuitBreaker | None = None) -> None:
+        """Hitting the daily $ target — stops STOCKS only for the specific agent.
+        Options keep trading on their own bounded per-trade risk limits.
         """
         self._close_stocks_and_reconcile(reason)
+        try:
+            alerting.alert_profit_locked(equity=self._broker.get_equity(), gain=0.0)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _close_stocks_and_reconcile(self, reason: str) -> None:
         today = date.today()
@@ -1982,7 +2793,7 @@ class TradingRuntime:
             )
             self._state_store.upsert_position(ticker, 0, position["avg_entry_price"])
 
-    def _wait_until_flat(self, ticker: str, timeout_seconds: float = 5.0) -> None:
+    def _wait_until_flat(self, ticker: str, timeout_seconds: float = 30.0) -> None:
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if self._broker.get_position_detail(ticker) is None:

@@ -93,7 +93,7 @@ def runtime_with_position(tmp_path: Path) -> TradingRuntime:
         settings=settings,
         data_client=MagicMock(),
         broker=broker,
-        circuit_breaker=breaker,
+        intraday_breaker=breaker, options_breaker=breaker, thesis_breaker=breaker, swing_breaker=breaker,
         state_store=store,
         anthropic_client=MagicMock(),
         watchlist=["AAPL"],
@@ -203,7 +203,7 @@ def test_check_intraday_exits_no_escalation_without_entry_regime(tmp_path: Path)
     store.upsert_position("AAPL", quantity=10, avg_entry_price=100.0)  # no entry_regime passed
 
     rt = TradingRuntime(
-        settings=settings, data_client=MagicMock(), broker=broker, circuit_breaker=breaker,
+        settings=settings, data_client=MagicMock(), broker=broker, intraday_breaker=breaker, options_breaker=breaker, thesis_breaker=breaker, swing_breaker=breaker,
         state_store=store, anthropic_client=MagicMock(), watchlist=["AAPL"],
     )
     rt._current_regime = MagicMock(return_value="bearish_crossover")
@@ -254,7 +254,7 @@ def test_thesis_position_survives_a_drop_that_would_close_a_momentum_position(tm
     )
 
     rt = TradingRuntime(
-        settings=settings, data_client=MagicMock(), broker=broker, circuit_breaker=breaker,
+        settings=settings, data_client=MagicMock(), broker=broker, intraday_breaker=breaker, options_breaker=breaker, thesis_breaker=breaker, swing_breaker=breaker,
         state_store=store, anthropic_client=MagicMock(), watchlist=["RDW"],
     )
     rt._current_regime = MagicMock(return_value="neutral")

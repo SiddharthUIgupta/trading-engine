@@ -225,7 +225,7 @@ def test_refresh_vol_universe_updates_runtime(tmp_path: Path):
 
     rt = TradingRuntime(
         settings=settings, data_client=dc, broker=MagicMock(),
-        circuit_breaker=breaker, state_store=store,
+        intraday_breaker=breaker, options_breaker=breaker, thesis_breaker=breaker, swing_breaker=breaker, state_store=store,
         anthropic_client=MagicMock(), watchlist=["NVDA"],
     )
     assert rt._vol_universe == ["NVDA"]  # initialized to watchlist
@@ -253,7 +253,7 @@ def test_refresh_vol_universe_no_ops_when_track_disabled(tmp_path: Path):
 
     rt = TradingRuntime(
         settings=settings, data_client=dc, broker=MagicMock(),
-        circuit_breaker=CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02),
+        intraday_breaker=CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02), options_breaker=CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02), thesis_breaker=CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02), swing_breaker=CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02),
         state_store=StateStore(tmp_path / "test.sqlite3"),
         anthropic_client=MagicMock(), watchlist=["AAPL"],
     )

@@ -60,8 +60,6 @@ class OpenBBDataClient:
         if self._obb is None:
             from openbb import obb  # imported lazily — heavy import, and only needed live
 
-            if self._pat:
-                obb.account.login(pat=self._pat)
             self._obb = obb
         return self._obb
 

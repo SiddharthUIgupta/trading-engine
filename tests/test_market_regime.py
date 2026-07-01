@@ -61,7 +61,7 @@ def test_vol_disarmed_when_vix_spiking():
 def test_vol_disarmed_when_vix_extreme():
     regime = assess_daily_regime(_spy_closes("bearish"), _vix_bars(45.0))
     assert regime.arm_vol is False
-    assert "extreme fear" in regime.reasons["vol"][0]
+    assert "extreme fear" in regime.reasons["vol"][0]  # VIX > 40 path still says "extreme fear"
 
 
 def test_vol_armed_when_vix_elevated_but_not_spiking():
@@ -125,7 +125,7 @@ def test_thesis_armed_in_normal_environment():
 def test_thesis_disarmed_in_extreme_fear():
     regime = assess_daily_regime(_spy_closes("bearish"), _vix_bars(35.0))
     assert regime.arm_thesis is False
-    assert "extreme fear" in regime.reasons["thesis"][0]
+    assert "elevated fear" in regime.reasons["thesis"][0]
 
 
 def test_thesis_disarmed_at_vix_boundary():

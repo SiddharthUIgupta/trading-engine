@@ -19,6 +19,7 @@ class OrbSignal:
     opening_range_high: float | None = None
     opening_range_low: float | None = None
     breakout_bar_index: int | None = None
+    gap_pct: float | None = None  # (today_open - prior_close) / prior_close
 
 
 def evaluate_orb(
@@ -26,6 +27,8 @@ def evaluate_orb(
     opening_range_minutes: int = 15,
     bar_minutes: int = 5,
     volume_confirmation_multiple: float | None = None,
+    prior_close: float | None = None,
+    min_gap_pct: float | None = None,
 ) -> OrbSignal:
     """Opening range = the high/low of the first `opening_range_minutes` of
     the session. A breakout is a bar CLOSING beyond that range, not just
@@ -49,6 +52,20 @@ def evaluate_orb(
     opening_range_low = min(b.low for b in range_bars)
     range_avg_volume = sum(b.volume for b in range_bars) / len(range_bars)
 
+    # Gap filter: flat opens produce far more false breakouts than gapped ones.
+    gap_pct: float | None = None
+    if prior_close is not None and prior_close > 0:
+        today_open = bars[0].open
+        gap_pct = (today_open - prior_close) / prior_close
+        if min_gap_pct is not None and gap_pct < min_gap_pct:
+            return OrbSignal(
+                direction="none",
+                reasons=[f"gap {gap_pct:.1%} < required {min_gap_pct:.1%} — flat open, skip"],
+                opening_range_high=opening_range_high,
+                opening_range_low=opening_range_low,
+                gap_pct=gap_pct,
+            )
+
     def _volume_confirms(bar) -> bool:
         if volume_confirmation_multiple is None:
             return True
@@ -60,13 +77,15 @@ def evaluate_orb(
             return OrbSignal(
                 direction="long",
                 reasons=[f"bar {i} closed {bar.close:.2f} above opening range high {opening_range_high:.2f}"],
-                opening_range_high=opening_range_high, opening_range_low=opening_range_low, breakout_bar_index=i,
+                opening_range_high=opening_range_high, opening_range_low=opening_range_low,
+                breakout_bar_index=i, gap_pct=gap_pct,
             )
         if bar.close < opening_range_low and _volume_confirms(bar):
             return OrbSignal(
                 direction="short",
                 reasons=[f"bar {i} closed {bar.close:.2f} below opening range low {opening_range_low:.2f}"],
-                opening_range_high=opening_range_high, opening_range_low=opening_range_low, breakout_bar_index=i,
+                opening_range_high=opening_range_high, opening_range_low=opening_range_low,
+                breakout_bar_index=i, gap_pct=gap_pct,
             )
 
     return OrbSignal(

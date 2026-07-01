@@ -707,6 +707,16 @@ class StateStore:
             conn.commit()
         return log_id
 
+    def get_entry_regime(self, ticker: str) -> str | None:
+        """Return the regime recorded at the most recent BUY signal log for this ticker."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT regime FROM agent_signal_log WHERE ticker=? AND proposed_action='BUY' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        return row[0] if row else None
+
     def score_agent_signals(self, ticker: str, pnl: float) -> None:
         """Mark all unscored signal logs for this ticker with the realized outcome."""
         outcome = "win" if pnl > 0 else "loss"
@@ -735,6 +745,38 @@ class StateStore:
                 (track, regime),
             ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
+
+    def get_scored_signal_logs(self, limit: int = 2000) -> list[dict]:
+        """Return all scored signal logs with per-agent details, for VW warm-start.
+
+        Each dict has: track, regime, outcome_pnl, signals (list of agent dicts).
+        Only returns logs that have been scored (have a non-null outcome_pnl).
+        """
+        with closing(self._connect()) as conn:
+            log_rows = conn.execute(
+                "SELECT id, track, regime, outcome_pnl FROM agent_signal_log "
+                "WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL "
+                "ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            if not log_rows:
+                return []
+            log_by_id = {
+                row[0]: {"track": row[1], "regime": row[2], "outcome_pnl": row[3], "signals": []}
+                for row in log_rows
+            }
+            placeholders = ",".join("?" * len(log_by_id))
+            detail_rows = conn.execute(
+                f"SELECT log_id, agent_name, stance, confidence FROM agent_signal_detail "
+                f"WHERE log_id IN ({placeholders})",
+                list(log_by_id.keys()),
+            ).fetchall()
+            for log_id, agent_name, stance, confidence in detail_rows:
+                if log_id in log_by_id:
+                    log_by_id[log_id]["signals"].append(
+                        {"agent_name": agent_name, "stance": stance, "confidence": confidence}
+                    )
+        return list(log_by_id.values())
 
     # ── Lesson validation ─────────────────────────────────────────────────────
 

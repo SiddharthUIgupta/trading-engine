@@ -137,6 +137,7 @@ class AlpacaBroker:
             side=order_side,
             time_in_force=TimeInForce.DAY,
             limit_price=limit_price,
+            position_intent=PositionIntent.BUY_TO_OPEN if side == Action.BUY else PositionIntent.SELL_TO_CLOSE,
         )
         order = self._client.submit_order(order_request)
         logger.info(
@@ -260,6 +261,20 @@ class AlpacaBroker:
                 "legs": legs,
             })
         return result
+
+    def get_all_positions(self) -> list[dict]:
+        """Returns all open positions with current prices and unrealized P&L."""
+        positions = self._client.get_all_positions()
+        return [
+            {
+                "symbol": p.symbol,
+                "qty": float(p.qty),
+                "avg_entry_price": float(p.avg_entry_price),
+                "current_price": float(p.current_price),
+                "unrealized_pl": float(p.unrealized_pl),
+            }
+            for p in positions
+        ]
 
     def close_all_positions(self, cancel_orders: bool = True) -> None:
         logger.warning("Closing ALL open positions (cancel_orders=%s).", cancel_orders)

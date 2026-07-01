@@ -60,7 +60,7 @@ def runtime(tmp_path: Path) -> TradingRuntime:
         settings=settings,
         data_client=MagicMock(),
         broker=broker,
-        circuit_breaker=breaker,
+        intraday_breaker=breaker, options_breaker=breaker, thesis_breaker=breaker, swing_breaker=breaker,
         state_store=store,
         anthropic_client=MagicMock(),
         watchlist=["AAPL"],
@@ -574,6 +574,9 @@ def test_scan_and_trade_orb_equities_opens_long_position_with_stop_and_target(ru
     runtime._data_client.get_price_history.return_value = PriceSeries(symbol="AAPL", interval="5m", bars=_orb_bars("long"))
     runtime._broker.submit_order.return_value = {"status": "submitted", "order_id": "abc", "order_status": "filled", "filled_qty": 5, "filled_avg_price": 101.0}
     runtime._broker.get_position_shares.return_value = 5
+    # Disable quality filters — this test focuses on order placement + stop/target logic
+    runtime._settings.orb_require_spy_positive = False
+    runtime._settings.orb_min_gap_pct = 0.0
 
     runtime._scan_and_trade_orb_equities(["AAPL"], date.today(), equity=100_000.0)
 

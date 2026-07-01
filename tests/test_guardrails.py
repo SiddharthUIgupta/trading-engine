@@ -41,24 +41,30 @@ def test_validate_position_size_never_blocks_a_sell(breaker: CircuitBreaker):
 
 
 def test_check_drawdown_trips_at_threshold(breaker: CircuitBreaker):
-    # 2% drawdown from 100,000 -> 98,000
-    assert breaker.check_drawdown(98_000.0) is True
+    # -$2,000 = 2% of $100,000 day-start equity — exactly at the 2% limit
+    assert breaker.check_drawdown(-2_000.0) is True
     assert breaker.is_tripped is True
 
 
 def test_check_drawdown_does_not_trip_below_threshold(breaker: CircuitBreaker):
-    assert breaker.check_drawdown(99_000.0) is False
+    # -$1,000 = 1% loss — below the 2% threshold
+    assert breaker.check_drawdown(-1_000.0) is False
+    assert breaker.is_tripped is False
+
+
+def test_check_drawdown_does_not_trip_on_profit(breaker: CircuitBreaker):
+    assert breaker.check_drawdown(500.0) is False
     assert breaker.is_tripped is False
 
 
 def test_check_drawdown_requires_day_started():
     cb = CircuitBreaker(max_position_size_pct=0.05, max_daily_drawdown_pct=0.02)
     with pytest.raises(RuntimeError):
-        cb.check_drawdown(98_000.0)
+        cb.check_drawdown(-2_000.0)
 
 
 def test_assert_not_tripped_raises_after_breach(breaker: CircuitBreaker):
-    breaker.check_drawdown(97_000.0)
+    breaker.check_drawdown(-3_000.0)
     with pytest.raises(CircuitBreakerTripped):
         breaker.assert_not_tripped()
 
@@ -96,7 +102,7 @@ def test_profit_locked_halts_stocks_but_not_options(breaker_with_profit_target: 
 
 
 def test_real_drawdown_breach_halts_both_stocks_and_options(breaker: CircuitBreaker):
-    breaker.check_drawdown(97_000.0)  # a real loss, not a banked profit
+    breaker.check_drawdown(-3_000.0)  # -3% loss — exceeds 2% limit
 
     assert breaker.is_stock_halted is True
     assert breaker.is_options_halted is True
@@ -111,7 +117,7 @@ def test_assert_options_trading_allowed_does_not_raise_on_profit_lock(breaker_wi
 
 
 def test_assert_options_trading_allowed_raises_on_real_breach(breaker: CircuitBreaker):
-    breaker.check_drawdown(97_000.0)
+    breaker.check_drawdown(-3_000.0)
     with pytest.raises(CircuitBreakerTripped):
         breaker.assert_options_trading_allowed()
     with pytest.raises(ValueError):

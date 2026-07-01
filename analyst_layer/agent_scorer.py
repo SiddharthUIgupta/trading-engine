@@ -1,10 +1,12 @@
 """Format agent accuracy context for injection into the risk officer prompt.
 
-After enough trades accumulate, each sub-agent's historical win-rate in the
-current track and market regime is surfaced to the risk officer so it can
-weight conflicting signals appropriately. An agent with 35% accuracy in
-bearish regimes should carry less weight than one with 70% accuracy — this
-makes that explicit in the LLM's context rather than leaving it implicit.
+Two layers of historical signal:
+  1. Flat per-agent win-rate table (from state_store.get_agent_accuracy) — simple,
+     works immediately, surfaces obvious track records like "sentiment agent is
+     wrong 70% of the time in bear regimes."
+  2. VW bandit win-probability (from VWSignalBandit.predict_context) — contextual,
+     learns the JOINT effect of track × regime × agent agreement patterns. Injected
+     as a single calibrated probability estimate once the model has seen >= 20 examples.
 """
 from __future__ import annotations
 
@@ -33,3 +35,31 @@ def format_accuracy_context(accuracy_rows: list[tuple[str, int, int]]) -> str:
     header = "[AGENT TRACK RECORD — historical accuracy in this track and market regime]"
     footer = "Weight signals accordingly when agents conflict."
     return "\n".join([header] + lines + [footer]) + "\n\n"
+
+
+def format_vw_context(win_probability: float | None, example_count: int = 0) -> str:
+    """Format VW bandit win-probability as a prompt context block.
+
+    Returns empty string when the model hasn't accumulated enough examples,
+    or when win_probability is None (model not available / not ready).
+    """
+    if win_probability is None:
+        return ""
+
+    pct = win_probability * 100
+    if pct >= 65:
+        confidence_label = "STRONG HISTORICAL EDGE"
+    elif pct >= 50:
+        confidence_label = "SLIGHT HISTORICAL EDGE"
+    elif pct >= 35:
+        confidence_label = "SLIGHT HISTORICAL HEADWIND"
+    else:
+        confidence_label = "STRONG HISTORICAL HEADWIND"
+
+    return (
+        f"[VW BANDIT — CONTEXTUAL WIN PROBABILITY]\n"
+        f"  Predicted win probability for this track × regime: {pct:.0f}% ({confidence_label})\n"
+        f"  Based on {example_count} past trades with similar track and market regime.\n"
+        f"  Factor this into your confidence weighting — it captures patterns the per-agent "
+        f"accuracy table above cannot (joint effects and regime interactions).\n\n"
+    )

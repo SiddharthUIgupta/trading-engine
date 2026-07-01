@@ -49,8 +49,19 @@ class Settings(BaseSettings):
     # for a equity-scaled target (e.g. 0.005 = 0.5% of day-start equity).
     # If PCT is set it overrides the flat USD value at the start of each day.
     # Set to None / omit to disable the profit lock entirely.
-    daily_profit_target_usd: float = Field(default=50.0, alias="DAILY_PROFIT_TARGET_USD")
-    daily_profit_target_pct: float | None = Field(default=None, alias="DAILY_PROFIT_TARGET_PCT")
+    # Raised from $50: a $50 ceiling halted new entries after any single
+    # moderate win, throttling the thesis track before it could build a
+    # full day's position. PCT-based target (2% of equity) scales correctly.
+    daily_profit_target_usd: float = Field(default=500.0, alias="DAILY_PROFIT_TARGET_USD")
+    daily_profit_target_pct: float | None = Field(default=0.02, alias="DAILY_PROFIT_TARGET_PCT")
+
+    # --- Per-agent capital allocation (fractions of total equity, must sum ≤ 1) ---
+    # Each agent can deploy up to its slice. The shared pool (equity - all deployed)
+    # acts as a secondary cap — no single agent can crowd out the others.
+    intraday_capital_pct: float = Field(default=0.35, alias="INTRADAY_CAPITAL_PCT")
+    options_capital_pct: float = Field(default=0.35, alias="OPTIONS_CAPITAL_PCT")
+    thesis_capital_pct: float = Field(default=0.10, alias="THESIS_CAPITAL_PCT")
+    swing_capital_pct: float = Field(default=0.20, alias="SWING_CAPITAL_PCT")
 
     # --- State persistence ---
     state_db_path: Path = Field(default=Path("./state/trading_engine.sqlite3"), alias="STATE_DB_PATH")
@@ -87,6 +98,31 @@ class Settings(BaseSettings):
     # options ORB track). Without this the track accumulates 30+ positions all
     # paying theta simultaneously, which bleeds premium on every tick.
     max_open_options_positions: int = Field(default=8, alias="MAX_OPEN_OPTIONS_POSITIONS")
+
+    # --- ORB equity quality filters ---
+    # Minimum gap from prior close for a valid ORB long setup. Stocks that
+    # gapped up ≥2% already have pre-market conviction; flat opens produce
+    # far more false breakouts because there's no directional catalyst.
+    orb_min_gap_pct: float = Field(default=0.04, alias="ORB_MIN_GAP_PCT")
+    # Volume confirmation: breakout bar must exceed this multiple of the
+    # opening-range average volume. Raised from 1.5x — 2x is the threshold
+    # where institutional participation is meaningfully confirmed vs. retail noise.
+    orb_volume_confirmation_multiple: float = Field(default=2.0, alias="ORB_VOLUME_CONFIRMATION_MULTIPLE")
+    # SPY direction gate: only trade long ORB when SPY is green on the day.
+    # ORB long breakouts on red-tape days fail at a significantly higher rate
+    # because sector rotations and macro selling pressure absorb the move.
+    orb_require_spy_positive: bool = Field(default=True, alias="ORB_REQUIRE_SPY_POSITIVE")
+    # Float cap: small-float stocks produce larger % moves on the same dollar volume.
+    # 0 = disabled. At 30M the screen focuses on names where ORB squeeze is meaningful.
+    orb_max_float_shares: int = Field(default=0, alias="ORB_MAX_FLOAT_SHARES")
+    # Minimum gain % for an ORB winner to be converted to a swing hold at EOD
+    # instead of closing. 3% means the breakout showed real conviction; below
+    # that it's noise and should still close same-day per the intraday design.
+    orb_swing_convert_pct: float = Field(default=0.03, alias="ORB_SWING_CONVERT_PCT")
+    # On red SPY days, route confirmed short ORB breakdowns to put options instead
+    # of discarding the signal. Higher-quality bearish entries than the general
+    # options scan — each one is a specific breakdown confirmed by ORB + market direction.
+    orb_spy_red_puts_enabled: bool = Field(default=True, alias="ORB_SPY_RED_PUTS_ENABLED")
 
     # --- Low-float momentum scanner (deterministic, no LLM) ---
     # The user's 7-criteria spec — all seven are conjunctive (a candidate
@@ -138,13 +174,55 @@ class Settings(BaseSettings):
     # name temporarily out of favor (failed trial, accounting issue,
     # secular decline, vs. RDW-style dislocation).
     thesis_max_pullback_pct: float = Field(default=0.50, alias="THESIS_MAX_PULLBACK_PCT")
-    thesis_max_daily_candidates: int = Field(default=10, alias="THESIS_MAX_DAILY_CANDIDATES")
+    # Raised from 10: backtest shows 58% win rate and +6.27% avg return on thesis.
+    # More candidates = more quality setups reviewed by the LLM each day.
+    thesis_max_daily_candidates: int = Field(default=20, alias="THESIS_MAX_DAILY_CANDIDATES")
     # Wide stop, no fixed take-profit, trailing stop only engages once the
     # position is up significantly — the point is to let a winner run
     # instead of capping it at a few percent like the momentum track does.
     thesis_stop_loss_pct: float = Field(default=0.18, alias="THESIS_STOP_LOSS_PCT")
     thesis_trailing_stop_pct: float = Field(default=0.10, alias="THESIS_TRAILING_STOP_PCT")
     thesis_trailing_stop_activation_pct: float = Field(default=0.20, alias="THESIS_TRAILING_STOP_ACTIVATION_PCT")
+
+    # --- Recovery scanner (market rebound / oversold bounce plays) ---
+    # Deterministic screen: pulled back from 60-day high but 5d momentum
+    # positive, above MA20, volume picking up. Feeds into the same consensus
+    # pipeline as thesis (LLM agents vote; risk officer gates it). Runs
+    # alongside thesis_scan_and_trade at 8:15am using the same universe.
+    recovery_track_enabled: bool = Field(default=True, alias="RECOVERY_TRACK_ENABLED")
+    recovery_min_pullback_pct: float = Field(default=0.15, alias="RECOVERY_MIN_PULLBACK_PCT")
+    recovery_max_pullback_pct: float = Field(default=0.40, alias="RECOVERY_MAX_PULLBACK_PCT")
+    recovery_volume_pickup_ratio: float = Field(default=1.20, alias="RECOVERY_VOLUME_PICKUP_RATIO")
+    recovery_max_daily_candidates: int = Field(default=10, alias="RECOVERY_MAX_DAILY_CANDIDATES")
+
+    # --- Swing trade track (3–6 week holds, trend-following with news/regime exits) ---
+    # Capability flag: set False to disable this track entirely.
+    swing_track_enabled: bool = Field(default=True, alias="SWING_TRACK_ENABLED")
+    # Per-position hard stop — 8% from avg entry. Wider than intraday (7%) to
+    # give multi-week trades room to breathe through normal intraday volatility.
+    swing_stop_loss_pct: float = Field(default=0.08, alias="SWING_STOP_LOSS_PCT")
+    # Trailing stop activates at 12% gain, trails 7% behind peak.
+    swing_trailing_stop_pct: float = Field(default=0.07, alias="SWING_TRAILING_STOP_PCT")
+    swing_trailing_stop_activation_pct: float = Field(default=0.12, alias="SWING_TRAILING_STOP_ACTIVATION_PCT")
+    # Force-exit after this many calendar days regardless of P&L — prevents
+    # swing positions from silently becoming thesis-style multi-month holds.
+    swing_max_hold_days: int = Field(default=21, alias="SWING_MAX_HOLD_DAYS")
+    # Hard cap on concurrent swing positions.
+    swing_max_open_positions: int = Field(default=5, alias="SWING_MAX_OPEN_POSITIONS")
+
+    # --- Macro news agent (pre-market, runs before regime assessment) ---
+    # LLM generates search queries tuned to today's date, fetches headlines,
+    # then scores overall US equity market sentiment. The result adjusts the
+    # effective VIX used by assess_daily_regime, potentially arming tracks
+    # that would otherwise sit just above a threshold. Uses the cheap
+    # subagent model (Haiku). Two LLM calls per day.
+    macro_news_enabled: bool = Field(default=True, alias="MACRO_NEWS_ENABLED")
+    # Maximum VIX adjustment from news sentiment (in VIX points), scaled by
+    # confidence. E.g. at 3.0 + confidence=0.8: effective VIX shifts by 2.4.
+    macro_news_vix_adjustment: float = Field(default=3.0, alias="MACRO_NEWS_VIX_ADJUSTMENT")
+    # Minimum confidence to apply any adjustment. Below this, news is too
+    # uncertain to override pure technical data.
+    macro_news_min_confidence: float = Field(default=0.6, alias="MACRO_NEWS_MIN_CONFIDENCE")
 
     # --- Options track (long calls/puts only — no spreads, no writing) ---
     # CAPABILITY FLAG: set True once when your broker account has options
@@ -156,7 +234,11 @@ class Settings(BaseSettings):
     # NOT 0-1 DTE: a fast-decaying near-term contract can be right about
     # direction and still expire worthless if the move is too slow. The
     # DTE floor below is what actually prevents that, not just habit.
-    options_track_enabled: bool = Field(default=True, alias="OPTIONS_TRACK_ENABLED")
+    # Disabled by default: ORB options accumulated 30 losing positions because
+    # ORB is an intraday signal but we were holding 30-45 DTE contracts. The
+    # intraday exit (OPTIONS_INTRADAY_STOP_PCT) partially fixes this, but the
+    # core edge is weak. Re-enable only with a clear backtested thesis.
+    options_track_enabled: bool = Field(default=False, alias="OPTIONS_TRACK_ENABLED")
     # 30-45 DTE for swing trading: gives the trade room to work over days
     # without being destroyed by theta in the final week. Previously 5-10
     # DTE which was essentially a same-week lottery ticket.
@@ -167,6 +249,10 @@ class Settings(BaseSettings):
     # carries embedded leverage the equity cap was never calibrated for.
     options_max_risk_pct: float = Field(default=0.01, alias="OPTIONS_MAX_RISK_PCT")
     options_stop_loss_pct: float = Field(default=0.50, alias="OPTIONS_STOP_LOSS_PCT")
+    # Same-day exit: if an ORB option is down ≥ this % by 3pm ET, close it.
+    # The ORB signal resolves intraday — a stalled breakout by late afternoon
+    # should not be carried overnight as a multi-week theta bleed.
+    options_intraday_stop_pct: float = Field(default=0.20, alias="OPTIONS_INTRADAY_STOP_PCT")
     # Force-close at 7 DTE to avoid gamma/theta spike in final week.
     options_force_close_days_before_expiration: int = Field(default=7, alias="OPTIONS_FORCE_CLOSE_DAYS_BEFORE_EXPIRATION")
 
@@ -217,7 +303,7 @@ class Settings(BaseSettings):
     vol_options_allow_uncovered: bool = Field(default=False, alias="VOL_OPTIONS_ALLOW_UNCOVERED")
     vol_options_uncovered_confirm: str = Field(default="", alias="VOL_OPTIONS_UNCOVERED_CONFIRM")
 
-    @field_validator("max_position_size_pct", "max_daily_drawdown_pct", "options_max_risk_pct", "options_stop_loss_pct", "vol_options_max_risk_pct", "vol_options_profit_target_pct", "exit_trailing_stop_activation_pct", "exit_trailing_stop_pct", "exit_stop_loss_pct", "vol_universe_max_spread_pct")
+    @field_validator("max_position_size_pct", "max_daily_drawdown_pct", "options_max_risk_pct", "options_stop_loss_pct", "vol_options_max_risk_pct", "vol_options_profit_target_pct", "exit_trailing_stop_activation_pct", "exit_trailing_stop_pct", "exit_stop_loss_pct", "vol_universe_max_spread_pct", "intraday_capital_pct", "options_capital_pct", "thesis_capital_pct", "swing_capital_pct", "swing_stop_loss_pct", "swing_trailing_stop_pct", "swing_trailing_stop_activation_pct")
     @classmethod
     def _fraction_in_range(cls, v: float) -> float:
         if not (0 < v <= 1):
