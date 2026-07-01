@@ -254,6 +254,11 @@ with tab_controls:
         "options": ("Options Scan", "Runs every 30 min — looks for directional ORB breakouts to trade with defined-risk calls/puts."),
     }
 
+    if "trigger_fired_at" not in st.session_state:
+        st.session_state.trigger_fired_at = None
+    if "last_trigger_name" not in st.session_state:
+        st.session_state.last_trigger_name = None
+
     cols = st.columns(len(_SCAN_META))
     for col, (scan_key, (label, description)) in zip(cols, _SCAN_META.items()):
         with col:
@@ -262,38 +267,47 @@ with tab_controls:
             if st.button(f"Run {label}", key=f"trigger_{scan_key}"):
                 try:
                     write_trigger(scan_key)
-                    st.success("Queued — engine will pick it up within 15 seconds.")
+                    st.session_state.trigger_fired_at = datetime.utcnow()
+                    st.session_state.last_trigger_name = label
+                    st.success("Queued — engine picks it up within 15 seconds. Refresh to see output.")
                 except Exception as exc:
                     st.error(f"Failed to write trigger: {exc}")
 
     st.divider()
-    st.subheader("Live Scan Output")
-    st.caption("Today's scan activity from the engine log — candidates found, consensus verdicts, orders placed.")
 
-    _LOG_KEYWORDS = (
-        "MANUAL TRIGGER", "THESIS SCAN", "GAP SCAN", "SWING SCAN", "MOMENTUM SCAN",
-        "cleared screening", "thesis scan PASSED", "shrink-volume confirmed",
-        "BUY", "SELL", "HOLD", "verdict", "approved", "rejected", "amended",
-        "kelly", "circuit breaker", "halted", "blocked", "gap_pct", "Gap scanner",
-        "consensus", "REGIME", "DAILY REGIME",
-    )
+    fired_at = st.session_state.trigger_fired_at
+    if fired_at is None:
+        st.info("Click a scan button above to run it. Output will appear here.")
+    else:
+        st.subheader(f"Output — {st.session_state.last_trigger_name}")
+        st.caption(f"Triggered at {fired_at.strftime('%H:%M:%S')} UTC. Refresh to update.")
 
-    try:
-        log_path = Path(__file__).resolve().parent.parent / "logs" / "trading_engine.log"
-        today_str = date.today().isoformat()
-        matching_lines = []
-        with open(log_path) as f:
-            for line in f:
-                if not line.startswith(today_str):
-                    continue
-                if any(kw in line for kw in _LOG_KEYWORDS):
-                    matching_lines.append(line.rstrip())
-        if matching_lines:
-            st.code("\n".join(matching_lines[-200:]), language=None)
-        else:
-            st.info("No scan activity logged today yet.")
-    except Exception as exc:
-        st.warning(f"Could not read log: {exc}")
+        _LOG_KEYWORDS = (
+            "MANUAL TRIGGER", "THESIS SCAN", "GAP SCAN", "SWING SCAN", "MOMENTUM SCAN",
+            "cleared screening", "thesis scan PASSED", "shrink-volume confirmed",
+            "BUY", "SELL", "HOLD", "verdict", "approved", "rejected", "amended",
+            "kelly", "circuit breaker", "halted", "blocked", "Gap scanner",
+            "consensus", "REGIME", "DAILY REGIME", "skipped", "no candidates",
+        )
+
+        cutoff_str = fired_at.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_path = Path(__file__).resolve().parent.parent / "logs" / "trading_engine.log"
+            matching_lines = []
+            with open(log_path) as f:
+                for line in f:
+                    if len(line) < 19 or line[10] != " ":
+                        continue
+                    if line[:19] < cutoff_str:
+                        continue
+                    if any(kw in line for kw in _LOG_KEYWORDS):
+                        matching_lines.append(line.rstrip())
+            if matching_lines:
+                st.code("\n".join(matching_lines), language=None)
+            else:
+                st.info("No output yet — the engine may still be picking up the trigger. Refresh in a few seconds.")
+        except Exception as exc:
+            st.warning(f"Could not read log: {exc}")
 
 # ---- Positions ----
 with tab_positions:
