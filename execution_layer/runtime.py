@@ -1232,6 +1232,14 @@ class TradingRuntime:
             macro_context = self._macro_snapshot.format_for_prompt()
             lessons_text = accuracy_context + vw_context + macro_context + lesson_store.format_for_prompt(relevant_lessons)
 
+            existing_shares = self._broker.get_position_shares(ticker)
+
+            # ── Kelly position sizing ─────────────────────────────────────────
+            pnl_history = self._state_store.get_pnl_history()
+            kelly_fraction, kelly_reason = kelly_fraction_from_pnl_history(
+                pnl_history, self._settings.max_position_size_pct
+            )
+
             # Apply robust circuit breaker size multiplier on top of Kelly
             # (consecutive loss soft brake × VIX scaling × global halt → 0)
             breaker_for_strategy = (
@@ -1248,14 +1256,6 @@ class TradingRuntime:
                         ticker, size_mult * 100, kelly_fraction, kelly_fraction * size_mult,
                     )
                 kelly_fraction = kelly_fraction * size_mult
-
-            existing_shares = self._broker.get_position_shares(ticker)
-
-            # ── Kelly position sizing ─────────────────────────────────────────
-            pnl_history = self._state_store.get_pnl_history()
-            kelly_fraction, kelly_reason = kelly_fraction_from_pnl_history(
-                pnl_history, self._settings.max_position_size_pct
-            )
 
             # ── Correlation guard (parallel fetches, session cache) ───────────
             active_held = [
