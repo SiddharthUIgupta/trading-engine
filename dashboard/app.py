@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv()
 
-from execution_layer.manual_trigger import VALID_SCANS, write_trigger  # noqa: E402
+from execution_layer.manual_trigger import SCAN_LABELS, VALID_SCANS, read_trigger_history, write_trigger  # noqa: E402
 from analyst_layer.agents.fundamental_agent import FundamentalAgent  # noqa: E402
 from analyst_layer.agents.general_analyst_agent import GeneralAnalystAgent  # noqa: E402
 from analyst_layer.agents.macro_sentiment_agent import MacroSentimentAgent  # noqa: E402
@@ -135,37 +135,35 @@ def _run_adhoc_analysis(ticker: str, settings, store: StateStore):
 
 st.title("trading-engine")
 
-# Floating refresh button — window.location.reload() is the only reliable
-# cross-Streamlit-version approach. Equivalent to browser F5: re-runs the
-# script and fetches fresh broker + DB data, which is what a dashboard wants.
+# Floating Refresh button — styled Streamlit button so clicking it triggers
+# st.rerun() natively (no JS, no WebSocket kill).
 st.markdown(
     """
     <style>
-    #__floating_refresh__ {
+    div[data-testid="stButton"]:has(button[key="__refresh_btn__"]),
+    div[data-testid="stButton"]:has(button[aria-label="↻ Refresh"]) {
         position: fixed;
         bottom: 1.75rem;
         right: 1.75rem;
         z-index: 99999;
-        background: #f97316;
-        color: white;
-        border: none;
-        border-radius: 2rem;
-        padding: 0.65rem 1.35rem;
-        font-size: 0.95rem;
-        font-weight: 700;
-        cursor: pointer;
-        box-shadow: 0 4px 14px rgba(249, 115, 22, 0.45);
-        transition: background 0.15s ease, transform 0.1s ease;
     }
-    #__floating_refresh__:hover {
-        background: #ea6c0a;
-        transform: scale(1.04);
+    div[data-testid="stButton"]:has(button[key="__refresh_btn__"]) button,
+    div[data-testid="stButton"]:has(button[aria-label="↻ Refresh"]) button {
+        background: #f97316 !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 2rem !important;
+        padding: 0.65rem 1.35rem !important;
+        font-size: 0.95rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 4px 14px rgba(249, 115, 22, 0.45) !important;
     }
     </style>
-    <button id="__floating_refresh__" onclick="window.location.reload()">↻ Refresh</button>
     """,
     unsafe_allow_html=True,
 )
+if st.button("↻ Refresh", key="__refresh_btn__"):
+    st.rerun()
 
 settings = _settings()
 store = _store()
@@ -239,75 +237,96 @@ with tab_analyze:
 
 # ---- Controls ----
 with tab_controls:
-    st.subheader("Manual Scan Triggers")
-    st.caption(
-        "Queues a scan on the live engine — it runs within ~15 seconds. "
-        "Scans respect all circuit breakers and regime guards exactly as if they "
-        "fired on schedule. The engine log will show `=== MANUAL TRIGGER ===`."
-    )
-
-    _SCAN_META = {
-        "thesis": ("Thesis Scan", "8:15 AM scan — finds stocks pulled back ≥20% from 52w high. Runs full 4-agent consensus on top candidates."),
-        "gap": ("Gap Scan", "9:05 AM scan — finds stocks gapping ≥5% pre-market (like META today). Queues approved names for immediate execution."),
-        "swing": ("Swing Scan", "9:45 AM scan — finds stocks in uptrend (SMA20>SMA50) at a pullback entry. Multi-week hold."),
-        "momentum": ("Momentum Scan", "Runs every 30 min intraday — looks for volume-spike + SMA breakout momentum signals."),
-        "options": ("Options Scan", "Runs every 30 min — looks for directional ORB breakouts to trade with defined-risk calls/puts."),
+    _SCAN_DESCRIPTIONS = {
+        "thesis": "Full market scan — stocks pulled back ≥20% from 52w high. 4-agent consensus. Takes ~10 min.",
+        "gap": "Pre-market gap ≥5% scanner. Queues approved names for immediate execution.",
+        "swing": "Uptrend + RSI pullback entries (SMA20>SMA50). Multi-week hold.",
+        "momentum": "Volume-spike + SMA breakout signals. Intraday.",
+        "options": "Directional ORB breakouts → defined-risk calls/puts.",
     }
 
-    if "trigger_fired_at" not in st.session_state:
-        st.session_state.trigger_fired_at = None
-    if "last_trigger_name" not in st.session_state:
-        st.session_state.last_trigger_name = None
-
-    cols = st.columns(len(_SCAN_META))
-    for col, (scan_key, (label, description)) in zip(cols, _SCAN_META.items()):
+    st.subheader("Run a Scan")
+    cols = st.columns(len(VALID_SCANS))
+    for col, scan_key in zip(cols, VALID_SCANS):
+        label = SCAN_LABELS[scan_key]
         with col:
             st.markdown(f"**{label}**")
-            st.caption(description)
-            if st.button(f"Run {label}", key=f"trigger_{scan_key}"):
+            st.caption(_SCAN_DESCRIPTIONS[scan_key])
+            if st.button(f"▶ Run", key=f"trigger_{scan_key}"):
                 try:
                     write_trigger(scan_key)
-                    st.session_state.trigger_fired_at = datetime.utcnow()
-                    st.session_state.last_trigger_name = label
-                    st.success("Queued — engine picks it up within 15 seconds. Refresh to see output.")
+                    st.success(f"Queued. Refresh in ~20s to see output.")
                 except Exception as exc:
-                    st.error(f"Failed to write trigger: {exc}")
+                    st.error(f"{exc}")
 
     st.divider()
 
-    fired_at = st.session_state.trigger_fired_at
-    if fired_at is None:
-        st.info("Click a scan button above to run it. Output will appear here.")
+    # ── Scan history — read from disk, survives page refresh ─────────────────
+    _LOG_KEYWORDS = (
+        "MANUAL TRIGGER", "THESIS SCAN", "GAP SCAN", "SWING SCAN", "MOMENTUM SCAN",
+        "cleared screening", "thesis scan PASSED", "shrink-volume confirmed",
+        "BUY", "SELL", "HOLD", "verdict", "approved", "rejected", "amended",
+        "kelly", "circuit breaker", "halted", "blocked", "Gap scanner",
+        "consensus", "REGIME", "DAILY REGIME", "skipped", "no candidates",
+    )
+
+    history = read_trigger_history()
+    if not history:
+        st.info("No scans triggered today. Click a button above to start one.")
     else:
-        st.subheader(f"Output — {st.session_state.last_trigger_name}")
-        st.caption(f"Triggered at {fired_at.strftime('%H:%M:%S')} UTC. Refresh to update.")
-
-        _LOG_KEYWORDS = (
-            "MANUAL TRIGGER", "THESIS SCAN", "GAP SCAN", "SWING SCAN", "MOMENTUM SCAN",
-            "cleared screening", "thesis scan PASSED", "shrink-volume confirmed",
-            "BUY", "SELL", "HOLD", "verdict", "approved", "rejected", "amended",
-            "kelly", "circuit breaker", "halted", "blocked", "Gap scanner",
-            "consensus", "REGIME", "DAILY REGIME", "skipped", "no candidates",
-        )
-
-        cutoff_str = fired_at.strftime("%Y-%m-%d %H:%M:%S")
+        # Build a summary table
+        log_path = Path(__file__).resolve().parent.parent / "logs" / "trading_engine.log"
         try:
-            log_path = Path(__file__).resolve().parent.parent / "logs" / "trading_engine.log"
-            matching_lines = []
-            with open(log_path) as f:
-                for line in f:
-                    if len(line) < 19 or line[10] != " ":
-                        continue
-                    if line[:19] < cutoff_str:
-                        continue
-                    if any(kw in line for kw in _LOG_KEYWORDS):
-                        matching_lines.append(line.rstrip())
-            if matching_lines:
-                st.code("\n".join(matching_lines), language=None)
-            else:
-                st.info("No output yet — the engine may still be picking up the trigger. Refresh in a few seconds.")
-        except Exception as exc:
-            st.warning(f"Could not read log: {exc}")
+            all_log_lines = log_path.read_text().splitlines()
+        except Exception:
+            all_log_lines = []
+
+        def _log_lines_between(from_ts: str, to_ts: str | None) -> list[str]:
+            """Return filtered log lines between two UTC ISO timestamps."""
+            # Log lines start with "YYYY-MM-DD HH:MM:SS" in local server time (UTC).
+            # Convert ISO timestamps to comparable prefixes.
+            from_cmp = from_ts[:19].replace("T", " ")
+            to_cmp = to_ts[:19].replace("T", " ") if to_ts else None
+            out = []
+            for line in all_log_lines:
+                if len(line) < 19 or line[10] != " ":
+                    continue
+                ts = line[:19]
+                if ts < from_cmp:
+                    continue
+                if to_cmp and ts > to_cmp:
+                    continue
+                if any(kw in line for kw in _LOG_KEYWORDS):
+                    out.append(line)
+            return out
+
+        # Summary table
+        table_rows = []
+        for i, entry in enumerate(history):
+            next_ts = history[i + 1]["fired_at"] if i + 1 < len(history) else None
+            lines = _log_lines_between(entry["fired_at"], next_ts)
+            fired_dt = datetime.fromisoformat(entry["fired_at"])
+            table_rows.append({
+                "#": i + 1,
+                "Time (UTC)": fired_dt.strftime("%H:%M:%S"),
+                "Scan": entry["label"],
+                "Log lines": len(lines),
+            })
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+
+        st.divider()
+
+        # Output for each trigger, newest first, each in an expander
+        for i, entry in reversed(list(enumerate(history))):
+            next_ts = history[i + 1]["fired_at"] if i + 1 < len(history) else None
+            lines = _log_lines_between(entry["fired_at"], next_ts)
+            fired_dt = datetime.fromisoformat(entry["fired_at"])
+            header = f"#{i+1}  {entry['label']}  —  {fired_dt.strftime('%H:%M:%S')} UTC  ({len(lines)} lines)"
+            with st.expander(header, expanded=(i == len(history) - 1)):
+                if lines:
+                    st.code("\n".join(lines), language=None)
+                else:
+                    st.caption("No output yet — refresh in a few seconds.")
 
 # ---- Positions ----
 with tab_positions:
