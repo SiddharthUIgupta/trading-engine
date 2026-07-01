@@ -262,9 +262,38 @@ with tab_controls:
             if st.button(f"Run {label}", key=f"trigger_{scan_key}"):
                 try:
                     write_trigger(scan_key)
-                    st.success(f"Queued — engine will pick it up within 15 seconds.")
+                    st.success("Queued — engine will pick it up within 15 seconds.")
                 except Exception as exc:
                     st.error(f"Failed to write trigger: {exc}")
+
+    st.divider()
+    st.subheader("Live Scan Output")
+    st.caption("Today's scan activity from the engine log — candidates found, consensus verdicts, orders placed.")
+
+    _LOG_KEYWORDS = (
+        "MANUAL TRIGGER", "THESIS SCAN", "GAP SCAN", "SWING SCAN", "MOMENTUM SCAN",
+        "cleared screening", "thesis scan PASSED", "shrink-volume confirmed",
+        "BUY", "SELL", "HOLD", "verdict", "approved", "rejected", "amended",
+        "kelly", "circuit breaker", "halted", "blocked", "gap_pct", "Gap scanner",
+        "consensus", "REGIME", "DAILY REGIME",
+    )
+
+    try:
+        log_path = Path(__file__).resolve().parent.parent / "logs" / "trading_engine.log"
+        today_str = date.today().isoformat()
+        matching_lines = []
+        with open(log_path) as f:
+            for line in f:
+                if not line.startswith(today_str):
+                    continue
+                if any(kw in line for kw in _LOG_KEYWORDS):
+                    matching_lines.append(line.rstrip())
+        if matching_lines:
+            st.code("\n".join(matching_lines[-200:]), language=None)
+        else:
+            st.info("No scan activity logged today yet.")
+    except Exception as exc:
+        st.warning(f"Could not read log: {exc}")
 
 # ---- Positions ----
 with tab_positions:
