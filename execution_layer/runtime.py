@@ -2957,3 +2957,23 @@ class TradingRuntime:
                 contract_symbol, position["underlying_symbol"], position["option_type"],
                 position["strike"], position["expiration"], 0, position["avg_entry_price"],
             )
+
+    # ---- Manual trigger watcher (polls every 15s for dashboard-initiated scans) ----
+    def check_manual_trigger(self) -> None:
+        from execution_layer.manual_trigger import read_and_clear_trigger
+        scan = read_and_clear_trigger()
+        if scan is None:
+            return
+        logger.info("=== MANUAL TRIGGER: %s scan ===", scan.upper())
+        dispatch = {
+            "thesis": self.thesis_scan_and_trade,
+            "swing": self.swing_scan_and_trade,
+            "momentum": self.momentum_scan_and_trade,
+            "options": self.options_scan_and_trade,
+            "gap": self.gap_scan_and_queue,
+        }
+        fn = dispatch.get(scan)
+        if fn:
+            fn()
+        else:
+            logger.warning("Manual trigger: unknown scan %r — ignored", scan)

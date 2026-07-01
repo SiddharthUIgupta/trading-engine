@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv()
 
+from execution_layer.manual_trigger import VALID_SCANS, write_trigger  # noqa: E402
 from analyst_layer.agents.fundamental_agent import FundamentalAgent  # noqa: E402
 from analyst_layer.agents.general_analyst_agent import GeneralAnalystAgent  # noqa: E402
 from analyst_layer.agents.macro_sentiment_agent import MacroSentimentAgent  # noqa: E402
@@ -203,8 +204,8 @@ elif equity is not None:
 st.divider()
 
 # ---- Tabs ----
-tab_analyze, tab_positions, tab_trades, tab_performance, tab_decisions, tab_scans, tab_cost, tab_events = st.tabs(
-    ["Analyze Ticker", "Positions", "Trade History", "Performance", "Agent Decisions", "Scanner Activity", "Cost Tracking", "Events Log"]
+tab_analyze, tab_controls, tab_positions, tab_trades, tab_performance, tab_decisions, tab_scans, tab_cost, tab_events = st.tabs(
+    ["Analyze Ticker", "Controls", "Positions", "Trade History", "Performance", "Agent Decisions", "Scanner Activity", "Cost Tracking", "Events Log"]
 )
 
 # ---- Analyze Ticker (general read — no position sizing, no order) ----
@@ -235,6 +236,35 @@ with tab_analyze:
                 for signal in signals:
                     st.markdown(f"**{signal.agent_name}** ({signal.confidence.value}): {signal.stance.value}")
                     st.caption(_md(signal.rationale))
+
+# ---- Controls ----
+with tab_controls:
+    st.subheader("Manual Scan Triggers")
+    st.caption(
+        "Queues a scan on the live engine — it runs within ~15 seconds. "
+        "Scans respect all circuit breakers and regime guards exactly as if they "
+        "fired on schedule. The engine log will show `=== MANUAL TRIGGER ===`."
+    )
+
+    _SCAN_META = {
+        "thesis": ("Thesis Scan", "8:15 AM scan — finds stocks pulled back ≥20% from 52w high. Runs full 4-agent consensus on top candidates."),
+        "gap": ("Gap Scan", "9:05 AM scan — finds stocks gapping ≥5% pre-market (like META today). Queues approved names for immediate execution."),
+        "swing": ("Swing Scan", "9:45 AM scan — finds stocks in uptrend (SMA20>SMA50) at a pullback entry. Multi-week hold."),
+        "momentum": ("Momentum Scan", "Runs every 30 min intraday — looks for volume-spike + SMA breakout momentum signals."),
+        "options": ("Options Scan", "Runs every 30 min — looks for directional ORB breakouts to trade with defined-risk calls/puts."),
+    }
+
+    cols = st.columns(len(_SCAN_META))
+    for col, (scan_key, (label, description)) in zip(cols, _SCAN_META.items()):
+        with col:
+            st.markdown(f"**{label}**")
+            st.caption(description)
+            if st.button(f"Run {label}", key=f"trigger_{scan_key}"):
+                try:
+                    write_trigger(scan_key)
+                    st.success(f"Queued — engine will pick it up within 15 seconds.")
+                except Exception as exc:
+                    st.error(f"Failed to write trigger: {exc}")
 
 # ---- Positions ----
 with tab_positions:

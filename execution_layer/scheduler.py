@@ -12,6 +12,7 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from execution_layer.runtime import TradingRuntime
 
@@ -112,6 +113,13 @@ def build_scheduler(runtime: TradingRuntime) -> BackgroundScheduler:
         trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=EXCHANGE_TZ),
         id="post_market_logging",
         misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        runtime.check_manual_trigger,
+        trigger=IntervalTrigger(seconds=15),
+        id="manual_trigger_watcher",
+        max_instances=1,
+        coalesce=True,
     )
 
     logger.info("Scheduler built with jobs: %s", [job.id for job in scheduler.get_jobs()])
