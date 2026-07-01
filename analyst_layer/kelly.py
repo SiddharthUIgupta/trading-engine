@@ -24,6 +24,12 @@ from __future__ import annotations
 
 MIN_TRADES_FOR_KELLY = 15
 _FALLBACK_MULTIPLIER = 0.5  # conservative: half the max cap while bootstrapping
+# When Kelly comes out negative (no measured edge), allow this minimum fraction
+# so the system keeps trading and the VW bandit keeps getting examples.
+# Only applies while n < EXPLORATION_TRADE_THRESHOLD — after that, a 0 Kelly
+# means zero (the system has enough history to know it has no edge).
+EXPLORATION_MIN_PCT = 0.01        # 1% of equity per trade
+EXPLORATION_TRADE_THRESHOLD = 50  # stop exploring once we have this many trades
 
 
 def compute_kelly_fraction(
@@ -95,9 +101,19 @@ def kelly_fraction_from_pnl_history(
     raw_kelly = compute_kelly_fraction(win_rate, win_loss_ratio)
     capped = min(raw_kelly, max_position_size_pct)
 
-    reason = (
-        f"half-Kelly from {n} trades: "
-        f"win_rate={win_rate:.1%}, avg_win=${avg_win:.0f}, avg_loss=${avg_loss:.0f}, "
-        f"W/L_ratio={win_loss_ratio:.2f} → raw={raw_kelly:.1%} → capped={capped:.1%}"
-    )
+    if capped == 0.0 and n < EXPLORATION_TRADE_THRESHOLD:
+        capped = EXPLORATION_MIN_PCT
+        reason = (
+            f"half-Kelly from {n} trades: "
+            f"win_rate={win_rate:.1%}, avg_win=${avg_win:.0f}, avg_loss=${avg_loss:.0f}, "
+            f"W/L_ratio={win_loss_ratio:.2f} → raw={raw_kelly:.1%} (negative edge) "
+            f"→ exploration floor {EXPLORATION_MIN_PCT:.1%} applied "
+            f"({n}/{EXPLORATION_TRADE_THRESHOLD} trades to exit exploration)"
+        )
+    else:
+        reason = (
+            f"half-Kelly from {n} trades: "
+            f"win_rate={win_rate:.1%}, avg_win=${avg_win:.0f}, avg_loss=${avg_loss:.0f}, "
+            f"W/L_ratio={win_loss_ratio:.2f} → raw={raw_kelly:.1%} → capped={capped:.1%}"
+        )
     return capped, reason
