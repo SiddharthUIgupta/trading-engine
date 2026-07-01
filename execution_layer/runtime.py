@@ -990,10 +990,10 @@ class TradingRuntime:
                 return
 
     def _build_thesis_candidates(self, today: date, universe: list | None = None) -> list[str]:
-        """Scans OpenBB's aggressive_small_caps/undervalued_growth discovery
-        screens for names pulled back from their 52-week high, capped at
-        `thesis_max_daily_candidates`. `universe` can be pre-fetched and shared
-        with `_build_recovery_candidates` to avoid a duplicate API call.
+        """Screens the quality universe for names pulled back from their 52-week high.
+
+        Capped at `thesis_max_daily_candidates`. `universe` can be pre-fetched
+        and shared with `_build_recovery_candidates` to avoid a duplicate fetch.
         """
         try:
             candidates = universe if universe is not None else self._data_client.get_thesis_universe()
