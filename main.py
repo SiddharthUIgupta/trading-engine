@@ -68,7 +68,7 @@ def main() -> None:
         logger.info("Paper trading mode (default).")
 
     anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
-    data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
+    data_client = OpenBBDataClient(pat=settings.openbb_pat or None, finnhub_api_key=settings.finnhub_api_key or None)
     broker = AlpacaBroker.from_settings(settings)
     global_risk = GlobalRiskState(
         max_weekly_drawdown_pct=settings.max_weekly_drawdown_pct,

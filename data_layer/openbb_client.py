@@ -16,7 +16,8 @@ from pydantic import ValidationError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from data_layer.exceptions import DataValidationError, ProviderFetchError
-from data_layer.google_news import fetch_headlines
+from data_layer.finnhub_client import fetch_company_headlines
+from data_layer.google_news import fetch_headlines as _google_fetch_headlines
 from data_layer.models import (
     AnalystRevision,
     FilingSummary,
@@ -52,8 +53,9 @@ class OpenBBDataClient:
     underlying `obb` SDK is stateless aside from credential config.
     """
 
-    def __init__(self, pat: str | None = None) -> None:
+    def __init__(self, pat: str | None = None, finnhub_api_key: str | None = None) -> None:
         self._pat = pat
+        self._finnhub_api_key = finnhub_api_key or ""
         self._obb = None  # lazy import/init so tests never need a real OpenBB hub login
 
     def _client(self):
@@ -128,7 +130,12 @@ class OpenBBDataClient:
         less financially-targeted set, with no sentiment field of its own.
         """
         try:
-            headlines = fetch_headlines(symbol)
+            if self._finnhub_api_key:
+                headlines = fetch_company_headlines(symbol, self._finnhub_api_key)
+                source = "finnhub"
+            else:
+                headlines = _google_fetch_headlines(symbol)
+                source = "google_news"
         except ProviderFetchError as exc:
             raise ProviderFetchError(f"sentiment fetch failed for {symbol}: {exc}") from exc
 
@@ -142,7 +149,7 @@ class OpenBBDataClient:
             return SentimentSnapshot(
                 symbol=symbol,
                 as_of=datetime.utcnow(),
-                source="google_news",
+                source=source,
                 score=max(-1.0, min(1.0, score)),
                 polarity=polarity,
                 headline_count=len(headlines),

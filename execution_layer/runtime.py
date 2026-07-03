@@ -188,6 +188,7 @@ class TradingRuntime:
                     client=self._anthropic,
                     model=self._settings.anthropic_subagent_model,
                     today=today,
+                    finnhub_api_key=self._settings.finnhub_api_key,
                 )
                 macro_sentiment = macro.sentiment
                 macro_confidence = macro.confidence
@@ -446,6 +447,8 @@ class TradingRuntime:
     # rule, and by the time a multi-second consensus call finished, an
     # intraday breakout's entry window would often already be gone.
     def momentum_scan_and_trade(self) -> None:
+        if not self._settings.orb_equity_enabled:
+            return
         orb_armed = self._daily_regime.arm_orb_equity if self._daily_regime else True
         if not self._settings.dynamic_universe_enabled or not orb_armed or self._breaker.is_stock_halted:
             if self._settings.dynamic_universe_enabled and not orb_armed:

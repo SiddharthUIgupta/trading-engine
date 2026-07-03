@@ -54,7 +54,13 @@ def run_thesis_backtest(
     stop_loss_pct: float = 0.18,
     trailing_stop_pct: float = 0.10,
     trailing_stop_activation_pct: float = 0.20,
+    entry_slippage_pct: float = 0.0,
+    exit_slippage_pct: float = 0.0,
 ) -> list[Trade]:
+    """
+    entry_slippage_pct: fraction added to entry fill (e.g. 0.005 = 0.5% worse than open).
+    exit_slippage_pct: fraction subtracted from exit fill (e.g. 0.003 = 0.3% worse than stop).
+    """
     if universe is None:
         universe = get_sp500_universe()
 
@@ -80,6 +86,7 @@ def run_thesis_backtest(
         trades = _walk_forward(
             ticker, bars, rolling_high, rolling_low,
             min_pullback_pct, max_pullback_pct, stop_loss_pct, trailing_stop_pct, trailing_stop_activation_pct,
+            entry_slippage_pct, exit_slippage_pct,
         )
         all_trades.extend(trades)
         if (n + 1) % 50 == 0:
@@ -91,6 +98,8 @@ def run_thesis_backtest(
 def _walk_forward(
     ticker, bars, rolling_high, rolling_low,
     min_pullback_pct, max_pullback_pct, stop_loss_pct, trailing_stop_pct, trailing_stop_activation_pct,
+    entry_slippage_pct: float = 0.0,
+    exit_slippage_pct: float = 0.0,
 ) -> list[Trade]:
     trades: list[Trade] = []
     in_position = False
@@ -110,7 +119,7 @@ def _walk_forward(
             candidate = ThesisCandidate(symbol=ticker, price=bar.close, year_high=float(year_high), year_low=float(year_low))
             signal = evaluate_thesis_candidate(candidate, min_pullback_pct, max_pullback_pct)
             if signal.passed and i < last_index:
-                entry_price = bars[i + 1].open
+                entry_price = bars[i + 1].open * (1 + entry_slippage_pct)
                 entry_date = bars[i + 1].timestamp.date()
                 high_water_mark = entry_price
                 in_position = True
@@ -119,7 +128,8 @@ def _walk_forward(
         else:
             stop_price = entry_price * (1 - stop_loss_pct)
             if bar.low <= stop_price:
-                trades.append(Trade(ticker, entry_date, entry_price, bar_date, stop_price, "stop-loss"))
+                fill = stop_price * (1 - exit_slippage_pct)
+                trades.append(Trade(ticker, entry_date, entry_price, bar_date, fill, "stop-loss"))
                 in_position = False
                 i += 1
                 continue
@@ -129,7 +139,8 @@ def _walk_forward(
             if high_water_mark > entry_price and gain_to_peak >= trailing_stop_activation_pct:
                 trailing_stop_price = high_water_mark * (1 - trailing_stop_pct)
                 if bar.low <= trailing_stop_price:
-                    trades.append(Trade(ticker, entry_date, entry_price, bar_date, trailing_stop_price, "trailing-stop"))
+                    fill = trailing_stop_price * (1 - exit_slippage_pct)
+                    trades.append(Trade(ticker, entry_date, entry_price, bar_date, fill, "trailing-stop"))
                     in_position = False
                     i += 1
                     continue

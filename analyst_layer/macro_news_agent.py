@@ -105,12 +105,29 @@ class MacroSentiment:
     news_tickers: list[NewsTickerSignal] = field(default_factory=list)
 
 
-def _fetch_yfinance_news(queries: list[str], count_per_query: int = 10) -> tuple[list[str], int]:
-    """Fetch news via yfinance Search for each query.
+def _fetch_finnhub_news(api_key: str) -> tuple[list[str], int]:
+    """Fetch finance-focused news from Finnhub (general + merger categories).
 
-    Returns (formatted_text_lines, unique_item_count). Each line is either
-    "- title" or "- title\n  summary" depending on what yfinance returns.
-    Deduplicates across queries by title.
+    Returns (formatted_text_lines, unique_item_count).
+    """
+    from data_layer.finnhub_client import fetch_market_news
+    from data_layer.exceptions import ProviderFetchError
+    try:
+        articles = fetch_market_news(api_key, categories=("general", "merger"))
+        lines = [
+            f"- {headline}" + (f"\n  {summary}" if summary else "")
+            for headline, summary in articles
+        ]
+        return lines, len(lines)
+    except ProviderFetchError as exc:
+        logger.warning("Finnhub market news failed: %s", exc)
+        return [], 0
+
+
+def _fetch_yfinance_news(queries: list[str], count_per_query: int = 10) -> tuple[list[str], int]:
+    """Fetch news via yfinance Search for each query (fallback when no Finnhub key).
+
+    Returns (formatted_text_lines, unique_item_count).
     """
     try:
         import yfinance as yf
@@ -127,9 +144,6 @@ def _fetch_yfinance_news(queries: list[str], count_per_query: int = 10) -> tuple
             for item in results:
                 if not isinstance(item, dict):
                     continue
-                # yfinance returns two formats depending on version:
-                # Newer: {id, content: {title, summary, ...}}
-                # Older: {uuid, title, publisher, ...}
                 content = item.get("content") or {}
                 title = (content.get("title") or item.get("title") or "").strip()
                 summary = (content.get("summary") or "").strip()
@@ -149,12 +163,13 @@ def assess_macro_sentiment(
     client: Anthropic,
     model: str,
     today: date | None = None,
+    finnhub_api_key: str = "",
 ) -> MacroSentiment:
-    """Run the two-step macro news assessment using yfinance Search.
+    """Run the macro news assessment.
 
-    Step 1: LLM generates search queries tuned to today's market context.
-    Step 2: Fetch news via yfinance Search — no hardcoded symbols or topics.
-    Step 3: LLM scores sentiment AND extracts individual stock catalysts.
+    With a Finnhub key: fetches finance-specific news directly (general +
+    merger categories) — no query generation step needed.
+    Without a key: falls back to LLM-generated queries → yfinance Search.
 
     Returns neutral, zero-confidence result on any failure — the regime
     treats that as 'no adjustment', which is the safe default.
@@ -163,32 +178,35 @@ def assess_macro_sentiment(
         today = date.today()
     today_str = today.strftime("%B %d, %Y")
 
-    # ── Step 1: LLM generates search queries ─────────────────────────────────
+    # ── Fetch news ────────────────────────────────────────────────────────────
     queries: list[str] = []
-    try:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=300,
-            system=_QUERY_GEN_SYSTEM,
-            messages=[{"role": "user", "content": _QUERY_GEN_USER.format(today=today_str)}],
-        )
-        parsed = json.loads(resp.content[0].text.strip())
-        if not isinstance(parsed, list):
-            raise ValueError(f"expected list, got {type(parsed)}")
-        queries = [str(q) for q in parsed[:8] if q]
-        logger.info("Macro news: LLM generated %d queries for %s", len(queries), today_str)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Macro news: query generation failed (%s) — using date-anchored fallback", exc)
-        month_year = today.strftime("%B %Y")
-        queries = [
-            f"stock market news {month_year}",
-            f"Federal Reserve {month_year}",
-            f"earnings results {month_year}",
-            "market movers stocks today",
-        ]
-
-    # ── Step 2: fetch news via yfinance ──────────────────────────────────────
-    news_lines, item_count = _fetch_yfinance_news(queries, count_per_query=10)
+    if finnhub_api_key:
+        news_lines, item_count = _fetch_finnhub_news(finnhub_api_key)
+        logger.info("Macro news: %d items from Finnhub for %s", item_count, today_str)
+    else:
+        # Fallback: LLM generates queries → yfinance Search
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=300,
+                system=_QUERY_GEN_SYSTEM,
+                messages=[{"role": "user", "content": _QUERY_GEN_USER.format(today=today_str)}],
+            )
+            parsed = json.loads(resp.content[0].text.strip())
+            if not isinstance(parsed, list):
+                raise ValueError(f"expected list, got {type(parsed)}")
+            queries = [str(q) for q in parsed[:8] if q]
+            logger.info("Macro news: LLM generated %d queries for %s", len(queries), today_str)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Macro news: query generation failed (%s) — using date-anchored fallback", exc)
+            month_year = today.strftime("%B %Y")
+            queries = [
+                f"stock market news {month_year}",
+                f"Federal Reserve {month_year}",
+                f"earnings results {month_year}",
+                "market movers stocks today",
+            ]
+        news_lines, item_count = _fetch_yfinance_news(queries, count_per_query=10)
     if not news_lines:
         logger.warning("Macro news: no news fetched — returning neutral")
         return MacroSentiment(

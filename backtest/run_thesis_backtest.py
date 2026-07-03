@@ -21,26 +21,43 @@ from backtest.metrics import summarize  # noqa: E402
 settings = get_settings()
 data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
 
-trades = run_thesis_backtest(data_client, years_back=3)
-report = summarize(trades)
+universe = None  # defaults to S&P 500
 
-print("\n=== THESIS BACKTEST REPORT ===")
-print(json.dumps(
-    {
+def _fmt(report) -> dict:
+    return {
         "total_closed_trades": report.total_trades,
         "still_open_at_backtest_end": report.still_open_at_backtest_end,
-        "win_rate": report.win_rate,
-        "avg_win_pct": report.avg_win_pct,
-        "avg_loss_pct": report.avg_loss_pct,
-        "profit_factor": report.profit_factor,
-        "best_trade_pct": report.best_trade_pct,
-        "worst_trade_pct": report.worst_trade_pct,
-        "mean_return_pct": report.mean_return_pct,
-        "median_return_pct": report.median_return_pct,
+        "win_rate": f"{report.win_rate:.1%}" if report.win_rate is not None else None,
+        "avg_win_pct": f"{report.avg_win_pct:.2%}" if report.avg_win_pct is not None else None,
+        "avg_loss_pct": f"{report.avg_loss_pct:.2%}" if report.avg_loss_pct is not None else None,
+        "profit_factor": round(report.profit_factor, 3) if report.profit_factor is not None else None,
+        "mean_return_pct": f"{report.mean_return_pct:.2%}" if report.mean_return_pct is not None else None,
+        "median_return_pct": f"{report.median_return_pct:.2%}" if report.median_return_pct is not None else None,
+        "best_trade_pct": f"{report.best_trade_pct:.2%}" if report.best_trade_pct is not None else None,
+        "worst_trade_pct": f"{report.worst_trade_pct:.2%}" if report.worst_trade_pct is not None else None,
         "confidence_note": report.confidence_note,
-    },
-    indent=2,
-))
+    }
+
+# ── Scenario 1: zero slippage (original backtest) ────────────────────────────
+logging.getLogger("thesis_backtest").info("Running scenario 1: zero slippage")
+trades_clean = run_thesis_backtest(data_client, universe=universe, years_back=3)
+report_clean = summarize(trades_clean)
+
+# ── Scenario 2: realistic slippage (0.5% entry, 0.3% exit) ──────────────────
+logging.getLogger("thesis_backtest").info("Running scenario 2: 0.5%% entry / 0.3%% exit slippage")
+trades_slip = run_thesis_backtest(
+    data_client, universe=universe, years_back=3,
+    entry_slippage_pct=0.005, exit_slippage_pct=0.003,
+)
+report_slip = summarize(trades_slip)
+
+result = {
+    "zero_slippage": _fmt(report_clean),
+    "with_slippage_0.5pct_entry_0.3pct_exit": _fmt(report_slip),
+}
+
+print("\n=== THESIS BACKTEST: SLIPPAGE IMPACT ===")
+print(json.dumps(result, indent=2))
 
 with open("backtest_results_thesis.json", "w") as f:
     json.dump([
@@ -48,7 +65,8 @@ with open("backtest_results_thesis.json", "w") as f:
             "ticker": t.ticker, "entry_date": t.entry_date.isoformat(), "entry_price": t.entry_price,
             "exit_date": t.exit_date.isoformat() if t.exit_date else None, "exit_price": t.exit_price,
             "exit_reason": t.exit_reason, "return_pct": t.return_pct,
+            "slippage": "0.5%_entry_0.3%_exit",
         }
-        for t in trades
+        for t in trades_slip
     ], f, indent=2)
-print("\nFull trade log written to backtest_results_thesis.json")
+print("\nFull trade log (with slippage) written to backtest_results_thesis.json")

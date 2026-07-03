@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # --- OpenBB ---
     openbb_pat: str = Field(default="", alias="OPENBB_PAT")
 
+    # --- Finnhub (financial news) ---
+    finnhub_api_key: str = Field(default="", alias="FINNHUB_API_KEY")
+
     # --- Alpaca ---
     alpaca_api_key: str = Field(default="", alias="ALPACA_API_KEY")
     alpaca_secret_key: str = Field(default="", alias="ALPACA_SECRET_KEY")
@@ -110,6 +113,11 @@ class Settings(BaseSettings):
     # options ORB track). Without this the track accumulates 30+ positions all
     # paying theta simultaneously, which bleeds premium on every tick.
     max_open_options_positions: int = Field(default=8, alias="MAX_OPEN_OPTIONS_POSITIONS")
+
+    # --- ORB equity track ---
+    # Disabled: backtest shows 46% win rate / -0.07% avg return (negative before slippage).
+    # All intraday capital is redirected to thesis track.
+    orb_equity_enabled: bool = Field(default=True, alias="ORB_EQUITY_ENABLED")
 
     # --- ORB equity quality filters ---
     # Minimum gap from prior close for a valid ORB long setup. Stocks that
