@@ -105,6 +105,10 @@ class ProtectionRuntime:
         orders. This keeps order execution in the plane that manages exits — so a
         bracket entry + its stop-loss order are both placed by the same process.
         """
+        expired = self._state_store.expire_stale_order_intents(max_age_hours=4.0)
+        if expired:
+            logger.warning("%d order intent(s) expired (>4h old) — not submitted, decision was stale", expired)
+
         intents = self._state_store.get_pending_order_intents()
         if not intents:
             return
@@ -237,6 +241,8 @@ class ProtectionRuntime:
             elif self._swing_breaker.check_profit_target(equity):
                 self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._swing_breaker)
 
+        self._sync_breaker_state_to_db()
+
         # Consume pending order intents from Alpha Plane
         self.consume_order_intents(today, equity)
 
@@ -250,7 +256,38 @@ class ProtectionRuntime:
         if self._settings.swing_track_enabled:
             self._check_swing_exits(equity)
 
+    def _sync_breaker_state_to_db(self) -> None:
+        """Writes each breaker's live in-memory halted state to breaker_state
+        every tick — not just on trip. `_trip_agent` writes "true" the moment
+        a breaker trips, but nothing previously wrote "false" back after
+        `ensure_day_started()` resets the in-memory flag on a new day, so a
+        single trip would silently halt that bucket in Alpha forever. Writing
+        `is_stock_halted` (tripped OR profit-locked) into the same "halted"
+        key Alpha checks also closes a second gap: profit-lock only ever set
+        a separate "profit_locked" key that Alpha's is_breaker_halted() never
+        read, so a profit lock never actually stopped Alpha from queuing new
+        BUY intents for that bucket.
+        """
+        for breaker in (self._intraday_breaker, self._options_breaker, self._thesis_breaker, self._swing_breaker):
+            self._state_store.set_breaker_state(
+                breaker.name, "halted", "true" if breaker.is_stock_halted else "false"
+            )
+
     # ── Exit checks ───────────────────────────────────────────────────────────
+
+    def _release_bracket_stop(self, ticker: str, bracket_stop_order_id: str | None) -> None:
+        """Cancels the resting bracket stop leg before a software-driven exit
+        sells the position outright. Alpaca reserves a position's shares
+        against any open order on that symbol — without this, the exit's own
+        SELL gets rejected as insufficient qty and the position rides down to
+        the stale stop instead of the trailing/LLM-driven exit that fired.
+        A failed cancel (already filled/expired) still lets the exit proceed —
+        cancel_order() already swallows that case.
+        """
+        if not bracket_stop_order_id:
+            return
+        self._broker.cancel_order(bracket_stop_order_id)
+        self._state_store.clear_bracket_stop(ticker)
 
     def _check_intraday_exits(self, equity: float) -> None:
         today = date.today()
@@ -309,6 +346,7 @@ class ProtectionRuntime:
             if proposal is None or proposal.action != Action.SELL:
                 continue
 
+            self._release_bracket_stop(ticker, bracket_stop_id)
             self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
             try:
                 result = self._broker.submit_order(proposal)
@@ -602,6 +640,7 @@ class ProtectionRuntime:
                 ticker=ticker, action=Action.SELL,
                 quantity=int(detail["qty"]), limit_price=current_price,
             )
+            self._release_bracket_stop(ticker, position.get("bracket_stop_order_id"))
             self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
             try:
                 result = self._broker.submit_order(proposal)

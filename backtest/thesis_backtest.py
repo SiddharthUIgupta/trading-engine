@@ -89,6 +89,8 @@ def run_thesis_backtest(
         tickers = get_sp500_universe()
 
     all_trades: list[Trade] = []
+    no_data_count = 0
+    insufficient_history_count = 0
     for n, ticker in enumerate(tickers):
         membership_periods = pit_membership.get(ticker) if pit_membership else None
 
@@ -96,10 +98,12 @@ def run_thesis_backtest(
             series = data_client.get_price_history(ticker, start_date=start, end_date=end)
         except DataLayerError as exc:
             logger.debug("%s: skipped (%s)", ticker, exc)
+            no_data_count += 1
             continue
 
         bars = series.bars
         if len(bars) < _LOOKBACK_TRADING_DAYS + 10:
+            insufficient_history_count += 1
             continue
 
         closes = pd.Series([b.close for b in bars])
@@ -115,6 +119,15 @@ def run_thesis_backtest(
         all_trades.extend(trades)
         if (n + 1) % 50 == 0:
             logger.info("Thesis backtest: processed %d/%d tickers, %d trades so far", n + 1, len(tickers), len(all_trades))
+
+    skipped = no_data_count + insufficient_history_count
+    if skipped:
+        logger.warning(
+            "Thesis backtest: %d of %d tickers skipped (%d no price data, %d insufficient history) — "
+            "delisted/dead tickers are exactly the ones most likely to have no data, so this count is "
+            "how much of the PIT survivorship-bias correction may still be understated.",
+            skipped, len(tickers), no_data_count, insufficient_history_count,
+        )
 
     return all_trades
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from analyst_layer.schemas import ConsensusPayload
@@ -324,6 +324,19 @@ class StateStore:
             conn.execute(
                 "UPDATE positions SET stop_price=?, updated_at=? WHERE ticker=?",
                 (stop_price, datetime.utcnow().isoformat(), ticker),
+            )
+            conn.commit()
+
+    def clear_bracket_stop(self, ticker: str) -> None:
+        """Clears the resting-stop reference after the stop leg has been
+        cancelled — e.g. right before a software-driven exit sells the
+        position outright. Uses a plain UPDATE (not upsert_position's
+        COALESCE) because COALESCE can never write a column back to NULL.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE positions SET bracket_stop_order_id=NULL, updated_at=? WHERE ticker=?",
+                (datetime.utcnow().isoformat(), ticker),
             )
             conn.commit()
 
@@ -910,6 +923,25 @@ class StateStore:
                 (client_order_id, strategy, ticker, action, quantity, limit_price, stop_price, datetime.utcnow().isoformat()),
             )
             conn.commit()
+
+    def expire_stale_order_intents(self, max_age_hours: float = 4.0) -> int:
+        """Marks pending order_intents older than max_age_hours as 'expired'
+        instead of letting them execute a stale decision — e.g. an Alpha BUY
+        intent written Friday morning that Protection doesn't get to until
+        Monday because both processes were down over the weekend. Returns the
+        number of rows expired. Called at the top of consume_order_intents,
+        before get_pending_order_intents(), so expired rows are never even
+        read as candidates for submission.
+        """
+        cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "UPDATE order_intents SET status='expired', processed_at=? "
+                "WHERE status='pending' AND created_at < ?",
+                (datetime.utcnow().isoformat(), cutoff),
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def get_pending_order_intents(self) -> list[dict]:
         with closing(self._connect()) as conn:
