@@ -84,7 +84,16 @@ Rule-based exit checks (stop-loss, trailing stop, profit target) — LLM only in
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 cp .env.example .env   # fill in ANTHROPIC_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
-python main.py
+```
+
+Runs as two independent systemd services rather than a single process — see
+[Two-Plane IPC](./ARCHITECTURE.md#two-plane-ipc-order_intents--breaker_state) in
+`ARCHITECTURE.md` for why:
+
+```bash
+sudo bash install_services.sh                        # installs + enables both units
+sudo systemctl start trading-engine-protection.service  # exits/reconciliation — start first
+sudo systemctl start trading-engine-alpha.service        # scanning/LLM consensus
 ```
 
 ### Management CLI (uses zcmd)
@@ -106,7 +115,7 @@ python scripts/backtest.py --strategy orb      --years 2
 
 ### Tests
 ```bash
-pytest   # 390 tests
+pytest   # 399 tests
 ```
 
 ---

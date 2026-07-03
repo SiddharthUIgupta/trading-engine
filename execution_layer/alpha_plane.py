@@ -460,8 +460,17 @@ class AlphaRuntime:
             equity=equity, today=today,
             profit_target_pct=self._settings.daily_profit_target_pct,
         )
-        candidates = orb_scanner.scan_orb_candidates(self._data_client, today, max_candidates=self._settings.orb_max_candidates)
-        self._scan_and_trade_options_orb(candidates, today, equity)
+        try:
+            movers = self._data_client.get_market_movers()
+        except DataLayerError as exc:
+            logger.error("ORB options scan: market movers fetch failed: %s", exc)
+            return
+        candidates = [m.symbol for m in movers]
+        new_candidates = [c for c in candidates if c not in self._scanned_options_tickers_today]
+        if not new_candidates:
+            return
+        logger.info("=== OPTIONS SCAN (ORB signal): %d new candidate(s) ===", len(new_candidates))
+        self._scan_and_trade_options_orb(new_candidates, today, equity)
 
     def vol_options_scan_and_trade(self) -> None:
         # Vol options: premium-selling structures — submit directly (specific contracts)
@@ -884,29 +893,362 @@ class AlphaRuntime:
     # ── Options methods (submit directly — intraday, no overnight protection) ─
 
     def _scan_and_trade_orb_equities(self, today: date, equity: float) -> None:
-        # ORB equity: deterministic screen, short-lived positions — direct broker submit
-        from execution_layer.runtime import TradingRuntime as _RT
-        # Delegate to the original implementation via composition — avoids duplication
-        # for this intraday-only, no-overnight-risk track.
-        pass  # handled by the monolith in the current deployment; Alpha Plane delegates to runtime.py for ORB
+        spy_positive: bool = True
+        if self._settings.orb_require_spy_positive:
+            try:
+                spy_intraday = self._data_client.get_price_history("SPY", start_date=today, end_date=today, interval="5m")
+                if spy_intraday.bars:
+                    spy_positive = spy_intraday.bars[-1].close >= spy_intraday.bars[0].open
+                    if not spy_positive:
+                        bearish_mode = self._settings.orb_spy_red_puts_enabled
+                        logger.info("ORB scan: SPY red today — %s",
+                                    "routing short breakdowns to puts" if bearish_mode else "skipping all entries")
+            except DataLayerError:
+                pass
+
+        long_signals = 0
+        short_signals = 0
+        max_equity = self._settings.max_open_equity_positions
+        max_opts = self._settings.max_open_options_positions
+
+        try:
+            movers = self._data_client.get_market_movers()
+        except DataLayerError as exc:
+            logger.error("ORB equity scan: market movers fetch failed: %s", exc)
+            return
+        candidates = [m.symbol for m in movers]
+        movers_by_symbol = {m.symbol: m for m in movers}
+        for ticker in candidates:
+            if spy_positive:
+                open_count = len([p for p in self._state_store.get_positions() if p["quantity"] > 0])
+                if open_count >= max_equity:
+                    logger.info("ORB scan: %d/%d equity positions open — at cap", open_count, max_equity)
+                    break
+            elif self._settings.orb_spy_red_puts_enabled:
+                open_opts = len([p for p in self._state_store.get_option_positions() if p.get("quantity", 0) > 0])
+                if open_opts >= max_opts:
+                    logger.info("ORB bearish scan: %d/%d option positions open — at cap", open_opts, max_opts)
+                    break
+            else:
+                break
+
+            if spy_positive and movers_by_symbol:
+                mover = movers_by_symbol.get(ticker)
+                if mover is not None and mover.percent_change < self._settings.orb_min_gap_pct * 100:
+                    self._scanned_tickers_today.add(ticker)
+                    continue
+
+            self._scanned_tickers_today.add(ticker)
+
+            if spy_positive and self._settings.orb_max_float_shares > 0:
+                try:
+                    shares_float = self._data_client.get_shares_float(ticker)
+                    if shares_float > self._settings.orb_max_float_shares:
+                        continue
+                except DataLayerError:
+                    pass
+
+            try:
+                intraday = self._data_client.get_price_history(ticker, start_date=today, end_date=today, interval="5m")
+            except DataLayerError as exc:
+                logger.debug("%s: skipped for ORB scan (%s)", ticker, exc)
+                continue
+
+            prior_close: float | None = None
+            if spy_positive:
+                try:
+                    daily_closes = self._get_daily_closes(ticker, today)
+                    if daily_closes and len(daily_closes) >= 2:
+                        prior_close = daily_closes[-2]
+                except Exception:
+                    pass
+
+            signal = orb_scanner.evaluate_orb(
+                intraday,
+                opening_range_minutes=15,
+                volume_confirmation_multiple=self._settings.orb_volume_confirmation_multiple,
+                prior_close=prior_close,
+                min_gap_pct=self._settings.orb_min_gap_pct if spy_positive else None,
+            )
+
+            if spy_positive:
+                if signal.direction != "long":
+                    continue
+                long_signals += 1
+                logger.info("%s: ORB long signal — gap=%.1f%% (%s)",
+                            ticker, (signal.gap_pct or 0) * 100, "; ".join(signal.reasons))
+                self._open_orb_equity_position(ticker, signal, equity, today)
+            else:
+                if signal.direction != "short":
+                    continue
+                if ticker in self._scanned_options_tickers_today:
+                    continue
+                short_signals += 1
+                logger.info("%s: ORB short breakdown on red SPY — buying puts", ticker)
+                self._scanned_options_tickers_today.add(ticker)
+                self._open_option_position(ticker, Action.SELL, equity, today)
+
+        self._state_store.record_event(
+            event_type="momentum_orb_scan_summary",
+            detail=(
+                f"{long_signals} long equity signal(s), {short_signals} bearish put signal(s) "
+                f"across {len(candidates)} candidates (SPY={'green' if spy_positive else 'red'})"
+            ),
+        )
+
+    def _open_orb_equity_position(self, ticker: str, signal, equity: float, today: date) -> None:
+        current_price = signal.opening_range_high
+        stop_price = signal.opening_range_low
+        risk_per_share = current_price - stop_price
+        if risk_per_share <= 0:
+            logger.info("%s: ORB signal has non-positive risk per share — skipping", ticker)
+            return
+        target_price = current_price + 2 * risk_per_share
+        max_notional = equity * self._settings.max_position_size_pct
+        quantity = math.floor(max_notional / current_price)
+        if quantity <= 0:
+            return
+
+        proposal = TradeProposal(ticker=ticker, action=Action.BUY, quantity=quantity, limit_price=current_price)
+        try:
+            self._breaker.assert_not_tripped()
+            self._breaker.validate_position_size(proposal, equity)
+            result = self._broker.submit_order(proposal)
+            logger.info("%s: ORB equity order result=%s", ticker, result)
+            self._state_store.record_event(
+                event_type=f"order_{Action.BUY.value.lower()}",
+                detail=f"{ticker}: BUY x{quantity} @ {current_price:.2f} -> {result.get('order_status','unknown')}",
+            )
+            detail = self._broker.get_position_detail(ticker)
+            shares = int(detail["qty"]) if detail else quantity
+            avg_price = detail["avg_entry_price"] if detail else current_price
+            self._state_store.upsert_position(
+                ticker, shares, avg_price,
+                last_buy_at=today.isoformat(), entry_regime="bullish_crossover",
+                strategy="orb", stop_price=stop_price, target_price=target_price,
+            )
+            alerting.alert_buy(ticker=ticker, shares=shares, price=avg_price, strategy="orb")
+            new_equity = self._broker.get_equity()
+            if self._breaker.check_profit_target(new_equity):
+                logger.info("PROFIT LOCK after ORB trade on %s, equity=%.2f", ticker, new_equity)
+        except CircuitBreakerTripped as exc:
+            logger.error("Circuit breaker blocked ORB equity order for %s: %s", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s: ORB equity order failed: %s", ticker, exc)
 
     def _scan_and_trade_options_orb(self, candidates: list[str], today: date, equity: float) -> None:
-        pass  # same — handled by monolith; Alpha Plane delegates for options
+        signals_found = 0
+        max_opts = self._settings.max_open_options_positions
+        for ticker in candidates:
+            open_opts = len([p for p in self._state_store.get_option_positions() if p.get("quantity", 0) > 0])
+            if open_opts >= max_opts:
+                logger.info("Options scan: %d/%d option positions open — at cap", open_opts, max_opts)
+                break
+            self._scanned_options_tickers_today.add(ticker)
+            try:
+                intraday = self._data_client.get_price_history(ticker, start_date=today, end_date=today, interval="5m")
+            except DataLayerError as exc:
+                logger.debug("%s: skipped for options ORB scan (%s)", ticker, exc)
+                continue
+
+            signal = orb_scanner.evaluate_orb(intraday, opening_range_minutes=15, volume_confirmation_multiple=1.5)
+            if signal.direction == "none":
+                continue
+
+            signals_found += 1
+            logger.info("%s: ORB signal -> %s (%s)", ticker, signal.direction, "; ".join(signal.reasons))
+            direction = Action.BUY if signal.direction == "long" else Action.SELL
+            self._open_option_position(ticker, direction, equity, today)
+
+        self._state_store.record_event(
+            event_type="options_orb_scan_summary",
+            detail=f"{signals_found} ORB signal(s) found across {len(candidates)} candidates",
+        )
+
+    def _open_option_position(self, ticker: str, direction: Action, equity: float, today: date) -> None:
+        wash_warning = self._wash_sale_guard.check_option_buy_for_wash(ticker, today)
+        if wash_warning:
+            self._state_store.record_event(event_type="wash_sale_option_warning", detail=wash_warning)
+        try:
+            chain = self._data_client.get_option_chain(ticker)
+        except DataLayerError as exc:
+            logger.error("%s: option chain fetch failed: %s", ticker, exc)
+            return
+
+        selection = options_structurer.select_contract(
+            chain, direction, min_dte=self._settings.options_min_dte, max_dte=self._settings.options_max_dte
+        )
+        if not selection.selected:
+            logger.info("%s: no contract selected (%s)", ticker, "; ".join(selection.reasons))
+            return
+
+        contract = selection.contract
+        max_risk_dollars = equity * self._settings.options_max_risk_pct
+        contracts = math.floor(max_risk_dollars / (contract.ask * 100)) if contract.ask > 0 else 0
+        if contracts <= 0:
+            return
+
+        try:
+            self._options_breaker.assert_options_trading_allowed()
+            result = self._broker.submit_option_order(
+                contract.contract_symbol, side=Action.BUY, contracts=contracts, limit_price=contract.ask
+            )
+            logger.info("%s: options order result=%s", contract.contract_symbol, result)
+            self._state_store.record_event(
+                event_type="option_order_buy",
+                detail=f"{contract.contract_symbol}: BUY x{contracts} @ {contract.ask:.2f} -> {result.get('order_status','unknown')}",
+            )
+            detail = self._broker.get_position_detail(contract.contract_symbol)
+            qty = int(detail["qty"]) if detail else 0
+            avg_price = detail["avg_entry_price"] if detail else contract.ask
+            self._state_store.upsert_option_position(
+                contract.contract_symbol, contract.underlying_symbol, contract.option_type.value,
+                contract.strike, contract.expiration.isoformat(), qty, avg_price,
+                opened_at=today.isoformat(),
+            )
+            alerting.alert_option_buy(
+                contract_symbol=contract.contract_symbol, underlying=contract.underlying_symbol,
+                contracts=qty, premium=avg_price, strategy="orb_options",
+            )
+            new_equity = self._broker.get_equity()
+            if self._options_breaker.check_profit_target(new_equity):
+                logger.info("PROFIT LOCK after options trade on %s, equity=%.2f", ticker, new_equity)
+        except CircuitBreakerTripped as exc:
+            logger.error("Circuit breaker blocked options order for %s: %s", ticker, exc)
 
     def _fetch_vix_context(self, today: date) -> VixContext:
         try:
-            return vol_analytics.fetch_vix_context(self._data_client, today)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("VIX context fetch failed: %s", exc)
-            return VixContext(vix_spot=20.0, vix_term_slope=0.0, regime="neutral")
+            vix_series = self._data_client.get_price_history("^VIX", start_date=today - timedelta(days=45), end_date=today)
+            bars = vix_series.bars
+            if not bars:
+                return VixContext(vix_current=18.0)
+            vix_current = bars[-1].close
+            vix_1w_ago = bars[-5].close if len(bars) >= 5 else None
+            vix_1m_ago = bars[-21].close if len(bars) >= 21 else None
+            vix3m_current: float | None = None
+            try:
+                vix3m_series = self._data_client.get_price_history("^VIX3M", start_date=today - timedelta(days=5), end_date=today)
+                if vix3m_series.bars:
+                    vix3m_current = vix3m_series.bars[-1].close
+            except DataLayerError:
+                pass
+            return VixContext(vix_current=vix_current, vix_1w_ago=vix_1w_ago, vix_1m_ago=vix_1m_ago, vix3m_current=vix3m_current)
+        except DataLayerError as exc:
+            logger.warning("VIX fetch failed — defaulting to stable VIX context: %s", exc)
+            return VixContext(vix_current=18.0)
 
     def _build_portfolio_greeks(self, equity: float) -> PortfolioGreeks:
-        try:
-            return vol_analytics.build_portfolio_greeks(self._state_store, self._broker, equity)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Portfolio greeks build failed: %s", exc)
-            return PortfolioGreeks()
+        option_positions = self._state_store.get_option_positions()
+        vol_short_positions = [p for p in option_positions if p.get("strategy") == "vol_short" and p["quantity"] != 0]
+        n = len(vol_short_positions)
+        return PortfolioGreeks(net_delta=0.0, net_vega=-10.0 * n, net_theta=1.0 * n, portfolio_value=equity, num_open_positions=n)
 
-    def _open_vol_options_position(self, ticker: str, payload: VolConsensusPayload, equity: float, today: date) -> None:
-        # Delegates to the original runtime implementation for complex vol options structures
-        pass
+    def _find_option_contract(self, chain, option_type: OptionType, expiration: date, strike: float):
+        for c in chain:
+            if c.option_type == option_type and c.expiration == expiration and abs(c.strike - strike) < 0.01:
+                return c
+        return None
+
+    def _open_vol_options_position(
+        self, ticker: str, payload: VolConsensusPayload, chain, equity: float, today: date
+    ) -> None:
+        proposal = payload.proposal
+        wash_warning = self._wash_sale_guard.check_option_buy_for_wash(ticker, today)
+        if wash_warning:
+            self._state_store.record_event(event_type="wash_sale_option_warning", detail=wash_warning)
+
+        if proposal.structure != StructureType.IRON_CONDOR:
+            logger.warning(
+                "%s: vol structure %s requires naked shorts (Level 4) — blocked. "
+                "Only iron condors are executed on this Level 3 account.",
+                ticker, proposal.structure.value,
+            )
+            self._state_store.record_event(
+                event_type="vol_options_blocked_level4",
+                detail=f"{ticker}: {proposal.structure.value} blocked — requires Level 4 approval.",
+            )
+            return
+
+        self._open_iron_condor(ticker, proposal, chain, today)
+
+    def _open_iron_condor(self, ticker: str, proposal, chain, today: date) -> None:
+        short_call = self._find_option_contract(chain, OptionType.CALL, proposal.expiration, proposal.short_call_strike)
+        short_put = self._find_option_contract(chain, OptionType.PUT, proposal.expiration, proposal.short_put_strike)
+        long_call = self._find_option_contract(chain, OptionType.CALL, proposal.expiration, proposal.long_call_strike)
+        long_put = self._find_option_contract(chain, OptionType.PUT, proposal.expiration, proposal.long_put_strike)
+
+        missing = [name for name, c in (
+            ("short_call", short_call), ("short_put", short_put),
+            ("long_call", long_call), ("long_put", long_put),
+        ) if c is None]
+        if missing:
+            logger.error("%s: iron condor missing legs in chain: %s", ticker, missing)
+            self._state_store.record_event(
+                event_type="vol_options_broker_rejected",
+                detail=f"{ticker}: iron condor missing chain legs: {missing}",
+            )
+            return
+
+        def _mid(bid: float, ask: float) -> float:
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+            return bid or ask or 0.0
+
+        mid_credit = round(
+            _mid(short_call.bid, short_call.ask) + _mid(short_put.bid, short_put.ask)
+            - _mid(long_call.bid, long_call.ask) - _mid(long_put.bid, long_put.ask), 2,
+        )
+        natural_credit = round(
+            (short_call.bid or 0.0) + (short_put.bid or 0.0)
+            - (long_call.ask or 0.0) - (long_put.ask or 0.0), 2,
+        )
+        net_credit = mid_credit if mid_credit > 0 else natural_credit
+        if net_credit <= 0:
+            logger.info("%s: iron condor net credit %.2f <= 0 — skipping", ticker, net_credit)
+            return
+        logger.info("%s: iron condor credit: mid=%.2f natural=%.2f submitting at %.2f",
+                    ticker, mid_credit, natural_credit, net_credit)
+
+        spread_legs = [
+            (short_call.contract_symbol, Action.SELL),
+            (short_put.contract_symbol, Action.SELL),
+            (long_call.contract_symbol, Action.BUY),
+            (long_put.contract_symbol, Action.BUY),
+        ]
+
+        try:
+            self._options_breaker.assert_options_trading_allowed()
+            result = self._broker.submit_spread_order(
+                legs=spread_legs, contracts=proposal.quantity, net_credit=net_credit,
+            )
+            logger.info("%s: iron condor mleg → %s (net_credit=%.2f)",
+                        ticker, result.get("order_status", "unknown"), net_credit)
+            self._state_store.record_event(
+                event_type="vol_options_opened",
+                detail=(
+                    f"{ticker}: iron_condor mleg "
+                    f"{short_call.strike:.0f}C/{short_put.strike:.0f}P short "
+                    f"{long_call.strike:.0f}C/{long_put.strike:.0f}P long "
+                    f"exp={proposal.expiration} DTE={proposal.dte} net_credit={net_credit:.2f}"
+                ),
+            )
+            for contract, side in (
+                (short_call, Action.SELL), (short_put, Action.SELL),
+                (long_call, Action.BUY), (long_put, Action.BUY),
+            ):
+                detail = self._broker.get_position_detail(contract.contract_symbol)
+                qty = int(detail["qty"]) if detail else 0
+                avg_price = detail["avg_entry_price"] if detail else net_credit
+                self._state_store.upsert_option_position(
+                    contract.contract_symbol, ticker, contract.option_type.value,
+                    contract.strike, contract.expiration.isoformat(),
+                    qty, avg_price, opened_at=today.isoformat(), strategy="vol_short",
+                )
+        except CircuitBreakerTripped as exc:
+            logger.error("Circuit breaker blocked iron condor for %s: %s", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("%s: iron condor mleg rejected: %s", ticker, exc)
+            self._state_store.record_event(
+                event_type="vol_options_broker_rejected",
+                detail=f"{ticker}: iron condor mleg — {exc}",
+            )

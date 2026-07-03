@@ -10,24 +10,37 @@ Broker: Alpaca (live account, Level 3 options). LLM: Anthropic Claude (Sonnet fo
 
 ## System Map
 
+Two independent processes, deliberately split for fault isolation — a crash in
+scanning/LLM logic can no longer take down exit protection:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        main.py                              │
-│           Boots settings, wires all layers,                 │
-│           starts APScheduler, blocks forever.               │
-└───────────────────────┬─────────────────────────────────────┘
-                        │
-        ┌───────────────▼───────────────┐
-        │     execution_layer/          │
-        │     runtime.py                │  ← the brain
-        │     scheduler.py              │  ← the clock
-        │     state_store.py            │  ← SQLite wrapper
-        │     broker.py                 │  ← Alpaca wrapper
-        │     guardrails.py             │  ← circuit breaker
-        │     exit_rules.py             │  ← stop/trail logic
-        │     tax_compliance.py         │  ← wash-sale guard
-        │     manual_trigger.py         │  ← dashboard → engine IPC
-        └───────────────┬───────────────┘
+┌───────────────────────────────┐      ┌──────────────────────────────────┐
+│   main_alpha.py                │      │   main_protection.py              │
+│   Alpha Plane                  │      │   Protection Plane                │
+│   Scans, LLM consensus, sizing │      │   Exits, reconciliation, orders   │
+│   Writes order_intents (BUY)   │─────►│   Reads order_intents, submits    │
+│   Never calls broker.submit_   │ SQLite   bracket orders, marks processed │
+│   order() for equity entries   │ IPC   │   Runs even if Alpha is down     │
+└───────────────┬────────────────┘      └────────────────┬───────────────────┘
+                │                                         │
+                │           breaker_state table           │
+                │◄─────────── (Protection writes trip,  ─►│
+                │              Alpha reads before queuing) │
+                │                                         │
+        ┌───────▼─────────────────────────────────────────▼───────┐
+        │     execution_layer/                                    │
+        │     alpha_plane.py       │  ← AlphaRuntime (Alpha proc)  │
+        │     protection_plane.py  │  ← ProtectionRuntime (Prot.)  │
+        │     runtime.py           │  ← legacy monolith (inactive; │
+        │                          │    kept for reference/tests)  │
+        │     state_store.py       │  ← SQLite wrapper             │
+        │     broker.py            │  ← Alpaca wrapper             │
+        │     guardrails.py        │  ← circuit breaker            │
+        │     exit_rules.py        │  ← stop/trail logic           │
+        │     tax_compliance.py    │  ← wash-sale guard            │
+        │     alerting.py          │  ← dead-man alerts + heartbeats│
+        │     manual_trigger.py    │  ← dashboard → engine IPC     │
+        └───────────────┬──────────────────────────────────────────┘
                         │
         ┌───────────────▼───────────────┐
         │     analyst_layer/            │
@@ -40,6 +53,7 @@ Broker: Alpaca (live account, Level 3 options). LLM: Anthropic Claude (Sonnet fo
         │     thesis_scanner.py         │  ← pullback signal
         │     momentum_scanner.py       │  ← float/volume screen
         │     kelly.py                  │  ← position sizing
+        │     vw_bandit.py              │  ← VowpalWabbit online bandit
         │     lesson_store.py           │  ← pattern memory
         │     reflection_agent.py       │  ← post-trade LLM review
         │     correlation.py            │  ← portfolio overlap guard
@@ -55,23 +69,50 @@ Broker: Alpaca (live account, Level 3 options). LLM: Anthropic Claude (Sonnet fo
         └───────────────────────────────┘
 ```
 
+### Two-Plane IPC (order_intents / breaker_state)
+
+- **`order_intents` table** — Alpha writes `(client_order_id, strategy, ticker, action, quantity, limit_price, stop_price, status='pending')` after LLM consensus approves a BUY. Protection polls pending rows every 15 min, submits the actual bracket order to Alpaca, and marks the row processed. `client_order_id` is the PRIMARY KEY with `INSERT OR IGNORE`, so a retried write from Alpha can never double-queue the same order.
+- **`breaker_state` table** — when Protection trips a circuit breaker, it writes `(breaker_name, state_key='halted', state_value='true')`. Alpha checks this table before queuing any new intent for that bucket, so a halt initiated by Protection is respected by Alpha even though they're separate processes with separate in-memory breaker objects.
+- **`client_order_id` idempotency** — `sha1(date|ticker|action|qty)[:32]`. Alpaca dedupes retried submissions on this ID, so a Protection restart mid-submission can't result in a duplicate live order.
+
+### Bracket Orders (OTO)
+
+Protection submits entries as `LimitOrderRequest` with `OrderClass.OTO` + a `StopLossRequest` child leg. The stop rests directly at the Alpaca broker instead of being polled and submitted by our own code — so a stop is enforced even if both planes are down. `amend_stop_order()` moves the resting stop up as the trailing-stop logic activates.
+
+### Dead-Man Alerting
+
+- **Per-job heartbeats** — every scheduled job in both planes writes to `state/heartbeat.json` on completion (and pings healthchecks.io if configured). A missed heartbeat signals the job silently died rather than just finding nothing to do.
+- **Zero-BUY streak alert** — if 3+ consecutive sessions produce zero BUYs across all tracks, an email alert fires. Catches the failure mode where the scheduler is technically alive but every scan is silently erroring out before reaching a trade decision.
+
 ---
 
 ## Daily Schedule (Eastern Time)
 
+Split across the two planes — Alpha decides and queues, Protection executes and protects.
+
+### Alpha Plane (`main_alpha.py`)
+
 | Time | Job | What Happens |
 |------|-----|--------------|
-| 8:00am | `pre_market_scan` | Fetches daily regime (VIX + SPY SMAs). Arms or disarms each strategy track for the day. Runs macro news agent (Finnhub general/merger feeds → Haiku sentiment scoring). |
-| 8:15am | `thesis_scan_and_trade` | Scans OpenBB's undervalued-growth universe (5 screens, market-wide) for 20–50% pullbacks. Top 20 pass to LLM consensus. |
-| 9:05am | `gap_scan_and_queue` | Scans akshare US movers + watchlist for pre-market gaps ≥5%. Top 5 candidates pass directly to thesis consensus, bypassing the pullback screen. |
-| 9:30am | `market_open_execution` | Fires pending BUY payloads from thesis/gap scans approved pre-market. |
-| 9:00–3:00pm every 15min | `intraday_monitoring` | Reconciles positions vs broker, checks stops/trailing stops, checks options exits. |
-| 9:00–3:00pm every 30min | `momentum_scan_and_trade` | ORB equity disabled. Job still runs but exits immediately (`ORB_EQUITY_ENABLED=false`). |
-| 9:45am | `swing_scan_and_trade` | Scans for swing trade setups (3–6 week holds). |
-| 10:00am + 1:00pm | `vol_options_scan_and_trade` | Short premium (iron condors, strangles) when VIX/IV conditions suit. |
-| Every 15s | `manual_trigger_watcher` | Polls `state/manual_trigger.json` for dashboard-triggered scans. Dispatches immediately when found. |
-| 3:30pm | `pre_close_orb_exit` | Closes any residual ORB position flat or losing (legacy guard, ORB now disabled). |
-| 4:30pm | `post_market_logging` | Logs cost summary, positions, daily P&L to the log file. |
+| 8:15am | `pre_market_scan` (thesis) | Fetches daily regime (VIX + SPY SMAs). Arms or disarms each strategy track for the day. Runs macro news agent. |
+| 8:15am | `thesis_scan_and_trade` | Scans OpenBB's undervalued-growth universe (5 screens, market-wide) for 20–50% pullbacks. Top 20 pass to LLM consensus. Approved BUYs written to `order_intents`, not submitted directly. |
+| 9:05am | `gap_scan_and_queue` | Scans akshare US movers + watchlist for pre-market gaps ≥5%. Top 5 candidates pass directly to thesis consensus. |
+| 9:30am | `market_open_execution` | Queues any pending approved intents for 9:30 execution. |
+| 9:35am | `swing_scan_and_trade` | Scans for swing trade setups (3–6 week holds). |
+| 9:00–3:00pm every 15min | `momentum_scan_and_trade` (ORB equity) | Disabled (`ORB_EQUITY_ENABLED=false`); full implementation exists in `alpha_plane.py` for when re-enabled. |
+| 9:00–3:00pm every 15min | `options_scan_and_trade` (ORB options) | Disabled (`OPTIONS_TRACK_ENABLED=false`); submits directly (specific option contracts, not routed through `order_intents`). |
+| 10:00am + 1:00pm | `vol_options_scan_and_trade` | Short premium (iron condors) when VIX/IV conditions suit. Submits directly — Level 3 iron condor mleg orders, computed per-scan. |
+| 4:30pm | `post_market_logging` | Logs cost summary, positions, daily P&L. |
+| Every 15s | `check_manual_trigger` | Polls `state/manual_trigger.json` for dashboard-triggered scans. |
+
+### Protection Plane (`main_protection.py`)
+
+| Time | Job | What Happens |
+|------|-----|--------------|
+| 9:30–4:00pm every 15min | `intraday_monitoring` | Reconciles positions vs broker → ensures day started → checks `breaker_state` → consumes pending `order_intents` (submits bracket orders) → runs all exit checks (intraday, ORB, options, vol options, swing). |
+| 3:30pm | `pre_close_orb_exit` | Closes any residual same-day ORB position flat or losing. |
+
+If Alpha crashes, Protection keeps running independently — existing positions stay protected by stop-losses and exit rules every 15 minutes regardless.
 
 ---
 
@@ -290,6 +331,14 @@ After each trade closes, `ReflectionAgent` (Sonnet) generates structured lessons
 
 `ReflectionAgent` produces a post-mortem with `what_happened`, `root_cause`, `outcome_was_noise`, and `lessons`. Receives full context: regime at entry, all three sub-agent rationales, and outcome.
 
+### 4. Candidate Ledger
+
+Every screened candidate — not just executed trades — is logged to the `candidates` table with its LLM verdict, gate result, and forward returns (1/5/21/63 day) backfilled nightly. This lets the lesson journal's edge be measured against the full candidate population, not just the trades that happened to clear every gate — a much stronger denominator for deciding whether a lesson generalizes.
+
+### 5. Lesson Injection Freeze
+
+`FREEZE_LESSON_INJECTION` (default `true`) stops injecting past lessons into LLM prompts until the candidate ledger has accumulated enough forward-return data to prove a lesson actually predicts anything, rather than the reflection agent's own narrative confidence. Flip to `false` once the candidate ledger shows a lesson's tagged setups have a real edge.
+
 ---
 
 ## State Database (SQLite)
@@ -310,6 +359,9 @@ Location: `./state/trading_engine.sqlite3`
 | `trade_reflections` | Post-mortem narratives |
 | `events` | Append-only audit log of all system events |
 | `token_usage` | Per-agent LLM token counts and estimated cost |
+| `order_intents` | Alpha→Protection IPC: pending BUY intents keyed by `client_order_id` |
+| `breaker_state` | Protection→Alpha IPC: which capital buckets are halted |
+| `candidates` | Every screened candidate (not just trades) with verdict + forward returns |
 
 ---
 
@@ -349,6 +401,9 @@ GAP_SCAN_MAX_CANDIDATES=5
 # Kelly exploration
 # When Kelly=0 and n<50 trades, system uses 1% floor to keep learning
 
+# Learning loop safety
+FREEZE_LESSON_INJECTION=true        # withhold lessons from prompts until candidate ledger proves edge
+
 # Models
 ANTHROPIC_MODEL=claude-sonnet-4-6
 ANTHROPIC_SUBAGENT_MODEL=claude-haiku-4-5-20251001
@@ -359,9 +414,9 @@ ANTHROPIC_SUBAGENT_MODEL=claude-haiku-4-5-20251001
 ## Infrastructure
 
 - **Hardware:** Raspberry Pi 5 (ARM64)
-- **Process:** `nohup python main.py &` — single process, APScheduler manages all timing
-- **Logs:** `logs/trading_engine.log`
-- **Dashboard:** Streamlit (`dashboard/app.py`) — positions, P&L, agent signals, regime, Controls tab with manual scan triggers
+- **Process:** Two systemd services — `trading-engine-protection.service` (`Restart=always`, `RestartSec=10`) and `trading-engine-alpha.service` (`Restart=on-failure`, `RestartSec=30`, `BindsTo=trading-engine-protection.service`). The legacy single-process `main.py` / `trading-engine.service` still exists but is inactive.
+- **Logs:** `logs/trading_engine_alpha.log`, `logs/trading_engine_protection.log`
+- **Dashboard:** Streamlit (`dashboard/app.py`) — positions, P&L, agent signals, regime, Controls tab with manual scan triggers. Reads positions/events/run_history directly from SQLite, so it's agnostic to which plane wrote a given row.
 - **Git:** `SiddharthUIgupta/trading-engine`, branch `master`
 
 ---
@@ -372,10 +427,13 @@ ANTHROPIC_SUBAGENT_MODEL=claude-haiku-4-5-20251001
 |----------|--------|----------|------------|-------|
 | ORB, no filters | 11,275 | 46.3% | -0.07% | Net negative — disabled |
 | ORB + 2x volume | ~11,000 | 48% | +0.04% | Break-even pre-slippage, negative after |
-| **Thesis (zero slippage)** | **1,370** | **57.9%** | **+6.27%** | **Proven edge** |
-| **Thesis (0.5%/0.3% slippage)** | **1,385** | **56.7%** | **+5.31%** | **Edge survives realistic execution costs** |
+| Thesis (zero slippage, current-constituent universe) | 1,370 | 57.9% | +6.27% | Survivorship-biased — universe was today's 503 S&P names applied retroactively |
+| Thesis (0.5%/0.3% slippage, current-constituent universe) | 1,385 | 56.7% | +5.31% | Survivorship-biased, same issue |
+| **Thesis (0.5%/0.3% slippage, point-in-time universe)** | **1,352 closed** | **54.5%** | **+4.08%**, PF 1.49 | **Current methodology — survivorship bias corrected** |
 
-Thesis backtest methodology: S&P 500 universe, 3 years, entry at next-day open, exits via stop-loss (18%) or trailing stop (activates at +20%, trails 10%). No LLM replay — tests the deterministic screen only.
+**Point-in-time (PIT) universe fix:** The current-constituent backtests above applied today's S&P 500 list retroactively — a stock that was later removed (bankruptcy, acquisition, delisting) never had a chance to generate a losing trade, inflating the win rate. `backtest/universe.py` now pulls per-ticker index membership start/end dates from `fja05680/sp500` (`get_pit_membership`), and `_walk_forward` in `backtest/thesis_backtest.py` skips signal generation on any bar where the ticker wasn't actually in the index that day. This expands the universe to 567 tickers (vs 503 current constituents) and lowers the win rate from 56.7% to 54.5% — the true, unbiased number. `run_thesis_backtest(..., use_pit_universe=True)` is now the default; pass `--no-pit` to `backtest/run_thesis_backtest.py` to reproduce the old biased numbers for comparison.
+
+Thesis backtest methodology: 3 years, entry at next-day open, exits via stop-loss (18%) or trailing stop (activates at +20%, trails 10%). No LLM replay — tests the deterministic screen only.
 
 ---
 
