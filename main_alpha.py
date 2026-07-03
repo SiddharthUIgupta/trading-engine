@@ -42,41 +42,51 @@ from anthropic import Anthropic
 from config.settings import get_settings
 from data_layer.openbb_client import OpenBBDataClient
 from execution_layer.broker import AlpacaBroker
-from execution_layer.guardrails import CircuitBreaker
+from execution_layer.guardrails import RobustCircuitBreaker
 from execution_layer.state_store import StateStore
 from execution_layer.alpha_plane import AlphaRuntime
 from execution_layer import alerting
 
 ET = "America/New_York"
 
+WATCHLIST = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ", "AMZN", "META", "TSLA"]
+
 settings = get_settings()
 state_store = StateStore(settings.state_db_path)
-broker = AlpacaBroker(
-    api_key=settings.alpaca_api_key,
-    secret_key=settings.alpaca_secret_key,
-    paper=settings.alpaca_paper,
-)
+broker = AlpacaBroker.from_settings(settings)
 anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
 data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
 
-intraday_breaker = CircuitBreaker(
+intraday_breaker = RobustCircuitBreaker(
+    max_position_size_pct=settings.max_position_size_pct,
+    max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
+    capital_limit_pct=settings.intraday_capital_pct,
+    daily_profit_target_usd=settings.daily_profit_target_usd,
     name="intraday",
-    max_daily_drawdown_pct=settings.circuit_breaker_max_daily_drawdown_pct,
 )
-options_breaker = CircuitBreaker(
+options_breaker = RobustCircuitBreaker(
+    max_position_size_pct=settings.max_position_size_pct,
+    max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
+    capital_limit_pct=settings.options_capital_pct,
+    daily_profit_target_usd=settings.daily_profit_target_usd,
     name="options",
-    max_daily_drawdown_pct=settings.options_circuit_breaker_max_daily_drawdown_pct,
 )
-thesis_breaker = CircuitBreaker(
+thesis_breaker = RobustCircuitBreaker(
+    max_position_size_pct=settings.max_position_size_pct,
+    max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
+    capital_limit_pct=settings.thesis_capital_pct,
+    daily_profit_target_usd=settings.daily_profit_target_usd,
     name="thesis",
-    max_daily_drawdown_pct=settings.thesis_circuit_breaker_max_daily_drawdown_pct,
 )
-swing_breaker = CircuitBreaker(
+swing_breaker = RobustCircuitBreaker(
+    max_position_size_pct=settings.max_position_size_pct,
+    max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
+    capital_limit_pct=settings.swing_capital_pct,
+    daily_profit_target_usd=settings.daily_profit_target_usd,
     name="swing",
-    max_daily_drawdown_pct=settings.swing_circuit_breaker_max_daily_drawdown_pct,
 )
 
-watchlist = [t.strip() for t in settings.watchlist.split(",") if t.strip()]
+watchlist = WATCHLIST
 
 runtime = AlphaRuntime(
     settings=settings,
