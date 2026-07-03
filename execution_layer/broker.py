@@ -8,17 +8,33 @@ no code path here that can flip to a live endpoint from a single flag.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
+from datetime import date
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, OptionLegRequest
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    OptionLegRequest,
+    ReplaceOrderRequest,
+    StopLossRequest,
+)
 
 from analyst_layer.schemas import Action, TradeProposal
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _order_id(*parts: str) -> str:
+    """Deterministic client_order_id — same inputs always produce the same ID.
+    Alpaca dedupes on this, so a timeout-then-retry can't double-fill.
+    """
+    key = "|".join([date.today().isoformat()] + list(parts))
+    return hashlib.sha1(key.encode()).hexdigest()[:32]
 
 
 class LiveTradingBlockedError(Exception):
@@ -101,6 +117,7 @@ class AlpacaBroker:
             side=side,
             time_in_force=TimeInForce.DAY,
             limit_price=float(f"{proposal.limit_price:.2f}"),  # guarantee exactly 2 decimal places; raw floats fail Alpaca's sub-penny check
+            client_order_id=_order_id(proposal.ticker, proposal.action.value, str(proposal.quantity)),
         )
         order = self._client.submit_order(order_request)
         logger.info(
@@ -138,6 +155,7 @@ class AlpacaBroker:
             time_in_force=TimeInForce.DAY,
             limit_price=limit_price,
             position_intent=PositionIntent.BUY_TO_OPEN if side == Action.BUY else PositionIntent.SELL_TO_CLOSE,
+            client_order_id=_order_id(contract_symbol, side.value, str(contracts)),
         )
         order = self._client.submit_order(order_request)
         logger.info(
@@ -208,6 +226,64 @@ class AlpacaBroker:
             len(legs), contracts, net_credit, not self.is_live,
         )
         return self._poll_for_fill(order, poll_for_fill_seconds)
+
+    def submit_bracket_order(
+        self,
+        proposal: TradeProposal,
+        stop_price: float,
+        poll_for_fill_seconds: float = 3.0,
+    ) -> dict:
+        """Entry limit order + resting broker-side stop as an OTO bracket.
+        The stop leg is created at Alpaca immediately and survives Pi crashes —
+        worst case is the last stop price we set, not an unprotected position.
+        Returns the standard fill dict plus 'stop_order_id' (None if the
+        entry hasn't filled yet and the stop leg isn't visible yet).
+        Only used for BUY entries on thesis/swing strategies.
+        """
+        order_request = LimitOrderRequest(
+            symbol=proposal.ticker,
+            qty=proposal.quantity,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=float(f"{proposal.limit_price:.2f}"),
+            order_class=OrderClass.OTO,
+            stop_loss=StopLossRequest(stop_price=float(f"{stop_price:.2f}")),
+            client_order_id=_order_id(proposal.ticker, "bracket", str(proposal.quantity)),
+        )
+        order = self._client.submit_order(order_request)
+        logger.info(
+            "Submitted bracket BUY: %s x%d @ %.2f stop=%.2f (paper=%s)",
+            proposal.ticker, proposal.quantity, proposal.limit_price, stop_price, not self.is_live,
+        )
+        result = self._poll_for_fill(order, poll_for_fill_seconds)
+
+        # The stop leg order ID lets us amend the trailing stop at the broker.
+        # It appears in `legs` on the parent order once Alpaca processes it.
+        stop_order_id = None
+        try:
+            refreshed = self._client.get_order_by_id(order.id)
+            if refreshed.legs:
+                stop_order_id = str(refreshed.legs[0].id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s: could not retrieve stop leg order ID: %s", proposal.ticker, exc)
+
+        result["stop_order_id"] = stop_order_id
+        return result
+
+    def amend_stop_order(self, stop_order_id: str, new_stop_price: float) -> None:
+        """Move the resting Alpaca stop upward as the trailing stop activates.
+        Only ever moves the stop UP — we never lower a protective stop.
+        Logs a warning on failure but never raises (a failed amend means the
+        old stop is still live, which is better than crashing the exit loop).
+        """
+        try:
+            self._client.replace_order_by_id(
+                stop_order_id,
+                ReplaceOrderRequest(stop_price=float(f"{new_stop_price:.2f}")),
+            )
+            logger.info("Amended broker stop %s → new stop=%.2f", stop_order_id, new_stop_price)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("amend_stop_order(%s, %.2f) failed: %s", stop_order_id, new_stop_price, exc)
 
     def get_last_fill_price(self, symbol: str) -> float | None:
         """Most recent FILLED order's fill price for one symbol — used

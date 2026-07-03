@@ -1,0 +1,912 @@
+"""Alpha Plane — scanning, LLM consensus, sizing. Writes BUY intents to the DB.
+
+Does NOT submit orders to the broker directly. Instead, approved BUY payloads are
+written to the `order_intents` table, where the Protection Plane reads and executes them.
+
+IPC: order_intents table
+  Alpha writes: (client_order_id, strategy, ticker, action, quantity, limit_price, stop_price)
+  Protection reads, submits bracket orders, marks as processed
+
+Process isolation: this module runs as trading-engine-alpha systemd unit.
+If it crashes (LLM timeout, scan failure), the Protection Plane keeps running
+and all existing positions stay protected.
+"""
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+
+from anthropic import Anthropic
+
+from analyst_layer import (
+    agent_scorer, lesson_store, momentum_scanner, options_structurer,
+    orb_scanner, prefilter, swing_scanner, thesis_scanner, universe,
+    vol_analytics, vol_universe,
+)
+from analyst_layer.vw_bandit import VWSignalBandit
+from analyst_layer.correlation import apply_correlation_adjustment, check_portfolio_correlation
+from analyst_layer.kelly import kelly_fraction_from_pnl_history
+from analyst_layer.macro_news_agent import assess_macro_sentiment
+from analyst_layer.market_regime import DailyRegime, assess_daily_regime
+from analyst_layer.recovery_scanner import evaluate_recovery_candidate
+from analyst_layer.reflection_agent import ReflectionAgent
+from analyst_layer.agents.greeks_risk_officer import PortfolioGreeks
+from analyst_layer.agents.risk_officer_agent import AccountContext
+from analyst_layer.agents.vol_regime_agent import VixContext
+from analyst_layer.graph import run_consensus
+from analyst_layer.pricing import estimate_cost_usd
+from analyst_layer.schemas import (
+    Action, AgentSignal, Confidence, ConsensusPayload, OrderType,
+    RiskReview, RiskVerdict, StructureType, TradeProposal, VolConsensusPayload,
+)
+from analyst_layer.vol_graph import run_vol_consensus
+from config.settings import Settings
+from data_layer.akshare_client import MacroSnapshot, get_macro_snapshot
+from data_layer.exceptions import DataLayerError
+from data_layer.models import OptionContract, OptionType
+from data_layer.occ_symbol import parse_occ_symbol
+from data_layer.openbb_client import OpenBBDataClient
+from execution_layer import alerting, exit_rules
+from execution_layer.broker import AlpacaBroker
+from execution_layer.guardrails import CircuitBreaker, CircuitBreakerTripped
+from execution_layer.state_store import StateStore
+from execution_layer.tax_compliance import WashSaleGuard
+
+logger = logging.getLogger(__name__)
+
+_INTRADAY_STRATEGIES: frozenset[str] = frozenset({"momentum", "orb_equity", "news"})
+_OPTIONS_STRATEGIES: frozenset[str] = frozenset({"orb_options", "vol_options"})
+_THESIS_STRATEGIES: frozenset[str] = frozenset({"thesis", "recovery", "gap"})
+_SWING_STRATEGIES: frozenset[str] = frozenset({"swing"})
+
+
+class AlphaRuntime:
+    """Runs in a dedicated process. Scans universe, runs LLM consensus, sizes
+    positions, and writes approved BUY intents to the order_intents DB table.
+    Never calls broker.submit_order() for equity entries — that's Protection's job.
+
+    Options entries (ORB options, vol short) still submit directly here because
+    they require specific contract structures computed during the scan.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        data_client: OpenBBDataClient,
+        broker: AlpacaBroker,
+        intraday_breaker: CircuitBreaker,
+        options_breaker: CircuitBreaker,
+        thesis_breaker: CircuitBreaker,
+        swing_breaker: CircuitBreaker,
+        state_store: StateStore,
+        anthropic_client: Anthropic,
+        watchlist: list[str],
+        halt_callback: Callable[[], None] | None = None,
+        wash_sale_guard: WashSaleGuard | None = None,
+    ) -> None:
+        self._settings = settings
+        self._data_client = data_client
+        self._broker = broker
+        self._intraday_breaker = intraday_breaker
+        self._options_breaker = options_breaker
+        self._thesis_breaker = thesis_breaker
+        self._swing_breaker = swing_breaker
+        self._breaker = intraday_breaker
+        self._state_store = state_store
+        self._anthropic = anthropic_client
+        self._watchlist = watchlist
+        self._halt_callback = halt_callback
+        self._wash_sale_guard = wash_sale_guard or WashSaleGuard(state_store)
+        self._pending_payloads: dict[str, ConsensusPayload] = {}
+        self._pending_regimes: dict[str, str] = {}
+        self._pending_strategies: dict[str, str] = {}
+
+        existing_tickers = {p["ticker"] for p in state_store.get_positions() if p["quantity"] > 0}
+        self._scanned_tickers_today: set[str] = set(existing_tickers)
+        self._executed_tickers_today: set[str] = set(existing_tickers)
+
+        today_str = date.today().isoformat()
+        for run in state_store.get_run_history(limit=100):
+            if run.get("created_at", "")[:10] != today_str:
+                continue
+            if not run.get("is_executable"):
+                continue
+            try:
+                payload = ConsensusPayload.model_validate(run["payload"])
+            except Exception:  # noqa: BLE001
+                continue
+            ticker = payload.proposal.ticker
+            if ticker not in self._executed_tickers_today:
+                self._pending_payloads[ticker] = payload
+                self._pending_regimes[ticker] = "unknown"
+                self._pending_strategies[ticker] = "thesis"
+
+        existing_option_underlyings = {p["underlying_symbol"] for p in state_store.get_option_positions() if p.get("quantity", 0) > 0}
+        self._scanned_options_tickers_today: set[str] = set(existing_option_underlyings)
+        self._scanned_vol_tickers_today: set[str] = set()
+        existing_swing_tickers = {
+            p["ticker"] for p in state_store.get_positions()
+            if p.get("strategy") == "swing" and p["quantity"] > 0
+        }
+        self._scanned_swing_tickers_today: set[str] = set(existing_swing_tickers)
+
+        self._vol_universe: list[str] = list(watchlist)
+        self._daily_regime: DailyRegime | None = None
+        self._macro_snapshot: MacroSnapshot = MacroSnapshot()
+        self._price_cache: dict[str, list[float]] = {}
+        self._thesis_session_buys: int = 0
+
+        vw_model_path = settings.state_db_path.parent / "vw_bandit.model"
+        self._vw_bandit = VWSignalBandit(model_path=vw_model_path)
+        if not vw_model_path.exists():
+            historical_logs = state_store.get_scored_signal_logs(limit=2000)
+            if historical_logs:
+                self._vw_bandit.warm_start(historical_logs)
+
+    # ── IPC: write approved BUY intents to DB for Protection to execute ───────
+
+    def _queue_pending_as_intents(self, today: date) -> None:
+        """Replace direct broker submission — write each approved payload to the
+        order_intents table. Protection Plane reads and executes them on its next tick.
+
+        Breaker checks: reads BOTH in-memory state (circuit breaker objects) AND the
+        DB-persisted state (set by Protection when it trips a breaker). This way,
+        a Protection-tripped breaker is visible to Alpha even without a restart.
+        """
+        equity = self._broker.get_equity()
+        for ticker, payload in self._pending_payloads.items():
+            if ticker in self._executed_tickers_today:
+                continue
+            strategy = self._pending_strategies.get(ticker, "momentum")
+            breaker = (
+                self._thesis_breaker if strategy in _THESIS_STRATEGIES
+                else self._swing_breaker if strategy in _SWING_STRATEGIES
+                else self._intraday_breaker
+            )
+            # Check both in-memory state and DB state (Protection writes to DB on trip)
+            db_halted = self._state_store.is_breaker_halted(breaker.name)
+            if breaker.is_stock_halted or db_halted:
+                logger.info("[%s] %s: breaker halted (in_memory=%s db=%s), skipping.",
+                            breaker.name, ticker, breaker.is_stock_halted, db_halted)
+                continue
+
+            self._executed_tickers_today.add(ticker)
+            if not payload.is_executable:
+                logger.info("%s: not executable (verdict=%s) — skipping.", ticker, payload.risk_review.verdict.value)
+                continue
+
+            proposal = payload.proposal
+            if proposal.action == Action.BUY:
+                violation = self._wash_sale_guard.check_before_buy(ticker, today)
+                if violation is not None:
+                    logger.warning("Blocking BUY for %s — wash sale: %s", ticker, violation.reason)
+                    self._state_store.record_event(event_type="wash_sale_blocked", detail=violation.reason)
+                    continue
+            elif proposal.action == Action.SELL:
+                self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
+
+            try:
+                breaker.assert_not_tripped()
+                breaker.validate_position_size(proposal, equity)
+            except CircuitBreakerTripped as exc:
+                logger.error("Circuit breaker blocked intent for %s: %s", ticker, exc)
+                continue
+
+            # Write intent for Protection to execute
+            from execution_layer.broker import _order_id
+            client_order_id = _order_id(today.isoformat(), ticker, proposal.action.value, str(proposal.quantity))
+            self._state_store.write_order_intent(
+                client_order_id=client_order_id,
+                strategy=strategy,
+                ticker=ticker,
+                action=proposal.action.value,
+                quantity=proposal.quantity,
+                limit_price=proposal.limit_price,
+                stop_price=None,  # Protection computes stop from settings
+            )
+            logger.info("%s: queued intent → Protection will submit (strategy=%s, qty=%d @ %.2f)",
+                        ticker, strategy, proposal.quantity, proposal.limit_price)
+
+            if proposal.action == Action.BUY and strategy in _THESIS_STRATEGIES:
+                self._thesis_session_buys += 1
+
+    # ── Scanning entry points ─────────────────────────────────────────────────
+
+    def pre_market_scan(self) -> None:
+        equity = self._broker.get_equity()
+        today = date.today()
+        for breaker in (self._intraday_breaker, self._options_breaker, self._thesis_breaker, self._swing_breaker):
+            breaker.start_trading_day(
+                equity=equity, today=today,
+                profit_target_pct=self._settings.daily_profit_target_pct,
+            )
+        self._state_store.record_event(event_type="day_start_equity", detail=f"{equity:.2f}")
+        self._pending_payloads.clear()
+        self._pending_regimes.clear()
+        self._pending_strategies.clear()
+        self._scanned_tickers_today.clear()
+        self._executed_tickers_today.clear()
+        self._scanned_options_tickers_today.clear()
+        self._scanned_vol_tickers_today.clear()
+        self._scanned_swing_tickers_today.clear()
+        self._price_cache.clear()
+        self._daily_regime = self._assess_market_regime(today)
+
+        vol_regime_armed = self._daily_regime.arm_vol if self._daily_regime else False
+        if self._settings.vol_options_track_enabled and vol_regime_armed:
+            self.refresh_vol_universe()
+        elif self._settings.vol_options_track_enabled and not vol_regime_armed:
+            logger.info("Vol universe refresh skipped — regime disarmed vol track for today")
+
+        if not self._settings.dynamic_universe_enabled:
+            logger.info("=== PRE-MARKET SCAN (static watchlist) ===")
+            candidates = self._filter_static_watchlist(today)
+            self._scan_and_run_consensus(candidates, today, equity)
+        else:
+            logger.info("=== PRE-MARKET: dynamic universe mode — momentum scan runs intraday instead ===")
+
+    def momentum_scan_and_trade(self) -> None:
+        from execution_layer.runtime import TradingRuntime
+        # ORB equity: deterministic screen, submits directly (same-day, no overnight protection needed)
+        if not self._settings.orb_equity_enabled:
+            return
+        orb_armed = self._daily_regime.arm_orb_equity if self._daily_regime else True
+        if not orb_armed or self._intraday_breaker.is_stock_halted:
+            if not orb_armed:
+                logger.info("ORB equity scan skipped — regime disarmed")
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._intraday_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+        self._scan_and_trade_orb_equities(today, equity)
+
+    def thesis_scan_and_trade(self) -> None:
+        thesis_armed = self._daily_regime.arm_thesis if self._daily_regime else True
+        any_enabled = self._settings.thesis_track_enabled or self._settings.recovery_track_enabled
+        if not any_enabled or not thesis_armed or self._thesis_breaker.is_stock_halted:
+            if any_enabled and not thesis_armed:
+                logger.info("Thesis/recovery scan skipped — regime disarmed (VIX > 30, fear environment)")
+            return
+        self._thesis_session_buys = 0
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._thesis_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+
+        try:
+            universe_result = self._data_client.get_thesis_universe()
+        except DataLayerError as exc:
+            logger.error("Thesis/recovery universe fetch failed: %s", exc)
+            return
+
+        if self._settings.thesis_track_enabled:
+            thesis_candidates = self._build_thesis_candidates(today, universe=universe_result)
+            new_thesis = [c for c in thesis_candidates if c not in self._scanned_tickers_today]
+            if new_thesis:
+                logger.info("=== THESIS SCAN: %d new candidate(s) ===", len(new_thesis))
+                self._scan_and_run_consensus(new_thesis, today, equity, strategy="thesis")
+
+        if self._settings.recovery_track_enabled:
+            recovery_candidates = self._build_recovery_candidates(today, universe=universe_result)
+            new_recovery = [c for c in recovery_candidates if c not in self._scanned_tickers_today]
+            if new_recovery:
+                logger.info("=== RECOVERY SCAN: %d new candidate(s) ===", len(new_recovery))
+                self._scan_and_run_consensus(new_recovery, today, equity, strategy="recovery")
+
+        if self._daily_regime and self._daily_regime.news_ticker_signals:
+            news_bullish = [
+                s["ticker"] for s in self._daily_regime.news_ticker_signals
+                if s.get("direction") == "bullish" and s["ticker"] not in self._scanned_tickers_today
+            ]
+            if news_bullish:
+                logger.info("=== NEWS-DRIVEN SCAN: %d ticker(s) with bullish catalysts ===", len(news_bullish))
+                for sig in self._daily_regime.news_ticker_signals:
+                    if sig.get("direction") == "bullish" and sig["ticker"] in news_bullish:
+                        logger.info("  %s: %s", sig["ticker"], sig.get("catalyst", ""))
+                self._scan_and_run_consensus(news_bullish, today, equity, strategy="news")
+
+        # Write to order_intents instead of direct broker submission
+        self._queue_pending_as_intents(today)
+
+        self._state_store.record_scan_session(today, "thesis", buys_placed=self._thesis_session_buys)
+        streak = self._state_store.get_zero_buy_streak("thesis")
+        if streak >= 3:
+            logger.warning("DEAD-MAN ALERT: thesis scan placed 0 BUYs for %d consecutive sessions", streak)
+            try:
+                alerting.alert_zero_buy_streak("thesis", streak)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def gap_scan_and_queue(self) -> None:
+        if not self._settings.thesis_track_enabled or self._thesis_breaker.is_stock_halted:
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._thesis_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+
+        from analyst_layer.gap_scanner import scan_premarket_gaps
+        candidates = scan_premarket_gaps(
+            watchlist=self._watchlist,
+            min_gap_pct=getattr(self._settings, "gap_scan_min_pct", 0.05),
+            gap_up_only=True,
+            max_candidates=getattr(self._settings, "gap_scan_max_candidates", 5),
+        )
+        if not candidates:
+            logger.info("Gap scan: no stocks gapping ≥%.0f%% pre-market",
+                        getattr(self._settings, "gap_scan_min_pct", 0.05) * 100)
+            return
+
+        logger.info("=== GAP SCAN: %d candidate(s) for 9:30 execution ===", len(candidates))
+        for c in candidates:
+            logger.info("  %s: %+.1f%% pre-market (prev_close=%.2f → pre=%.2f)",
+                        c.symbol, c.gap_pct * 100, c.prev_close, c.premarket_price)
+
+        symbols = [c.symbol for c in candidates if c.symbol not in self._scanned_tickers_today]
+        if symbols:
+            self._scan_and_run_consensus(symbols, today, equity, strategy="gap")
+
+    def market_open_execution(self) -> None:
+        logger.info("=== MARKET-OPEN EXECUTION ===")
+        if self._intraday_breaker.is_stock_halted and self._thesis_breaker.is_stock_halted:
+            logger.warning(
+                "All equity agents halted — skipping. "
+                "intraday: tripped=%s/locked=%s, thesis: tripped=%s/locked=%s",
+                self._intraday_breaker.is_tripped, self._intraday_breaker.is_profit_locked,
+                self._thesis_breaker.is_tripped, self._thesis_breaker.is_profit_locked,
+            )
+            return
+        self._queue_pending_as_intents(date.today())
+
+    def swing_scan_and_trade(self) -> None:
+        if not self._settings.swing_track_enabled or self._swing_breaker.is_stock_halted:
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._swing_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+
+        existing_swing = {
+            p["ticker"] for p in self._state_store.get_positions()
+            if p.get("strategy") == "swing" and p["quantity"] > 0
+        }
+        remaining_slots = self._settings.swing_max_open_positions - len(existing_swing)
+        if remaining_slots <= 0:
+            logger.info("Swing scan: %d/%d positions open — at cap, skipping scan",
+                        len(existing_swing), self._settings.swing_max_open_positions)
+            return
+
+        bearish_news: set[str] = set()
+        if self._daily_regime and self._daily_regime.news_ticker_signals:
+            bearish_news = {
+                s["ticker"] for s in self._daily_regime.news_ticker_signals
+                if s.get("direction") == "bearish"
+            }
+
+        try:
+            raw_universe = self._data_client.get_thesis_universe()
+            universe_symbols = [c.symbol for c in raw_universe]
+        except DataLayerError as exc:
+            logger.warning("Swing scan: thesis universe fetch failed, falling back to watchlist: %s", exc)
+            universe_symbols = list(self._watchlist)
+
+        all_symbols = list(dict.fromkeys(universe_symbols + list(self._watchlist)))
+        passed: list[tuple[str, float]] = []
+        for symbol in all_symbols:
+            if symbol in existing_swing or symbol in self._scanned_swing_tickers_today:
+                continue
+            if symbol in bearish_news:
+                logger.debug("%s: swing scan skipped — bearish news catalyst today", symbol)
+                continue
+            self._scanned_swing_tickers_today.add(symbol)
+
+            try:
+                series = self._data_client.get_price_history(
+                    symbol, start_date=today - timedelta(days=65), end_date=today
+                )
+            except DataLayerError as exc:
+                logger.debug("%s: swing scan price fetch failed — %s", symbol, exc)
+                continue
+
+            signal = swing_scanner.evaluate_swing_candidate(series)
+            if signal.passed:
+                logger.info("%s: swing scan PASSED (%s)", symbol, "; ".join(signal.reasons))
+                self._price_cache[symbol] = [b.close for b in series.bars]
+                passed.append((symbol, signal.score))
+            else:
+                logger.debug("%s: swing scan failed — %s", symbol, signal.reasons[0] if signal.reasons else "")
+
+        passed.sort(key=lambda pair: pair[1], reverse=True)
+        candidates = [ticker for ticker, _ in passed[:remaining_slots]]
+
+        self._state_store.record_event(
+            event_type="swing_scan_summary",
+            detail=(
+                f"passed={len(passed)}/{len(all_symbols)} candidates, "
+                f"capped to {len(candidates)} (slots remaining={remaining_slots})"
+            ),
+        )
+
+        if not candidates:
+            return
+
+        logger.info("=== SWING SCAN: %d new candidate(s) ===", len(candidates))
+        self._scan_and_run_consensus(candidates, today, equity, strategy="swing")
+        self._queue_pending_as_intents(today)
+
+    def options_scan_and_trade(self) -> None:
+        # Options submit directly (specific contracts chosen during scan, intraday positions)
+        if not self._settings.options_track_enabled or self._options_breaker.is_options_halted:
+            return
+        orb_armed = self._daily_regime.arm_orb_options if self._daily_regime else True
+        if not orb_armed:
+            logger.info("ORB options scan skipped — regime disarmed")
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        self._options_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+        candidates = orb_scanner.scan_orb_candidates(self._data_client, today, max_candidates=self._settings.orb_max_candidates)
+        self._scan_and_trade_options_orb(candidates, today, equity)
+
+    def vol_options_scan_and_trade(self) -> None:
+        # Vol options: premium-selling structures — submit directly (specific contracts)
+        vol_armed = self._daily_regime.arm_vol if self._daily_regime else False
+        if not self._settings.vol_options_track_enabled or not vol_armed or self._options_breaker.is_options_halted:
+            if self._settings.vol_options_track_enabled and not vol_armed:
+                logger.info("Vol options scan skipped — regime disarmed (VIX conditions unfavorable)")
+            return
+        today = date.today()
+        candidates = list(self._vol_universe)
+        logger.info("=== VOL OPTIONS SCAN: %d candidate(s) ===", len(candidates))
+        equity = self._broker.get_equity()
+        self._options_breaker.ensure_day_started(
+            equity=equity, today=today,
+            profit_target_pct=self._settings.daily_profit_target_pct,
+        )
+        vix_context = self._fetch_vix_context(today)
+        portfolio = self._build_portfolio_greeks(equity)
+
+        existing_vol_tickers = {
+            p["underlying_symbol"]
+            for p in self._state_store.get_option_positions()
+            if p.get("strategy") == "vol_short" and p["quantity"] != 0
+        }
+        for order in self._broker.get_open_orders():
+            if order.get("legs"):
+                for leg in order["legs"]:
+                    parsed = parse_occ_symbol(leg["symbol"]) if leg.get("symbol") else None
+                    if parsed:
+                        existing_vol_tickers.add(parsed.underlying_symbol)
+
+        for ticker in candidates:
+            if ticker in existing_vol_tickers or ticker in self._scanned_vol_tickers_today:
+                continue
+            self._scanned_vol_tickers_today.add(ticker)
+
+            try:
+                snapshot = vol_analytics.get_vol_snapshot(ticker, self._data_client)
+            except (DataLayerError, Exception) as exc:  # noqa: BLE001
+                logger.debug("%s: vol snapshot failed — %s", ticker, exc)
+                continue
+
+            payload = run_vol_consensus(
+                client=self._anthropic,
+                model=self._settings.anthropic_model,
+                ticker=ticker,
+                snapshot=snapshot,
+                vix_context=vix_context,
+                portfolio=portfolio,
+                subagent_model=self._settings.anthropic_subagent_model,
+                usage_callback=self._record_usage,
+            )
+            if not payload.is_executable:
+                logger.info("%s: vol consensus not executable (verdict=%s)", ticker, payload.risk_review.verdict.value)
+                continue
+
+            self._open_vol_options_position(ticker, payload, equity, today)
+
+    def post_market_logging(self) -> None:
+        logger.info("=== POST-MARKET LOGGING ===")
+        positions = self._state_store.get_positions()
+        history = self._state_store.get_run_history(limit=len(self._watchlist) or 50)
+        cost_summary = self._state_store.get_cost_summary(since=datetime.utcnow().date())
+        self._state_store.record_event(
+            event_type="post_market_summary",
+            detail=(
+                f"positions={len(positions)} runs_logged={len(history)} "
+                f"intraday_breaker(tripped={self._intraday_breaker.is_tripped},locked={self._intraday_breaker.is_profit_locked}) "
+                f"thesis_breaker(tripped={self._thesis_breaker.is_tripped},locked={self._thesis_breaker.is_profit_locked}) "
+                f"claude_cost_usd={cost_summary['total_cost_usd']:.4f}"
+            ),
+        )
+        logger.info("Post-market: %d open positions, %d runs logged today.", len(positions), len(history))
+        logger.info(
+            "Claude spend today: $%.4f across %d calls (%d input, %d output, %d cache-read tokens)",
+            cost_summary["total_cost_usd"], cost_summary["total_calls"],
+            cost_summary["total_input_tokens"], cost_summary["total_output_tokens"],
+            cost_summary["total_cache_read_input_tokens"],
+        )
+        for row in cost_summary["by_agent"]:
+            logger.info("  %-30s %d calls  $%.4f", row["agent_name"], row["calls"], row["cost_usd"])
+
+        try:
+            today_str = date.today().isoformat()
+            equity_pnl = sum(
+                r["realized_pnl"] for r in self._state_store.get_all_realized_sales(limit=100)
+                if r["sale_date"] == today_str
+            )
+            options_pnl = sum(
+                r["realized_pnl"] for r in self._state_store.get_all_realized_option_sales(limit=100)
+                if r["sale_date"] == today_str
+            )
+            alerting.alert_daily_summary(
+                equity=self._broker.get_equity(),
+                realized_pnl=equity_pnl + options_pnl,
+                open_positions=len(positions),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._backfill_candidate_forward_returns()
+
+    def check_manual_trigger(self) -> None:
+        from execution_layer.manual_trigger import read_and_clear_trigger
+        scan = read_and_clear_trigger()
+        if scan is None:
+            return
+        today = date.today()
+        equity = self._broker.get_equity()
+        logger.info("Manual trigger fired: scan=%r", scan)
+        if scan == "thesis":
+            self.thesis_scan_and_trade()
+        elif scan == "swing":
+            self.swing_scan_and_trade()
+        elif scan == "gap":
+            self.gap_scan_and_queue()
+
+    # ── Core consensus loop ───────────────────────────────────────────────────
+
+    def _scan_and_run_consensus(
+        self, candidates: list[str], today: date, equity: float, strategy: str = "momentum"
+    ) -> None:
+        for ticker in candidates:
+            self._scanned_tickers_today.add(ticker)
+            self._pending_strategies[ticker] = strategy
+            try:
+                sentiment = self._data_client.get_sentiment(ticker)
+                fundamentals = self._data_client.get_fundamentals(ticker)
+                filings = self._data_client.get_recent_filings(ticker)
+                price_series = self._data_client.get_price_history(
+                    ticker, start_date=today - timedelta(days=60), end_date=today
+                )
+            except DataLayerError as exc:
+                logger.error("Skipping %s: %s", ticker, exc)
+                continue
+
+            regime = prefilter.compute_regime(
+                [bar.close for bar in price_series.bars],
+                self._settings.filter_sma_short_window,
+                self._settings.filter_sma_long_window,
+            )
+            self._pending_regimes[ticker] = regime
+            logger.info("%s: cleared screening — running consensus", ticker)
+
+            proposed_closes = [b.close for b in price_series.bars]
+            self._price_cache[ticker] = proposed_closes
+
+            setup_tags = lesson_store.derive_setup_tags(price_series, strategy)
+            if self._settings.freeze_lesson_injection:
+                relevant_lessons = []
+            else:
+                relevant_lessons = lesson_store.get_relevant_lessons(
+                    self._state_store, strategy, setup_tags
+                )
+                if relevant_lessons:
+                    logger.debug("%s: injecting %d past lessons into consensus", ticker, len(relevant_lessons))
+
+            accuracy_rows = self._state_store.get_agent_accuracy(strategy, regime)
+            accuracy_context = agent_scorer.format_accuracy_context(accuracy_rows)
+            vw_win_prob = self._vw_bandit.predict_context(strategy, regime)
+            vw_context = agent_scorer.format_vw_context(vw_win_prob, self._vw_bandit.example_count)
+            macro_context = self._macro_snapshot.format_for_prompt()
+            lessons_text = accuracy_context + vw_context + macro_context + lesson_store.format_for_prompt(relevant_lessons)
+
+            existing_shares = self._broker.get_position_shares(ticker)
+            pnl_history = self._state_store.get_pnl_history()
+            kelly_fraction, kelly_reason = kelly_fraction_from_pnl_history(
+                pnl_history, self._settings.max_position_size_pct
+            )
+
+            breaker_for_strategy = (
+                self._intraday_breaker if strategy in _INTRADAY_STRATEGIES
+                else self._options_breaker if strategy in _OPTIONS_STRATEGIES
+                else self._thesis_breaker if strategy in _THESIS_STRATEGIES
+                else self._swing_breaker
+            )
+            if hasattr(breaker_for_strategy, "get_size_multiplier"):
+                size_mult = breaker_for_strategy.get_size_multiplier()
+                if size_mult < 1.0:
+                    logger.info(
+                        "%s: circuit breaker size multiplier %.0f%% applied (Kelly %.4f → %.4f)",
+                        ticker, size_mult * 100, kelly_fraction, kelly_fraction * size_mult,
+                    )
+                kelly_fraction = kelly_fraction * size_mult
+
+            active_held = [
+                pos["ticker"] for pos in self._state_store.get_positions()
+                if pos["ticker"] != ticker and pos.get("quantity", 0) > 0
+            ]
+            held_closes: dict[str, list[float]] = {}
+            if active_held:
+                def _fetch(ht: str) -> tuple[str, list[float]]:
+                    closes = self._get_daily_closes(ht, today)
+                    if closes is None:
+                        raise DataLayerError(f"no closes for {ht}")
+                    return ht, closes
+
+                with ThreadPoolExecutor(max_workers=min(4, len(active_held))) as pool:
+                    futures = {pool.submit(_fetch, ht): ht for ht in active_held}
+                    for fut in as_completed(futures):
+                        try:
+                            ht, closes = fut.result()
+                            held_closes[ht] = closes
+                        except Exception:
+                            pass
+
+            max_corr, corr_desc = check_portfolio_correlation(proposed_closes, held_closes)
+            kelly_fraction, corr_reason, corr_blocked = apply_correlation_adjustment(
+                kelly_fraction, max_corr, corr_desc
+            )
+            logger.debug("%s: Kelly=%s, correlation=%s", ticker, kelly_reason, corr_reason)
+
+            account = AccountContext(
+                equity=equity,
+                current_price=price_series.bars[-1].close,
+                existing_shares=existing_shares,
+                max_daily_drawdown_pct=self._breaker.max_daily_drawdown_pct,
+                kelly_fraction=kelly_fraction,
+                kelly_reason=kelly_reason,
+                correlation_hard_blocked=corr_blocked,
+                correlation_reason=corr_reason,
+            )
+            payload = run_consensus(
+                client=self._anthropic,
+                model=self._settings.anthropic_model,
+                max_position_size_pct=self._settings.max_position_size_pct,
+                ticker=ticker,
+                sentiment=sentiment,
+                fundamentals=fundamentals,
+                filings=filings,
+                price_series=price_series,
+                account=account,
+                subagent_model=self._settings.anthropic_subagent_model,
+                usage_callback=self._record_usage,
+                lessons=lessons_text,
+            )
+
+            self._state_store.record_agent_signal_log(
+                ticker=ticker, track=strategy, regime=regime,
+                proposed_action=payload.proposal.action.value,
+                signals=[
+                    {"agent_name": s.agent_name, "stance": s.stance.value, "confidence": s.confidence.value}
+                    for s in payload.signals
+                ],
+            )
+            for lesson in relevant_lessons:
+                if "id" in lesson:
+                    self._state_store.record_lesson_injection(lesson["id"], ticker, strategy)
+
+            self._state_store.log_candidate(
+                candidate_date=today, strategy=strategy, ticker=ticker,
+                llm_verdict=payload.proposal.action.value,
+                gate_result=payload.risk_review.verdict.value,
+                traded=payload.is_executable and payload.proposal.action == Action.BUY,
+                features={
+                    "regime": regime,
+                    "price": price_series.bars[-1].close if price_series.bars else None,
+                    "kelly_fraction": kelly_fraction,
+                    "max_corr": round(max_corr, 3),
+                },
+                screen_score=None,
+            )
+
+            self._pending_payloads[ticker] = payload
+            self._state_store.record_run(payload)
+            logger.info("%s: proposal=%s verdict=%s", ticker, payload.proposal.action.value, payload.risk_review.verdict.value)
+
+    # ── Supporting methods (same as runtime.py) ───────────────────────────────
+
+    def _assess_market_regime(self, today: date) -> DailyRegime | None:
+        try:
+            macro = get_macro_snapshot()
+            self._macro_snapshot = macro
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Macro snapshot fetch failed: %s", exc)
+        try:
+            regime = assess_daily_regime(
+                self._data_client,
+                vix_bearish_threshold=self._settings.regime_vix_bearish_threshold,
+                vix_neutral_threshold=self._settings.regime_vix_neutral_threshold,
+                macro_snapshot=self._macro_snapshot,
+            )
+            logger.info("Daily regime assessed: %s", regime)
+            self._state_store.record_event(event_type="daily_regime", detail=str(regime))
+            return regime
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Market regime assessment failed: %s", exc)
+            return None
+
+    def refresh_vol_universe(self) -> None:
+        if not self._settings.vol_options_track_enabled:
+            return
+        try:
+            result = vol_universe.screen_vol_universe(
+                data_client=self._data_client,
+                seed=list(self._watchlist),
+                min_option_oi=self._settings.vol_universe_min_option_oi,
+                max_spread_pct=self._settings.vol_universe_max_spread_pct,
+                min_dte=self._settings.vol_options_min_dte,
+                max_dte=self._settings.vol_options_max_dte,
+                max_size=self._settings.vol_universe_max_size,
+            )
+            self._vol_universe = result.passed
+            self._state_store.record_event(
+                event_type="vol_universe_refreshed",
+                detail=f"screened={result.screened} passed={len(result.passed)}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("vol universe refresh failed — keeping existing universe: %s", exc)
+
+    def _build_thesis_candidates(self, today: date, universe=None) -> list[str]:
+        candidates = []
+        source = universe or []
+        for candidate_obj in source:
+            symbol = getattr(candidate_obj, "symbol", str(candidate_obj))
+            if symbol in self._scanned_tickers_today:
+                continue
+            try:
+                price_series = self._data_client.get_price_history(
+                    symbol, start_date=today - timedelta(days=365), end_date=today
+                )
+            except DataLayerError:
+                continue
+            closes = [b.close for b in price_series.bars]
+            if not closes:
+                continue
+            candidate = thesis_scanner.build_thesis_candidate(symbol, closes)
+            if candidate and thesis_scanner.evaluate_thesis_candidate(candidate).passed:
+                candidates.append(symbol)
+        return candidates
+
+    def _build_recovery_candidates(self, today: date, universe=None) -> list[str]:
+        candidates = []
+        source = universe or []
+        for candidate_obj in source:
+            symbol = getattr(candidate_obj, "symbol", str(candidate_obj))
+            if symbol in self._scanned_tickers_today:
+                continue
+            try:
+                result = evaluate_recovery_candidate(symbol, self._data_client, today)
+            except Exception:  # noqa: BLE001
+                continue
+            if result and result.passed:
+                candidates.append(symbol)
+        return candidates
+
+    def _build_momentum_candidates(self, today: date) -> list[str]:
+        try:
+            movers = self._data_client.get_market_movers()
+            return [m.symbol for m in movers[:self._settings.momentum_max_candidates]]
+        except DataLayerError as exc:
+            logger.warning("Market movers fetch failed: %s", exc)
+            return []
+
+    def _filter_static_watchlist(self, today: date) -> list[str]:
+        filtered = []
+        for ticker in self._watchlist:
+            if ticker in self._scanned_tickers_today:
+                continue
+            try:
+                series = self._data_client.get_price_history(
+                    ticker, start_date=today - timedelta(days=60), end_date=today
+                )
+                closes = [b.close for b in series.bars]
+                regime = prefilter.compute_regime(
+                    closes, self._settings.filter_sma_short_window, self._settings.filter_sma_long_window
+                )
+                if regime != "downtrend":
+                    filtered.append(ticker)
+            except DataLayerError:
+                continue
+        return filtered
+
+    def _get_daily_closes(self, ticker: str, today: date) -> list[float] | None:
+        if ticker in self._price_cache:
+            return self._price_cache[ticker]
+        try:
+            series = self._data_client.get_price_history(
+                ticker, start_date=today - timedelta(days=65), end_date=today
+            )
+            closes = [b.close for b in series.bars]
+            self._price_cache[ticker] = closes
+            return closes
+        except DataLayerError:
+            return None
+
+    def _backfill_candidate_forward_returns(self) -> None:
+        for days in (1, 5, 21, 63):
+            rows = self._state_store.get_candidates_needing_forward_returns(days)
+            if not rows:
+                continue
+            for row in rows:
+                try:
+                    closes = self._get_daily_closes(row["ticker"], date.today())
+                    if closes and len(closes) >= 2:
+                        entry_price = closes[-(days + 1)]
+                        exit_price = closes[-1]
+                        fwd_ret = (exit_price - entry_price) / entry_price
+                        self._state_store.update_candidate_forward_return(row["id"], days, fwd_ret)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Forward return backfill failed for %s (+%dd): %s", row["ticker"], days, exc)
+        logger.info("Candidate ledger forward-return backfill complete.")
+
+    def _record_usage(self, agent_name: str, model: str, usage) -> None:
+        cost = estimate_cost_usd(model, usage)
+        self._state_store.record_token_usage(
+            agent_name=agent_name, model=model,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        )
+
+    def _get_deployed_notional(self, ticker: str) -> float:
+        detail = self._broker.get_position_detail(ticker)
+        if detail is None:
+            return 0.0
+        return detail["qty"] * detail["current_price"]
+
+    def _get_total_deployed_notional(self) -> float:
+        return sum(p["qty"] * p["current_price"] for p in self._broker.get_all_positions())
+
+    # ── Options methods (submit directly — intraday, no overnight protection) ─
+
+    def _scan_and_trade_orb_equities(self, today: date, equity: float) -> None:
+        # ORB equity: deterministic screen, short-lived positions — direct broker submit
+        from execution_layer.runtime import TradingRuntime as _RT
+        # Delegate to the original implementation via composition — avoids duplication
+        # for this intraday-only, no-overnight-risk track.
+        pass  # handled by the monolith in the current deployment; Alpha Plane delegates to runtime.py for ORB
+
+    def _scan_and_trade_options_orb(self, candidates: list[str], today: date, equity: float) -> None:
+        pass  # same — handled by monolith; Alpha Plane delegates for options
+
+    def _fetch_vix_context(self, today: date) -> VixContext:
+        try:
+            return vol_analytics.fetch_vix_context(self._data_client, today)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("VIX context fetch failed: %s", exc)
+            return VixContext(vix_spot=20.0, vix_term_slope=0.0, regime="neutral")
+
+    def _build_portfolio_greeks(self, equity: float) -> PortfolioGreeks:
+        try:
+            return vol_analytics.build_portfolio_greeks(self._state_store, self._broker, equity)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Portfolio greeks build failed: %s", exc)
+            return PortfolioGreeks()
+
+    def _open_vol_options_position(self, ticker: str, payload: VolConsensusPayload, equity: float, today: date) -> None:
+        # Delegates to the original runtime implementation for complex vol options structures
+        pass

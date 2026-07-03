@@ -143,6 +143,58 @@ CREATE TABLE IF NOT EXISTS lesson_injection_log (
     track TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scan_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    buys_placed INTEGER NOT NULL DEFAULT 0,
+    candidates_screened INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_date, strategy)
+);
+
+CREATE TABLE IF NOT EXISTS order_intents (
+    client_order_id TEXT PRIMARY KEY,
+    strategy TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    limit_price REAL NOT NULL,
+    stop_price REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    processed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS breaker_state (
+    breaker_name TEXT NOT NULL,
+    state_key TEXT NOT NULL,
+    state_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (breaker_name, state_key)
+);
+
+CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_date TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    features_json TEXT NOT NULL DEFAULT '{}',
+    screen_score REAL,
+    llm_verdict TEXT,
+    llm_mode TEXT NOT NULL DEFAULT 'gating',
+    gate_result TEXT,
+    traded INTEGER NOT NULL DEFAULT 0,
+    fill_ref TEXT,
+    fwd_ret_1d REAL,
+    fwd_ret_5d REAL,
+    fwd_ret_21d REAL,
+    fwd_ret_63d REAL,
+    hit_stop_within_21d INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(candidate_date, strategy, ticker)
+);
 """
 
 
@@ -158,6 +210,7 @@ def _row_to_position(row) -> dict:
         "stop_price": row[7],
         "target_price": row[8],
         "updated_at": row[9],
+        "bracket_stop_order_id": row[10] if len(row) > 10 else None,
     }
 
 
@@ -189,6 +242,8 @@ class StateStore:
             for column in ("stop_price", "target_price"):
                 if column not in existing_columns:
                     conn.execute(f"ALTER TABLE positions ADD COLUMN {column} REAL")
+            if "bracket_stop_order_id" not in existing_columns:
+                conn.execute("ALTER TABLE positions ADD COLUMN bracket_stop_order_id TEXT")
             option_cols = {row[1] for row in conn.execute("PRAGMA table_info(option_positions)")}
             if "strategy" not in option_cols:
                 conn.execute("ALTER TABLE option_positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'orb_options'")
@@ -211,6 +266,7 @@ class StateStore:
         strategy: str | None = None,
         stop_price: float | None = None,
         target_price: float | None = None,
+        bracket_stop_order_id: str | None = None,
     ) -> None:
         """`last_buy_at`/`entry_regime`/`high_water_mark`/`strategy`/
         `stop_price`/`target_price` should only be passed when this update
@@ -221,13 +277,15 @@ class StateStore:
         already on file. `strategy` defaults to 'momentum' on a brand-new
         position if never specified. stop_price/target_price are NULL for
         momentum/thesis positions — only the ORB track uses them.
+        `bracket_stop_order_id` is the Alpaca order ID of the resting stop leg;
+        stored so we can amend it as the trailing stop moves up.
         """
         with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO positions
-                    (ticker, quantity, avg_entry_price, last_buy_at, entry_regime, high_water_mark, strategy, stop_price, target_price, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'momentum'), ?, ?, ?)
+                    (ticker, quantity, avg_entry_price, last_buy_at, entry_regime, high_water_mark, strategy, stop_price, target_price, bracket_stop_order_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'momentum'), ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     quantity = excluded.quantity,
                     avg_entry_price = excluded.avg_entry_price,
@@ -237,6 +295,7 @@ class StateStore:
                     strategy = COALESCE(?, positions.strategy),
                     stop_price = COALESCE(excluded.stop_price, positions.stop_price),
                     target_price = COALESCE(excluded.target_price, positions.target_price),
+                    bracket_stop_order_id = COALESCE(excluded.bracket_stop_order_id, positions.bracket_stop_order_id),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -249,9 +308,22 @@ class StateStore:
                     strategy,
                     stop_price,
                     target_price,
+                    bracket_stop_order_id,
                     datetime.utcnow().isoformat(),
                     strategy,
                 ),
+            )
+            conn.commit()
+
+    def update_broker_stop(self, ticker: str, stop_price: float) -> None:
+        """Update the local stop_price record after we amend the resting broker stop.
+        Called each time the trailing stop moves up so the DB reflects the current
+        broker stop level.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE positions SET stop_price=?, updated_at=? WHERE ticker=?",
+                (stop_price, datetime.utcnow().isoformat(), ticker),
             )
             conn.commit()
 
@@ -271,7 +343,7 @@ class StateStore:
     def get_positions(self) -> list[dict]:
         with closing(self._connect()) as conn:
             cursor = conn.execute(
-                "SELECT ticker, quantity, avg_entry_price, last_buy_at, entry_regime, high_water_mark, strategy, stop_price, target_price, updated_at "
+                "SELECT ticker, quantity, avg_entry_price, last_buy_at, entry_regime, high_water_mark, strategy, stop_price, target_price, updated_at, bracket_stop_order_id "
                 "FROM positions"
             )
             rows = cursor.fetchall()
@@ -818,3 +890,176 @@ class StateStore:
                 (delta, lesson_id),
             )
             conn.commit()
+
+    def write_order_intent(
+        self,
+        client_order_id: str,
+        strategy: str,
+        ticker: str,
+        action: str,
+        quantity: int,
+        limit_price: float,
+        stop_price: float | None = None,
+    ) -> None:
+        """Alpha Plane writes a BUY/SELL intent. Protection Plane consumes it."""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO order_intents
+                       (client_order_id, strategy, ticker, action, quantity, limit_price, stop_price, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (client_order_id, strategy, ticker, action, quantity, limit_price, stop_price, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def get_pending_order_intents(self) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT client_order_id, strategy, ticker, action, quantity, limit_price, stop_price, created_at "
+                "FROM order_intents WHERE status='pending' ORDER BY created_at"
+            ).fetchall()
+        return [
+            {"client_order_id": r[0], "strategy": r[1], "ticker": r[2], "action": r[3],
+             "quantity": r[4], "limit_price": r[5], "stop_price": r[6], "created_at": r[7]}
+            for r in rows
+        ]
+
+    def mark_order_intent_processed(self, client_order_id: str, status: str = "submitted") -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE order_intents SET status=?, processed_at=? WHERE client_order_id=?",
+                (status, datetime.utcnow().isoformat(), client_order_id),
+            )
+            conn.commit()
+
+    def set_breaker_state(self, breaker_name: str, key: str, value: str) -> None:
+        """Protection Plane writes breaker state. Alpha Plane reads it before queuing intents."""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO breaker_state (breaker_name, state_key, state_value, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(breaker_name, state_key) DO UPDATE SET
+                       state_value=excluded.state_value,
+                       updated_at=excluded.updated_at""",
+                (breaker_name, key, value, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def get_breaker_state(self, breaker_name: str, key: str, default: str = "false") -> str:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT state_value FROM breaker_state WHERE breaker_name=? AND state_key=?",
+                (breaker_name, key),
+            ).fetchone()
+        return row[0] if row else default
+
+    def is_breaker_halted(self, breaker_name: str) -> bool:
+        return self.get_breaker_state(breaker_name, "halted", "false") == "true"
+
+    def log_candidate(
+        self,
+        candidate_date: date,
+        strategy: str,
+        ticker: str,
+        llm_verdict: str,
+        gate_result: str,
+        traded: bool,
+        features: dict | None = None,
+        screen_score: float | None = None,
+        fill_ref: str | None = None,
+    ) -> None:
+        """Log every screened candidate, whether traded or not.
+        Upserts on (date, strategy, ticker) — re-running a scan on the same day
+        updates rather than duplicates.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO candidates
+                       (candidate_date, strategy, ticker, features_json, screen_score,
+                        llm_verdict, gate_result, traded, fill_ref, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(candidate_date, strategy, ticker) DO UPDATE SET
+                       llm_verdict=excluded.llm_verdict,
+                       gate_result=excluded.gate_result,
+                       traded=excluded.traded,
+                       fill_ref=excluded.fill_ref,
+                       features_json=excluded.features_json,
+                       screen_score=excluded.screen_score""",
+                (
+                    candidate_date.isoformat(),
+                    strategy,
+                    ticker,
+                    json.dumps(features or {}),
+                    screen_score,
+                    llm_verdict,
+                    gate_result,
+                    1 if traded else 0,
+                    fill_ref,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_candidates_needing_forward_returns(self, days_ago: int) -> list[dict]:
+        """Returns candidates from exactly `days_ago` trading days ago that
+        don't yet have the corresponding forward return filled in.
+        Used by the nightly forward-return backfill job.
+        """
+        col = {1: "fwd_ret_1d", 5: "fwd_ret_5d", 21: "fwd_ret_21d", 63: "fwd_ret_63d"}.get(days_ago)
+        if col is None:
+            return []
+        cutoff = date.today() - __import__("datetime").timedelta(days=days_ago)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT id, ticker FROM candidates WHERE candidate_date=? AND {col} IS NULL",
+                (cutoff.isoformat(),),
+            ).fetchall()
+        return [{"id": r[0], "ticker": r[1]} for r in rows]
+
+    def update_candidate_forward_return(self, candidate_id: int, days: int, ret: float) -> None:
+        col = {1: "fwd_ret_1d", 5: "fwd_ret_5d", 21: "fwd_ret_21d", 63: "fwd_ret_63d"}.get(days)
+        if col is None:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(f"UPDATE candidates SET {col}=? WHERE id=?", (ret, candidate_id))
+            conn.commit()
+
+    def record_scan_session(
+        self,
+        session_date: date,
+        strategy: str,
+        buys_placed: int,
+        candidates_screened: int = 0,
+    ) -> None:
+        """Records one thesis/swing/intraday scan session outcome.
+        Upserts so a re-run on the same day overwrites rather than duplicates.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO scan_sessions (session_date, strategy, buys_placed, candidates_screened, created_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(session_date, strategy) DO UPDATE SET
+                       buys_placed=excluded.buys_placed,
+                       candidates_screened=excluded.candidates_screened""",
+                (session_date.isoformat(), strategy, buys_placed, candidates_screened, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def get_zero_buy_streak(self, strategy: str, lookback_days: int = 10) -> int:
+        """Returns the number of consecutive most-recent sessions with 0 buys placed.
+        Looks at the last `lookback_days` recorded sessions for this strategy.
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT buys_placed FROM scan_sessions
+                   WHERE strategy=?
+                   ORDER BY session_date DESC
+                   LIMIT ?""",
+                (strategy, lookback_days),
+            ).fetchall()
+        streak = 0
+        for (buys,) in rows:
+            if buys == 0:
+                streak += 1
+            else:
+                break
+        return streak

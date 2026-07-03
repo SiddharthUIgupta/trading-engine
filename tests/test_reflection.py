@@ -320,8 +320,8 @@ def test_trigger_reflection_spawns_thread_on_sell(tmp_path: Path):
 
 
 def test_lessons_injected_into_consensus(tmp_path: Path):
-    """run_consensus receives non-empty lessons string when past lessons exist."""
-    settings = Settings(_env_file=None)
+    """run_consensus receives non-empty lessons string when past lessons exist and injection is not frozen."""
+    settings = Settings(_env_file=None, FREEZE_LESSON_INJECTION=False)
     store = StateStore(tmp_path / "test.sqlite3")
     store.record_lesson(
         lesson="Gap-ups with declining volume fail after 30 min.",

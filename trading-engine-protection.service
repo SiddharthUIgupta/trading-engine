@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading Engine — Protection Plane (exits, reconciliation, order execution)
+After=network.target
+
+[Service]
+Type=simple
+User=sidgupta3391
+WorkingDirectory=/home/sidgupta3391/trading-engine
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/sidgupta3391/trading-engine/.env
+ExecStart=/home/sidgupta3391/trading-engine/.venv/bin/python -m main_protection
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-engine-protection
+
+[Install]
+WantedBy=multi-user.target

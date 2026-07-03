@@ -156,6 +156,9 @@ class TradingRuntime:
         # redundant data-layer calls when the same ticker appears in both the
         # correlation guard and the consensus loop, or across multiple candidates.
         self._price_cache: dict[str, list[float]] = {}
+        # Counts thesis-strategy BUYs placed this session — reset at the start of
+        # each thesis_scan_and_trade call so zero-buy streak detection is per-session.
+        self._thesis_session_buys: int = 0
         # VW contextual bandit — online logistic regression that learns win
         # probability from track × regime × agent signal patterns. Persisted to
         # disk alongside the state DB; warm-started from DB history on first run.
@@ -786,6 +789,7 @@ class TradingRuntime:
             if any_enabled and not thesis_armed:
                 logger.info("Thesis/recovery scan skipped — regime disarmed (VIX > 30, fear environment)")
             return
+        self._thesis_session_buys = 0
         today = date.today()
         equity = self._broker.get_equity()
         self._thesis_breaker.ensure_day_started(
@@ -833,6 +837,16 @@ class TradingRuntime:
                 self._scan_and_run_consensus(news_bullish, today, equity, strategy="news")
 
         self._execute_pending_payloads(today)
+
+        # Dead-man check: record session outcome and alert on zero-buy streak.
+        self._state_store.record_scan_session(today, "thesis", buys_placed=self._thesis_session_buys)
+        streak = self._state_store.get_zero_buy_streak("thesis")
+        if streak >= 3:
+            logger.warning("DEAD-MAN ALERT: thesis scan placed 0 BUYs for %d consecutive sessions", streak)
+            try:
+                alerting.alert_zero_buy_streak("thesis", streak)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- Pre-market gap scanner: runs at 9:05 AM ET, queues for 9:30 open ----
     def gap_scan_and_queue(self) -> None:
@@ -1031,10 +1045,21 @@ class TradingRuntime:
                         reason = f"adverse news catalyst: {sig.get('catalyst', 'bearish news signal')}"
                         break
 
-            # 4. Trailing stop via exit_rules
+            # 4. Trailing stop via exit_rules (+ amend broker stop if bracket placed at entry)
             if not should_exit:
                 self._state_store.update_high_water_mark(ticker, current_price)
                 high_water_mark = max(position.get("high_water_mark") or avg_entry, current_price)
+
+                bracket_stop_id = position.get("bracket_stop_order_id")
+                if bracket_stop_id:
+                    gain_pct = (high_water_mark - avg_entry) / avg_entry
+                    if gain_pct >= self._settings.swing_trailing_stop_activation_pct:
+                        new_trail_stop = high_water_mark * (1 - self._settings.swing_trailing_stop_pct)
+                        current_stop = position.get("stop_price") or 0.0
+                        if new_trail_stop > current_stop:
+                            self._broker.amend_stop_order(bracket_stop_id, new_trail_stop)
+                            self._state_store.update_broker_stop(ticker, new_trail_stop)
+
                 decision = exit_rules.evaluate_exit(
                     avg_entry_price=avg_entry,
                     current_price=current_price,
@@ -1214,13 +1239,17 @@ class TradingRuntime:
             proposed_closes = [b.close for b in price_series.bars]
             self._price_cache[ticker] = proposed_closes
 
-            # Retrieve relevant lessons; prepend agent accuracy track record
+            # Retrieve relevant lessons — skipped when freeze_lesson_injection=True
+            # so we can measure base-system edge on a frozen config before mutating prompts.
             setup_tags = lesson_store.derive_setup_tags(price_series, strategy)
-            relevant_lessons = lesson_store.get_relevant_lessons(
-                self._state_store, strategy, setup_tags
-            )
-            if relevant_lessons:
-                logger.debug("%s: injecting %d past lessons into consensus", ticker, len(relevant_lessons))
+            if self._settings.freeze_lesson_injection:
+                relevant_lessons = []
+            else:
+                relevant_lessons = lesson_store.get_relevant_lessons(
+                    self._state_store, strategy, setup_tags
+                )
+                if relevant_lessons:
+                    logger.debug("%s: injecting %d past lessons into consensus", ticker, len(relevant_lessons))
 
             accuracy_rows = self._state_store.get_agent_accuracy(strategy, regime)
             accuracy_context = agent_scorer.format_accuracy_context(accuracy_rows)
@@ -1326,6 +1355,24 @@ class TradingRuntime:
             for lesson in relevant_lessons:
                 if "id" in lesson:
                     self._state_store.record_lesson_injection(lesson["id"], ticker, strategy)
+
+            # Candidate ledger — log every screened candidate regardless of verdict.
+            # Rejected candidates are the control group for measuring LLM uplift.
+            self._state_store.log_candidate(
+                candidate_date=today,
+                strategy=strategy,
+                ticker=ticker,
+                llm_verdict=payload.proposal.action.value,
+                gate_result=payload.risk_review.verdict.value,
+                traded=payload.is_executable and payload.proposal.action == Action.BUY,
+                features={
+                    "regime": regime,
+                    "price": price_series.bars[-1].close if price_series.bars else None,
+                    "kelly_fraction": kelly_fraction,
+                    "max_corr": round(max_corr, 3),
+                },
+                screen_score=None,
+            )
 
             self._pending_payloads[ticker] = payload
             self._state_store.record_run(payload)
@@ -1494,7 +1541,27 @@ class TradingRuntime:
             try:
                 breaker.assert_not_tripped()
                 breaker.validate_position_size(proposal, equity)
-                result = self._broker.submit_order(proposal)
+
+                # Thesis and swing entries get a broker-side stop (OTO bracket).
+                # The stop rests at Alpaca — it survives a Pi crash or network gap.
+                # Intraday/ORB strategies use plain DAY limit orders (positions are
+                # always flat by EOD, so there's nothing to protect overnight).
+                use_bracket = (
+                    proposal.action == Action.BUY
+                    and strategy in (_THESIS_STRATEGIES | _SWING_STRATEGIES)
+                )
+                if use_bracket:
+                    stop_loss_pct = (
+                        self._settings.thesis_stop_loss_pct if strategy in _THESIS_STRATEGIES
+                        else self._settings.swing_stop_loss_pct
+                    )
+                    stop_price = proposal.limit_price * (1 - stop_loss_pct)
+                    result = self._broker.submit_bracket_order(proposal, stop_price=stop_price)
+                    bracket_stop_order_id = result.get("stop_order_id")
+                else:
+                    result = self._broker.submit_order(proposal)
+                    bracket_stop_order_id = None
+
                 logger.info("%s: order result=%s", ticker, result)
                 self._record_order_event(ticker, proposal, result)
                 self._record_fill(
@@ -1503,7 +1570,11 @@ class TradingRuntime:
                     today,
                     entry_regime=self._pending_regimes.get(ticker),
                     strategy=strategy,
+                    bracket_stop_order_id=bracket_stop_order_id,
+                    stop_price=stop_price if use_bracket else None,
                 )
+                if proposal.action == Action.BUY and strategy in _THESIS_STRATEGIES:
+                    self._thesis_session_buys += 1
 
                 equity = self._broker.get_equity()
                 if breaker.check_profit_target(equity):
@@ -1644,6 +1715,23 @@ class TradingRuntime:
 
             self._state_store.update_high_water_mark(ticker, detail["current_price"])
             high_water_mark = max(position["high_water_mark"], detail["current_price"])
+
+            # Amend the resting broker stop upward when trailing activates.
+            # The broker stop is placed at entry stop_loss_pct; once the position
+            # gains enough to arm the trail, we move it to track the high-water mark.
+            # Only moves UP — never lowers a protective stop.
+            bracket_stop_id = position.get("bracket_stop_order_id")
+            if bracket_stop_id:
+                exit_params = self._exit_params_for(position["strategy"])
+                trailing_activation = exit_params.get("trailing_stop_activation_pct", 0.0)
+                trailing_pct = exit_params.get("trailing_stop_pct", 0.0)
+                gain_pct = (high_water_mark - detail["avg_entry_price"]) / detail["avg_entry_price"]
+                if trailing_pct > 0 and gain_pct >= trailing_activation:
+                    new_trail_stop = high_water_mark * (1 - trailing_pct)
+                    current_stop = position.get("stop_price") or 0.0
+                    if new_trail_stop > current_stop:
+                        self._broker.amend_stop_order(bracket_stop_id, new_trail_stop)
+                        self._state_store.update_broker_stop(ticker, new_trail_stop)
 
             decision = exit_rules.evaluate_exit(
                 avg_entry_price=detail["avg_entry_price"],
@@ -2428,6 +2516,8 @@ class TradingRuntime:
         today: date,
         entry_regime: str | None = None,
         strategy: str | None = None,
+        bracket_stop_order_id: str | None = None,
+        stop_price: float | None = None,
     ) -> None:
         """Shared bookkeeping after ANY order actually reaches the broker —
         used by both the morning batch and intraday exit checks so position
@@ -2462,6 +2552,8 @@ class TradingRuntime:
                 entry_regime=entry_regime,
                 high_water_mark=max(prior_hwm, proposal.limit_price),
                 strategy=strategy,
+                stop_price=stop_price,
+                bracket_stop_order_id=bracket_stop_order_id,
             )
             alerting.alert_buy(ticker=ticker, shares=int(shares), price=avg_price, strategy=strategy or "unknown")
         else:
@@ -2798,6 +2890,29 @@ class TradingRuntime:
             )
         except Exception:  # noqa: BLE001
             pass
+
+        self._backfill_candidate_forward_returns()
+
+    def _backfill_candidate_forward_returns(self) -> None:
+        """Nightly: fetch today's closing price for each candidate that needs
+        a 1/5/21/63-day forward return filled in. Best-effort — a failed fetch
+        for one ticker doesn't skip the others.
+        """
+        for days in (1, 5, 21, 63):
+            rows = self._state_store.get_candidates_needing_forward_returns(days)
+            if not rows:
+                continue
+            for row in rows:
+                try:
+                    closes = self._get_daily_closes(row["ticker"], date.today())
+                    if closes and len(closes) >= 2:
+                        entry_price = closes[-(days + 1)]
+                        exit_price = closes[-1]
+                        fwd_ret = (exit_price - entry_price) / entry_price
+                        self._state_store.update_candidate_forward_return(row["id"], days, fwd_ret)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Forward return backfill failed for %s (+%dd): %s", row["ticker"], days, exc)
+        logger.info("Candidate ledger forward-return backfill complete.")
 
     # ---- internals ----
     def _record_usage(self, agent_name: str, model: str, usage) -> None:

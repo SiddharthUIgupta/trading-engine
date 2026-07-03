@@ -21,7 +21,8 @@ from backtest.metrics import summarize  # noqa: E402
 settings = get_settings()
 data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
 
-universe = None  # defaults to S&P 500
+import sys
+use_pit = "--no-pit" not in sys.argv  # pass --no-pit to skip PIT and use Wikipedia (faster but biased)
 
 def _fmt(report) -> dict:
     return {
@@ -38,22 +39,34 @@ def _fmt(report) -> dict:
         "confidence_note": report.confidence_note,
     }
 
-# ── Scenario 1: zero slippage (original backtest) ────────────────────────────
-logging.getLogger("thesis_backtest").info("Running scenario 1: zero slippage")
-trades_clean = run_thesis_backtest(data_client, universe=universe, years_back=3)
+pit_label = "pit_universe" if use_pit else "wikipedia_current_biased"
+slippage_note = "0.5%_entry_0.3%_exit"
+
+# ── Scenario 1: PIT universe, zero slippage ───────────────────────────────────
+logging.getLogger("thesis_backtest").info("Running scenario 1: %s, zero slippage", pit_label)
+trades_clean = run_thesis_backtest(data_client, years_back=3, use_pit_universe=use_pit)
 report_clean = summarize(trades_clean)
 
-# ── Scenario 2: realistic slippage (0.5% entry, 0.3% exit) ──────────────────
-logging.getLogger("thesis_backtest").info("Running scenario 2: 0.5%% entry / 0.3%% exit slippage")
+# ── Scenario 2: PIT universe + realistic slippage ────────────────────────────
+logging.getLogger("thesis_backtest").info("Running scenario 2: %s, 0.5%%/0.3%% slippage", pit_label)
 trades_slip = run_thesis_backtest(
-    data_client, universe=universe, years_back=3,
+    data_client, years_back=3,
     entry_slippage_pct=0.005, exit_slippage_pct=0.003,
+    use_pit_universe=use_pit,
 )
 report_slip = summarize(trades_slip)
 
 result = {
-    "zero_slippage": _fmt(report_clean),
-    "with_slippage_0.5pct_entry_0.3pct_exit": _fmt(report_slip),
+    f"{pit_label}_zero_slippage": _fmt(report_clean),
+    f"{pit_label}_with_slippage": _fmt(report_slip),
+    "_note": (
+        "PIT universe uses fja05680/sp500 point-in-time membership — signals only "
+        "generated when ticker was actually in the S&P 500 on that bar date. "
+        "This eliminates look-ahead survivorship bias for buy-the-drawdown strategies."
+        if use_pit else
+        "WARNING: Wikipedia current-constituent list — SURVIVORSHIP BIAS. "
+        "Results are optimistic for buy-the-drawdown strategies."
+    ),
 }
 
 print("\n=== THESIS BACKTEST: SLIPPAGE IMPACT ===")
@@ -65,8 +78,8 @@ with open("backtest_results_thesis.json", "w") as f:
             "ticker": t.ticker, "entry_date": t.entry_date.isoformat(), "entry_price": t.entry_price,
             "exit_date": t.exit_date.isoformat() if t.exit_date else None, "exit_price": t.exit_price,
             "exit_reason": t.exit_reason, "return_pct": t.return_pct,
-            "slippage": "0.5%_entry_0.3%_exit",
+            "universe": pit_label, "slippage": slippage_note,
         }
         for t in trades_slip
     ], f, indent=2)
-print("\nFull trade log (with slippage) written to backtest_results_thesis.json")
+print(f"\nFull trade log ({pit_label}, with slippage) written to backtest_results_thesis.json")

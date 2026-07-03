@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading Engine — Alpha Plane (scanning, LLM, sizing)
+After=network.target trading-engine-protection.service
+BindsTo=trading-engine-protection.service
+
+[Service]
+Type=simple
+User=sidgupta3391
+WorkingDirectory=/home/sidgupta3391/trading-engine
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/sidgupta3391/trading-engine/.env
+ExecStart=/home/sidgupta3391/trading-engine/.venv/bin/python -m main_alpha
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-engine-alpha
+
+[Install]
+WantedBy=multi-user.target

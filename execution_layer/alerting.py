@@ -9,18 +9,23 @@ Optional: ALERT_EMAIL_TO (defaults to GMAIL_USER)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import smtplib
+import urllib.request
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _GMAIL_USER = os.getenv("GMAIL_USER", "")
 _GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 _TO = os.getenv("ALERT_EMAIL_TO") or _GMAIL_USER
+_HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_IO_URL", "")
+_HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "state/heartbeat.json"))
 
 
 def _send(subject: str, html: str) -> None:
@@ -193,3 +198,49 @@ def alert_crash(exc: str) -> None:
     </p>
     """
     _send(subject, html)
+
+
+def alert_zero_buy_streak(strategy: str, streak: int) -> None:
+    subject = f"⚠️ SILENT ENGINE — {strategy} has placed 0 BUYs for {streak} sessions"
+    html = f"""
+    <h2 style='color:#d97706;margin-bottom:4px'>⚠️ ZERO-BUY STREAK DETECTED</h2>
+    <p style='color:#666;margin-top:0'>{_now()}</p>
+    {_table(
+        ("Strategy", strategy),
+        ("Consecutive sessions with 0 BUYs", str(streak)),
+    )}
+    <p>The scan ran but placed no buy orders for {streak} consecutive sessions.
+    This may indicate a silent failure, regime disarm, or the screen finding nothing —
+    but ≥3 sessions in a row warrants manual inspection.</p>
+    <p style='color:#999;font-size:12px;margin-top:16px'>
+      Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
+    </p>
+    """
+    _send(subject, html)
+
+
+def ping_heartbeat(job_name: str) -> None:
+    """Record that `job_name` completed. Two side effects:
+    1. Writes a timestamp entry to the local heartbeat JSON file.
+    2. If HEALTHCHECKS_IO_URL is set, pings healthchecks.io (free tier supports
+       one check — useful for the most critical job; set the env var to a
+       healthchecks.io ping URL and point it at thesis_scan_and_trade).
+    Never raises — a broken heartbeat must never crash the trading process.
+    """
+    try:
+        _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = json.loads(_HEARTBEAT_FILE.read_text()) if _HEARTBEAT_FILE.exists() else {}
+        except Exception:
+            existing = {}
+        existing[job_name] = datetime.now(timezone.utc).isoformat()
+        _HEARTBEAT_FILE.write_text(json.dumps(existing, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Heartbeat file write failed for %s: %s", job_name, exc)
+
+    if _HEALTHCHECKS_URL:
+        try:
+            url = _HEALTHCHECKS_URL.rstrip("/") + f"/{job_name}" if "/" not in _HEALTHCHECKS_URL.split("//")[-1].split("?")[0].split("/")[-1] else _HEALTHCHECKS_URL
+            urllib.request.urlopen(url, timeout=5)  # noqa: S310
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Healthchecks.io ping failed for %s: %s", job_name, exc)

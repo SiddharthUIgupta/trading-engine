@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     # All intraday capital is redirected to thesis track.
     orb_equity_enabled: bool = Field(default=True, alias="ORB_EQUITY_ENABLED")
 
+    # --- Lesson injection freeze ---
+    # When True, past lessons are NOT injected into LLM consensus prompts.
+    # Keep frozen until the candidate ledger has >= 100 closed trades on a
+    # fixed config, so we can measure whether injection adds or destroys value.
+    freeze_lesson_injection: bool = Field(default=True, alias="FREEZE_LESSON_INJECTION")
+
     # --- ORB equity quality filters ---
     # Minimum gap from prior close for a valid ORB long setup. Stocks that
     # gapped up ≥2% already have pre-market conviction; flat opens produce
