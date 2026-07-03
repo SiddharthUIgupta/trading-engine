@@ -108,18 +108,19 @@ def assess_daily_regime(
         Daily VIX bars, most recent last. Needs ≥ 5 bars for trend; fewer → stable.
     macro_sentiment:
         Optional macro news sentiment ("bullish"/"bearish"/"neutral") from the
-        macro_news_agent. When provided at sufficient confidence, adjusts
-        vix_smooth up or down by up to `macro_vix_adjustment` points, which can
-        flip tracks between armed/disarmed near threshold boundaries.
+        macro_news_agent. MONOTONIC: only "bearish" at sufficient confidence
+        has any effect, RAISING vix_smooth by up to `macro_vix_adjustment`
+        points (can disarm tracks near a threshold). Bullish/neutral sentiment
+        never lowers effective VIX — a risk guard that headline sentiment can
+        relax is not a guard.
     macro_confidence:
         Confidence of the macro_sentiment assessment (0–1). Only applied when
         >= macro_min_confidence.
     macro_themes:
         Key themes from the news scoring, stored in DailyRegime for logging.
     macro_vix_adjustment:
-        Maximum VIX adjustment from news sentiment (in VIX points). Scaled
-        linearly by confidence. Default 3.0 — at VIX 31 + bullish news at 0.8
-        confidence, effective VIX becomes 31 - 3.0*0.8 = 28.6, arming thesis.
+        Maximum upward VIX adjustment from bearish news (in VIX points).
+        Scaled linearly by confidence.
     macro_min_confidence:
         Minimum confidence to apply any macro adjustment. Below this threshold
         the news is too uncertain to override pure technical data.
@@ -134,24 +135,20 @@ def assess_daily_regime(
     _smooth_window = min(5, len(vix_bars))
     vix_smooth: float = sum(b.close for b in vix_bars[-_smooth_window:]) / _smooth_window if vix_bars else 18.0
 
-    # ── Macro news adjustment to effective VIX ───────────────────────────────
-    # Applies only when confidence is sufficient. "bullish" news → reduce the
-    # effective VIX (market is recovering, fear overstated by raw VIX);
-    # "bearish" news → raise the effective VIX (macro headwinds warrant extra
-    # caution even if spot VIX hasn't spiked yet).
+    # ── Macro news adjustment to effective VIX (MONOTONIC) ──────────────────
+    # News sentiment may only TIGHTEN the regime (raise effective VIX), never
+    # loosen it. Bullish sentiment must never arm a track that raw volatility
+    # says should be disarmed — headline sentiment is at its most confidently
+    # bullish immediately before regime breaks, so a guard that bullish news
+    # can relax is not a guard.
     vix_effective = vix_smooth
-    if macro_sentiment and macro_confidence >= macro_min_confidence:
-        adjustment = macro_vix_adjustment * macro_confidence
-        if macro_sentiment == "bullish":
-            vix_effective = max(10.0, vix_smooth - adjustment)
-        elif macro_sentiment == "bearish":
-            vix_effective = vix_smooth + adjustment
-        if vix_effective != vix_smooth:
-            import logging as _logging
-            _logging.getLogger(__name__).info(
-                "Macro news (%s, conf=%.2f) adjusted effective VIX: %.1f → %.1f",
-                macro_sentiment, macro_confidence, vix_smooth, vix_effective,
-            )
+    if macro_sentiment == "bearish" and macro_confidence >= macro_min_confidence:
+        vix_effective = vix_smooth + macro_vix_adjustment * macro_confidence
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "Macro news (bearish, conf=%.2f) raised effective VIX: %.1f → %.1f",
+            macro_confidence, vix_smooth, vix_effective,
+        )
     vix_smooth = vix_effective
 
     vix_trend = (

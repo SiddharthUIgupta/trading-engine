@@ -984,8 +984,6 @@ class TradingRuntime:
         """
         today = date.today()
         for position in self._state_store.get_positions():
-            if self._swing_breaker.is_stock_halted:
-                return
             ticker = position["ticker"]
             if position["quantity"] <= 0 or position.get("strategy") != "swing":
                 continue
@@ -1060,7 +1058,6 @@ class TradingRuntime:
             )
             self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
             try:
-                self._swing_breaker.assert_not_tripped()
                 result = self._broker.submit_order(proposal)
                 logger.info("%s: swing exit order result=%s", ticker, result)
                 self._record_order_event(ticker, proposal, result)
@@ -1071,11 +1068,8 @@ class TradingRuntime:
                         reason=f"daily profit target reached after swing exit of {ticker}, equity={equity:.2f}",
                         breaker=self._swing_breaker,
                     )
-                    return
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked swing exit for %s: %s", ticker, exc)
-                self._trip_agent(self._swing_breaker, reason=str(exc))
-                return
+            except Exception as exc:  # noqa: BLE001 — one position's failed exit must not abort the others
+                logger.error("%s: swing exit order FAILED: %s", ticker, exc)
 
     def _build_thesis_candidates(self, today: date, universe: list | None = None) -> list[str]:
         """Screens the quality universe for names pulled back from their 52-week high.
@@ -1524,16 +1518,9 @@ class TradingRuntime:
 
     # ---- Phase 3: Intraday monitoring ----
     def intraday_monitoring(self) -> None:
-        # All 3 breakers must be halted before we skip reconciliation — if any
-        # agent is still active, we need fresh position state.
-        all_halted = (
-            self._intraday_breaker.is_halted
-            and self._options_breaker.is_halted
-            and self._thesis_breaker.is_halted
-            and self._swing_breaker.is_halted
-        )
-        if all_halted:
-            return
+        # Reconciliation and exit checks run UNCONDITIONALLY. Breakers gate
+        # new entries only — a tripped breaker means positions are losing,
+        # which is precisely when stop-loss enforcement must keep running.
         self._reconcile_positions()
         if self._settings.options_track_enabled or self._settings.vol_options_track_enabled:
             self._reconcile_option_positions()
@@ -1575,13 +1562,12 @@ class TradingRuntime:
             elif self._swing_breaker.check_profit_target(equity):
                 self._lock_in_profit(reason=f"daily profit target reached, equity={equity:.2f}", breaker=self._swing_breaker)
 
-        # ── Per-agent exit checks ─────────────────────────────────────────────
-        if not self._intraday_breaker.is_stock_halted:
-            self._check_intraday_exits(equity)
-            self._check_orb_exits(equity)
-        if self._settings.options_track_enabled and not self._options_breaker.is_options_halted:
+        # ── Per-agent exit checks — unconditional; breakers gate entries only ─
+        self._check_intraday_exits(equity)
+        self._check_orb_exits(equity)
+        if self._settings.options_track_enabled:
             self._check_options_exits(equity)
-        if self._settings.vol_options_track_enabled and not self._options_breaker.is_options_halted:
+        if self._settings.vol_options_track_enabled:
             self._check_vol_options_exits(equity)
         if self._settings.swing_track_enabled:
             self._check_swing_exits(equity)
@@ -1648,8 +1634,6 @@ class TradingRuntime:
         """
         today = date.today()
         for position in self._state_store.get_positions():
-            if self._breaker.is_stock_halted:
-                return
             ticker = position["ticker"]
             if position["quantity"] <= 0 or position["strategy"] in ("orb", "swing"):
                 continue  # ORB: fixed-price stops via _check_orb_exits; swing: regime+news exits via _check_swing_exits
@@ -1693,8 +1677,6 @@ class TradingRuntime:
 
             self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
             try:
-                self._breaker.assert_not_tripped()
-                self._breaker.validate_position_size(proposal, equity)
                 result = self._broker.submit_order(proposal)
                 logger.info("%s: intraday exit order result=%s", ticker, result)
                 self._record_order_event(ticker, proposal, result)
@@ -1702,11 +1684,8 @@ class TradingRuntime:
                 equity = self._broker.get_equity()
                 if self._breaker.check_profit_target(equity):
                     self._lock_in_profit(reason=f"daily profit target reached after intraday exit of {ticker}, equity={equity:.2f}")
-                    return
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked intraday exit for %s: %s", ticker, exc)
-                self._trip_breaker(reason=str(exc))
-                return
+            except Exception as exc:  # noqa: BLE001 — one position's failed exit must not abort the others
+                logger.error("%s: intraday exit order FAILED: %s", ticker, exc)
 
     def _exit_params_for(self, strategy: str) -> dict:
         """Which exit-rule thresholds apply to a position is entirely a
@@ -1746,8 +1725,6 @@ class TradingRuntime:
             if o.get("side") == "sell" and o.get("status") in ("new", "partially_filled", "accepted")
         }
         for position in self._state_store.get_positions():
-            if self._breaker.is_stock_halted:
-                return
             ticker = position["ticker"]
             if position["quantity"] <= 0 or position["strategy"] != "orb":
                 continue
@@ -1792,8 +1769,6 @@ class TradingRuntime:
             proposal = TradeProposal(ticker=ticker, action=Action.SELL, quantity=int(detail["qty"]), limit_price=current_price)
             self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
             try:
-                self._breaker.assert_not_tripped()
-                self._breaker.validate_position_size(proposal, equity)
                 result = self._broker.submit_order(proposal)
                 logger.info("%s: ORB exit order result=%s", ticker, result)
                 self._record_order_event(ticker, proposal, result)
@@ -1801,11 +1776,8 @@ class TradingRuntime:
                 equity = self._broker.get_equity()
                 if self._breaker.check_profit_target(equity):
                     self._lock_in_profit(reason=f"daily profit target reached after ORB exit of {ticker}, equity={equity:.2f}")
-                    return
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked ORB exit for %s: %s", ticker, exc)
-                self._trip_breaker(reason=str(exc))
-                return
+            except Exception as exc:  # noqa: BLE001 — one position's failed exit must not abort the others
+                logger.error("%s: ORB exit order FAILED: %s", ticker, exc)
 
     def _check_options_exits(self, equity: float) -> None:
         """No fixed take-profit (let a winning premium run, same philosophy
@@ -1817,8 +1789,6 @@ class TradingRuntime:
         """
         today = date.today()
         for position in self._state_store.get_option_positions():
-            if self._options_breaker.is_options_halted:
-                return
             contract_symbol = position["contract_symbol"]
             # vol_short positions use their own tastylive exit rules — see _check_vol_options_exits
             if position.get("strategy") == "vol_short":
@@ -1866,7 +1836,6 @@ class TradingRuntime:
             logger.info("%s: options exit — %s", contract_symbol, reason)
 
             try:
-                self._options_breaker.assert_options_trading_allowed()
                 contracts = int(detail["qty"])
                 result = self._broker.submit_option_order(
                     contract_symbol, side=Action.SELL, contracts=contracts, limit_price=current_price
@@ -1882,11 +1851,8 @@ class TradingRuntime:
                 equity = self._broker.get_equity()
                 if self._options_breaker.check_profit_target(equity):
                     self._lock_in_profit(reason=f"daily profit target reached after options exit of {contract_symbol}, equity={equity:.2f}", breaker=self._options_breaker)
-                    return
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked options exit for %s: %s", contract_symbol, exc)
-                self._trip_agent(self._options_breaker, reason=str(exc))
-                return
+            except Exception as exc:  # noqa: BLE001 — one position's failed exit must not abort the others
+                logger.error("%s: options exit order FAILED: %s", contract_symbol, exc)
 
     # ---- Vol options track (short premium — Natenberg/tastylive) ----
 
@@ -2282,8 +2248,6 @@ class TradingRuntime:
         for position in self._state_store.get_option_positions():
             if position.get("strategy") != "vol_short":
                 continue
-            if self._options_breaker.is_options_halted:
-                return
             contract_symbol = position["contract_symbol"]
             if position["quantity"] == 0:
                 continue
@@ -2322,7 +2286,6 @@ class TradingRuntime:
             qty = abs(int(detail["qty"]))  # positive count for the BUY-to-close order
 
             try:
-                self._options_breaker.assert_options_trading_allowed()
                 result = self._broker.submit_option_order(
                     contract_symbol, side=Action.BUY, contracts=qty, limit_price=cost_to_close
                 )
@@ -2367,11 +2330,8 @@ class TradingRuntime:
                         reason=f"daily profit target reached after vol options exit of {contract_symbol}, equity={equity:.2f}",
                         breaker=self._options_breaker,
                     )
-                    return
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked vol options exit for %s: %s", contract_symbol, exc)
-                self._trip_agent(self._options_breaker, reason=str(exc))
-                return
+            except Exception as exc:  # noqa: BLE001 — one position's failed exit must not abort the others
+                logger.error("%s: vol options exit order FAILED: %s", contract_symbol, exc)
 
     def _close_orphaned_option_legs(self, underlying: str) -> None:
         """Safety net after a failed mleg submission.
@@ -2405,7 +2365,6 @@ class TradingRuntime:
             qty = abs(int(detail["qty"]))
             side = Action.SELL if detail["qty"] > 0 else Action.BUY
             try:
-                self._options_breaker.assert_options_trading_allowed()
                 result = self._broker.submit_option_order(
                     pos["contract_symbol"], side=side,
                     contracts=qty, limit_price=detail["current_price"],
@@ -2709,8 +2668,6 @@ class TradingRuntime:
         Winning ORB positions (above entry) are left alone for the existing
         trailing stop to manage.
         """
-        if self._intraday_breaker.is_stock_halted:
-            return
         today = date.today()
         for position in self._state_store.get_positions():
             if position.get("strategy") != "orb":
@@ -2774,7 +2731,6 @@ class TradingRuntime:
             logger.info("%s: ORB pre-close exit — current %.2f below entry %.2f, closing before EOD",
                         ticker, current_price, avg_entry)
             try:
-                self._breaker.assert_not_tripped()
                 result = self._broker.submit_order(proposal)
                 self._record_order_event(ticker, proposal, result)
                 pnl = self._state_store.record_realized_sale(
@@ -2783,10 +2739,6 @@ class TradingRuntime:
                 )
                 self._trigger_reflection(ticker, "orb", pnl)
                 self._state_store.delete_position(ticker)
-            except CircuitBreakerTripped as exc:
-                logger.error("Circuit breaker blocked pre-close exit for %s: %s", ticker, exc)
-                self._trip_breaker(reason=str(exc))
-                return
             except Exception as exc:  # noqa: BLE001
                 logger.warning("%s: pre-close ORB exit failed: %s", ticker, exc)
 
@@ -2878,10 +2830,19 @@ class TradingRuntime:
         self._trip_agent(self._intraday_breaker, reason)
 
     def _lock_in_profit(self, reason: str, breaker: CircuitBreaker | None = None) -> None:
-        """Hitting the daily $ target — stops STOCKS only for the specific agent.
+        """Hitting the daily $ target — blocks NEW stock entries for the
+        specific agent for the rest of the day (via the _profit_locked flag,
+        already set by check_profit_target at the call site).
+
+        Deliberately does NOT liquidate positions: the thesis/swing edge in
+        the backtest comes entirely from multi-day winners running to the
+        trailing stop (+23% avg winner). Force-flattening the book on any
+        +2% equity day is a different, untested strategy. Per-position
+        stops/trails keep managing risk on everything already open.
         Options keep trading on their own bounded per-trade risk limits.
         """
-        self._close_stocks_and_reconcile(reason)
+        logger.info("PROFIT LOCK (new stock entries halted): %s", reason)
+        self._state_store.record_event(event_type="daily_profit_target_reached", detail=reason)
         try:
             alerting.alert_profit_locked(equity=self._broker.get_equity(), gain=0.0)
         except Exception:  # noqa: BLE001

@@ -187,6 +187,8 @@ class CircuitBreaker:
         """
         if self.daily_profit_target_usd is None:
             return False
+        if self._profit_locked:
+            return False  # already locked today — the transition fires exactly once
         if self._day_start_equity is None:
             raise RuntimeError("start_trading_day() must be called before check_profit_target()")
 
