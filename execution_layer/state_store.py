@@ -253,7 +253,17 @@ class StateStore:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._db_path)
+        """timeout=30.0 + WAL: Alpha and Protection are separate processes
+        writing the same file. The default rollback journal has a 0-second
+        busy timeout, so any write-write overlap between the two raises
+        `database is locked` immediately rather than waiting. WAL allows one
+        writer concurrent with readers and, combined with the timeout, makes
+        a same-tick collision wait and retry instead of throwing.
+        """
+        conn = sqlite3.connect(self._db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     def upsert_position(
         self,

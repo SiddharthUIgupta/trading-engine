@@ -788,6 +788,11 @@ class ProtectionRuntime:
         self._state_store.record_event(event_type="daily_profit_target_reached", detail=reason)
         if breaker:
             self._state_store.set_breaker_state(breaker.name, "profit_locked", "true")
+            # Write "halted" immediately rather than waiting for the next
+            # _sync_breaker_state_to_db() tick — otherwise there's a window
+            # (up to one intraday_monitoring interval) where Alpha can still
+            # queue new BUY intents against a bucket that just profit-locked.
+            self._state_store.set_breaker_state(breaker.name, "halted", "true")
         try:
             alerting.alert_profit_locked(equity=self._broker.get_equity(), gain=0.0)
         except Exception:  # noqa: BLE001
