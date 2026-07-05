@@ -84,6 +84,43 @@ def main() -> None:
         counts["ok"], counts["empty"], counts["failed"], elapsed,
     )
 
+    _log_easy_to_borrow_transitions(state_store, provider, candidates)
+
+
+def _log_easy_to_borrow_transitions(
+    state_store: StateStore, provider: ShortInterestSignalProvider, candidates: list[dict]
+) -> None:
+    """The flip is the signal, not the level — a ticker sitting at
+    easy_to_borrow=False for months is old news by the time this job would
+    surface it; the moment it CHANGES is what's actionable. Tracked via
+    signal_ticker_state (per-ticker, not per-candidate — see
+    state_store.py's docstring on why signal_values can't answer "the last
+    value for this ticker" unambiguously: the same ticker+date can have
+    multiple candidate_id rows across strategies).
+    """
+    with state_store._connect() as conn:
+        for candidate in candidates:
+            row = conn.execute(
+                "SELECT value FROM signal_values WHERE candidate_id=? AND signal_name=? AND signal_version=? "
+                "AND metric_name='easy_to_borrow' AND status='ok'",
+                (candidate["id"], provider.name, provider.version),
+            ).fetchone()
+            if row is None or row[0] is None:
+                continue
+
+            ticker = candidate["ticker"]
+            new_value = "true" if row[0] == 1.0 else "false"
+            old_value = state_store.get_ticker_signal_state(ticker, provider.name, "easy_to_borrow")
+
+            if old_value is not None and old_value != new_value:
+                state_store.record_event(
+                    event_type="easy_to_borrow_flip",
+                    detail=f"{ticker}: {old_value} -> {new_value}",
+                )
+                logger.info("%s: easy_to_borrow flipped %s -> %s", ticker, old_value, new_value)
+
+            state_store.set_ticker_signal_state(ticker, provider.name, "easy_to_borrow", new_value)
+
 
 if __name__ == "__main__":
     sys.exit(main())

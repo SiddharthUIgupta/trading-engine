@@ -232,6 +232,16 @@ class Settings(BaseSettings):
     short_interest_job_lookback_days: int = Field(default=7, alias="SHORT_INTEREST_JOB_LOOKBACK_DAYS")
     short_interest_staleness_caveat_days: int = Field(default=14, alias="SHORT_INTEREST_STALENESS_CAVEAT_DAYS")
 
+    # --- FINRA daily short-sale volume shadow signal (measurement only) ---
+    # Unlike short interest, FINRA's daily files ARE genuinely point-in-time
+    # queryable — lookback_days=25 covers the 20-day z-score plus buffer for
+    # missing/thin trading days. cache_dir holds raw downloaded files so a
+    # forward-return backfill never re-fetches (one file covers the whole
+    # market, ~12k tickers/day — caching matters).
+    finra_shvol_lookback_days: int = Field(default=25, alias="FINRA_SHVOL_LOOKBACK_DAYS")
+    finra_shvol_cache_dir: Path = Field(default=Path("./state/finra_shvol_cache"), alias="FINRA_SHVOL_CACHE_DIR")
+    finra_shvol_job_lookback_days: int = Field(default=7, alias="FINRA_SHVOL_JOB_LOOKBACK_DAYS")
+
     # --- Recovery scanner (market rebound / oversold bounce plays) ---
     # Deterministic screen: pulled back from 60-day high but 5d momentum
     # positive, above MA20, volume picking up. Feeds into the same consensus

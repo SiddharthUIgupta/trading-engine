@@ -186,6 +186,20 @@ CREATE TABLE IF NOT EXISTS breaker_state (
     PRIMARY KEY (breaker_name, state_key)
 );
 
+-- Same lightweight key-value shape as breaker_state, but scoped to signal
+-- tracking generically (any shadow signal provider's per-ticker "last known
+-- value", e.g. short_interest's easy_to_borrow, for transition detection) —
+-- NOT reused from breaker_state, which is specifically Protection/Alpha
+-- circuit-breaker IPC per its own docstring.
+CREATE TABLE IF NOT EXISTS signal_ticker_state (
+    ticker TEXT NOT NULL,
+    signal_name TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    last_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (ticker, signal_name, metric_name)
+);
+
 CREATE TABLE IF NOT EXISTS candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     candidate_date TEXT NOT NULL,
@@ -1058,6 +1072,33 @@ class StateStore:
 
     def is_breaker_halted(self, breaker_name: str) -> bool:
         return self.get_breaker_state(breaker_name, "halted", "false") == "true"
+
+    def set_ticker_signal_state(self, ticker: str, signal_name: str, metric_name: str, value: str) -> None:
+        """Per-ticker 'last known value' for a shadow-signal metric —
+        used for transition detection (e.g. short_interest's easy_to_borrow
+        flipping true->false). NOT signal_values: a ticker+date can have
+        multiple candidate_id rows (one per strategy that screens it that
+        day — see candidates' UNIQUE(candidate_date, strategy, ticker)),
+        which makes "the last value for this ticker" ambiguous there.
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO signal_ticker_state (ticker, signal_name, metric_name, last_value, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(ticker, signal_name, metric_name) DO UPDATE SET
+                       last_value=excluded.last_value,
+                       updated_at=excluded.updated_at""",
+                (ticker, signal_name, metric_name, value, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def get_ticker_signal_state(self, ticker: str, signal_name: str, metric_name: str) -> str | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT last_value FROM signal_ticker_state WHERE ticker=? AND signal_name=? AND metric_name=?",
+                (ticker, signal_name, metric_name),
+            ).fetchone()
+        return row[0] if row else None
 
     def log_candidate(
         self,
