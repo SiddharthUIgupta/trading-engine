@@ -37,6 +37,11 @@ Rule-based exit checks (stop-loss, trailing stop, profit target) — LLM only in
 - **Vowpal Wabbit contextual bandit** — online logistic regression that learns which track × regime × agent signal patterns win. Warm-started on 8,672 historical examples. Win probability injected into every agent prompt.
 - **Reflection agent** — after every closed trade, writes a structured lesson stored in SQLite and injected into future consensus prompts for similar setups.
 
+### Shadow signals — measurement only, zero trading influence
+Every screened candidate is scored by pluggable signal providers *after* the trade decision is already made — nothing here can affect a trade. Scores are logged alongside each candidate's eventual forward return so `scripts/signal_uplift.py` can measure real predictive power (Spearman IC, n≥300 gate) before any signal is ever considered for promotion into the risk gate — a separate, explicit, future decision (see `CLAUDE.md` → "Signal lifecycle").
+- **Kronos-small** — a vendored open-source financial time-series model (24.7M params). Samples 30 Monte Carlo price paths per candidate to compute touch-probability, median return, and dispersion.
+- **Short interest / squeeze potential** — real short-interest data (OpenBB/yfinance) and borrow-availability flags (Alpaca), the kind of signal that would have flagged GameStop/AMC-style setups. Tracks metric staleness explicitly (short-interest data is inherently ~20 days lagged — FINRA's settlement cadence) rather than assuming it away.
+
 ---
 
 ## Risk management
@@ -72,6 +77,7 @@ Rule-based exit checks (stop-loss, trailing stop, profit target) — LLM only in
 | Pre-filter factors | qlib Alpha158 formulas (KBAR, VSUMP/VSUMN, ILLIQ, R², Williams %R) |
 | Agent consensus | [LangGraph](https://langchain-ai.github.io/langgraph/) + Anthropic Claude |
 | Reinforcement learning | [Vowpal Wabbit](https://github.com/VowpalWabbit/vowpal_wabbit) contextual bandit |
+| Shadow signals | [Kronos-small](https://github.com/shiyu-coder/Kronos) (vendored, MIT) forecasting model via PyTorch (CPU); short-interest via OpenBB/yfinance + Alpaca |
 | Backtesting | [backtrader](https://github.com/mementum/backtrader) walk-forward backtests |
 | Scheduling | APScheduler |
 | State | SQLite |
@@ -113,9 +119,16 @@ python scripts/backtest.py --strategy momentum --years 2
 python scripts/backtest.py --strategy orb      --years 2
 ```
 
+### Shadow signals (manually invoked, not scheduled — see README "Shadow signals" above)
+```bash
+python scripts/kronos_shadow_signal_job.py           # scores un-enriched candidates with Kronos-small
+python scripts/short_interest_shadow_signal_job.py   # scores un-enriched candidates with short-interest data
+python scripts/signal_uplift.py                      # per-signal IC report + staleness + PROMOTE/DELETE verdict
+```
+
 ### Tests
 ```bash
-pytest   # 399 tests
+pytest   # 440 tests
 ```
 
 ---

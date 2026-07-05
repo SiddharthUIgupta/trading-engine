@@ -108,6 +108,31 @@ class FundamentalsSnapshot(StrictModel):
     revisions: list[AnalystRevision] = Field(default_factory=list)
 
 
+class ShortInterestSnapshot(StrictModel):
+    """FINRA bi-weekly settlement data, republished by yfinance/OpenBB.
+    `as_of` is the actual settlement date this data reflects — always
+    materially in the past (~20 days is typical), never "today". Use this
+    for any point-in-time bookkeeping, never the fetch time.
+    """
+    symbol: str
+    as_of: date
+    shares_short: int = Field(ge=0)
+    short_percent_of_float: float | None = Field(default=None, ge=0)
+    days_to_cover: float | None = Field(default=None, ge=0)
+    shares_short_prior_month: int | None = Field(default=None, ge=0)
+
+
+class ShortableStatus(StrictModel):
+    """Alpaca's current view of borrow availability — a live snapshot with
+    no historical time series, unlike ShortInterestSnapshot's settlement
+    date. `as_of` is always "now" (fetch time), by construction.
+    """
+    symbol: str
+    as_of: datetime
+    shortable: bool
+    easy_to_borrow: bool
+
+
 class MarketMover(StrictModel):
     """One row from an OpenBB discovery screen (active/gainers/losers) —
     cheap, already-computed price/volume stats with no extra fetch needed,

@@ -7,12 +7,12 @@ import numpy as np
 import pytest
 
 from execution_layer.state_store import StateStore
-from scripts.signal_uplift import compute_uplift, _residualize, _spearman, _MIN_SAMPLE, _PROMOTE_THRESHOLD
+from scripts.signal_uplift import compute_uplift, _median_staleness_days, _residualize, _spearman, _MIN_SAMPLE, _PROMOTE_THRESHOLD
 
 
 def _seed(
     store: StateStore, n: int, signal_name: str = "kronos_small", signal_version: str = "v1",
-    metric_name: str = "p_touch_win", value_fn=None, screen_score_fn=None,
+    metric_name: str = "p_touch_win", value_fn=None, screen_score_fn=None, metric_as_of_fn=None,
 ) -> None:
     rng = np.random.default_rng(42)
     for i in range(n):
@@ -27,7 +27,10 @@ def _seed(
         fwd_ret = rng.normal(0, 0.1)
         store.update_candidate_forward_return(cid, 21, fwd_ret)
         value = value_fn(i, fwd_ret) if value_fn else rng.normal(0, 0.1)
-        store.record_signal_values(cid, signal_name, signal_version, {metric_name: value}, status="ok")
+        metric_as_of = metric_as_of_fn(d) if metric_as_of_fn else d.isoformat()
+        store.record_signal_values(
+            cid, signal_name, signal_version, {metric_name: value}, status="ok", metric_as_of=metric_as_of,
+        )
 
 
 @pytest.fixture
@@ -94,6 +97,37 @@ def test_incremental_ic_controls_for_screen_score():
 
     assert raw_ic > 0.5, "raw IC should be inflated by the shared screen_score driver"
     assert abs(incremental_ic) < 0.2, "incremental IC should be much smaller once screen_score is controlled for"
+
+
+def test_pit_clean_signal_reports_zero_staleness(store: StateStore):
+    """A Kronos-like signal where metric_as_of == candidate_date always
+    (the default, when a provider has no get_metric_as_of) should report
+    exactly 0 staleness — a confirmation, not an assumption.
+    """
+    _seed(store, n=_MIN_SAMPLE + 10)  # default metric_as_of_fn = candidate_date
+    results = compute_uplift(store)
+    assert len(results) == 1
+    assert results[0]["median_staleness_days"] == 0.0
+
+
+def test_current_snapshot_signal_reports_real_staleness(store: StateStore):
+    """A short-interest-like signal where metric_as_of consistently lags
+    candidate_date (e.g. by 20 days, matching FINRA's settlement cadence)
+    must have that staleness surfaced, not silently reported as 0.
+    """
+    _seed(
+        store, n=_MIN_SAMPLE + 10,
+        metric_as_of_fn=lambda candidate_date: (candidate_date - timedelta(days=20)).isoformat(),
+    )
+    results = compute_uplift(store)
+    assert len(results) == 1
+    assert results[0]["median_staleness_days"] == pytest.approx(20.0)
+
+
+def test_median_staleness_days_returns_none_when_never_recorded():
+    import pandas as pd
+    group = pd.DataFrame({"metric_as_of": [None, None], "candidate_date": ["2026-01-01", "2026-01-02"]})
+    assert _median_staleness_days(group) is None
 
 
 def test_screen_score_populated_uses_incremental_path(store: StateStore):

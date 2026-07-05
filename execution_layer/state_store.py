@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS signal_values (
     value REAL,
     status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','empty','failed')),
     created_at TEXT NOT NULL,
+    metric_as_of TEXT,
     UNIQUE(candidate_id, signal_name, signal_version, metric_name)
 );
 """
@@ -278,6 +279,9 @@ class StateStore:
             realized_opt_cols = {row[1] for row in conn.execute("PRAGMA table_info(realized_option_sales)")}
             if "strategy_version" not in realized_opt_cols:
                 conn.execute("ALTER TABLE realized_option_sales ADD COLUMN strategy_version TEXT")
+            signal_value_cols = {row[1] for row in conn.execute("PRAGMA table_info(signal_values)")}
+            if "metric_as_of" not in signal_value_cols:
+                conn.execute("ALTER TABLE signal_values ADD COLUMN metric_as_of TEXT")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1143,24 +1147,36 @@ class StateStore:
         signal_version: str,
         metrics: dict[str, float | None],
         status: str = "ok",
+        metric_as_of: str | None = None,
     ) -> None:
         """Writes one row per metric for a single provider run against one
         candidate. `status` applies to every metric in this call — a provider
         that fails writes NULL values with status='failed' for every metric
         it would otherwise have emitted, so failures are visible in the
         ledger rather than silently absent rows.
+
+        `metric_as_of` is when the metric was actually true, not when this
+        write happened. For PIT-clean sources (e.g. price history) this
+        should be candidate_date — no staleness. For current-snapshot-only
+        sources (e.g. short interest, which has no free historical time
+        series), this should be the source's own as-of date so
+        scripts/signal_uplift.py can surface staleness rather than assume
+        it away. Defaults to None, not "now" — a caller that doesn't pass
+        this is a signal that staleness tracking wasn't considered, which
+        should be visible as NULL, not silently backfilled with today's date.
         """
         now = datetime.utcnow().isoformat()
         with closing(self._connect()) as conn:
             for metric_name, value in metrics.items():
                 conn.execute(
                     """INSERT INTO signal_values
-                           (candidate_id, signal_name, signal_version, metric_name, value, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                           (candidate_id, signal_name, signal_version, metric_name, value, status, created_at, metric_as_of)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(candidate_id, signal_name, signal_version, metric_name) DO UPDATE SET
                            value=excluded.value,
-                           status=excluded.status""",
-                    (candidate_id, signal_name, signal_version, metric_name, value, status, now),
+                           status=excluded.status,
+                           metric_as_of=excluded.metric_as_of""",
+                    (candidate_id, signal_name, signal_version, metric_name, value, status, now, metric_as_of),
                 )
             conn.commit()
 

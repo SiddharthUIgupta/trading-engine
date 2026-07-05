@@ -69,10 +69,10 @@ def store(tmp_path: Path) -> StateStore:
 def _get_rows(store: StateStore, candidate_id: int, signal_name: str) -> list[dict]:
     with store._connect() as conn:
         rows = conn.execute(
-            "SELECT metric_name, value, status FROM signal_values WHERE candidate_id=? AND signal_name=?",
+            "SELECT metric_name, value, status, metric_as_of FROM signal_values WHERE candidate_id=? AND signal_name=?",
             (candidate_id, signal_name),
         ).fetchall()
-    return [{"metric_name": r[0], "value": r[1], "status": r[2]} for r in rows]
+    return [{"metric_name": r[0], "value": r[1], "status": r[2], "metric_as_of": r[3]} for r in rows]
 
 
 def test_ok_provider_writes_correct_rows(store: StateStore):
@@ -87,6 +87,47 @@ def test_ok_provider_writes_correct_rows(store: StateStore):
     assert rows["metric_a"]["value"] == 0.5
     assert rows["metric_a"]["status"] == "ok"
     assert rows["metric_b"]["value"] == -0.2
+
+
+def test_provider_without_get_metric_as_of_defaults_to_candidate_date(store: StateStore):
+    """Kronos (and any price-history-only provider) has no get_metric_as_of
+    — candidate_date is the correct as-of by construction, zero staleness.
+    """
+    cid = _seed_candidate(store)
+    today_str = date.today().isoformat()
+    run_provider_on_candidates(
+        _OkProvider(), [{"id": cid, "ticker": "AAPL", "candidate_date": today_str}],
+        store, build_pit_snapshot=lambda t, d: _snapshot(),
+        expected_metric_names=["metric_a", "metric_b"], timeout_s=5.0,
+    )
+    rows = {r["metric_name"]: r for r in _get_rows(store, cid, "stub_ok")}
+    assert rows["metric_a"]["metric_as_of"] == today_str
+
+
+class _CustomAsOfProvider:
+    name = "stub_custom_as_of"
+    version = "v1"
+
+    def compute(self, ticker, pit_snapshot):
+        return {"metric_a": 1.0}
+
+    def get_metric_as_of(self, ticker, candidate_date, result):
+        return "2020-01-01"  # deliberately different from candidate_date
+
+
+def test_provider_with_get_metric_as_of_uses_custom_value(store: StateStore):
+    """A provider like short_interest, whose data reflects a settlement
+    date earlier than candidate_date, must have that staleness recorded —
+    not silently defaulted to candidate_date.
+    """
+    cid = _seed_candidate(store)
+    run_provider_on_candidates(
+        _CustomAsOfProvider(), [{"id": cid, "ticker": "AAPL", "candidate_date": date.today().isoformat()}],
+        store, build_pit_snapshot=lambda t, d: _snapshot(),
+        expected_metric_names=["metric_a"], timeout_s=5.0,
+    )
+    rows = _get_rows(store, cid, "stub_custom_as_of")
+    assert rows[0]["metric_as_of"] == "2020-01-01"
 
 
 def test_provider_returning_none_is_empty_not_failed(store: StateStore):
@@ -176,10 +217,31 @@ def test_lesson_store_and_prompt_construction_never_reference_signal_values():
 def test_shadow_signal_modules_never_import_execution_layer_protection():
     """Guard against scope creep: shadow_signals.py / kronos_provider.py must
     never import protection_plane or touch order_intents/breaker_state.
+
+    Uses ast for the import check, not string matching — a plain substring
+    search on "protection_plane" would false-positive the moment a docstring
+    explains this exact constraint in prose (this bit an equivalent check in
+    test_alpaca_reference_client.py — see that test's docstring).
     """
+    import ast
+
     repo_root = Path(__file__).resolve().parent.parent
-    for filename in ("shadow_signals.py", "kronos_provider.py"):
-        source = (repo_root / "analyst_layer" / filename).read_text()
-        assert "protection_plane" not in source
-        assert "order_intents" not in source
-        assert "breaker_state" not in source
+    for filename in ("shadow_signals.py", "kronos_provider.py", "short_interest_provider.py"):
+        path = repo_root / "analyst_layer" / filename
+        source = path.read_text()
+        tree = ast.parse(source)
+
+        imported_modules = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.append(node.module)
+
+        # state_store IS expected (that's how a signal persists its measurement) —
+        # only protection_plane specifically is the forbidden import here.
+        assert not any("protection_plane" in m for m in imported_modules), f"{filename} imports protection_plane"
+        # order_intents/breaker_state are table names, not importable modules —
+        # a real string check still makes sense for these (no AST equivalent).
+        assert "order_intents" not in source, f"{filename} references order_intents"
+        assert "breaker_state" not in source, f"{filename} references breaker_state"

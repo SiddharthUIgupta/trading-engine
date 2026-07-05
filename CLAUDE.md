@@ -55,6 +55,8 @@ A signal (any `analyst_layer/shadow_signals.py` provider) is always in exactly o
 
 `scripts/signal_uplift.py`'s verdict at n>=300 is authoritative: `PROMOTE-CANDIDATE` or `DELETE-CANDIDATE`. Below n=300, "INSUFFICIENT SAMPLE" — no conclusions, no promotion, no deletion.
 
+Current-snapshot-only signals (no free point-in-time history — e.g. `short_interest`, which only has a ~20-day-stale "current" settlement snapshot, not a queryable historical series like price-based signals) report `median_staleness_days` alongside their verdict. The n>=300 gate is necessary but not sufficient for these — any `PROMOTE-CANDIDATE` verdict with non-zero staleness needs manual review before it's trusted, since the measurement may have leaked future information into the correlation.
+
 ---
 
 ## Evidence protocol — how to make claims

@@ -47,6 +47,22 @@ def _residualize(y: pd.Series, x: pd.Series) -> pd.Series:
     return y - (slope * x + intercept)
 
 
+def _median_staleness_days(group: pd.DataFrame) -> float | None:
+    """candidate_date - metric_as_of, in days. For PIT-clean sources (e.g.
+    Kronos, where metric_as_of == candidate_date always) this is always 0 —
+    a useful confirmation, not just an assumption. For current-snapshot-only
+    sources (e.g. short interest) this surfaces real staleness next to the
+    verdict rather than silently ignoring it. None if metric_as_of was never
+    recorded (a provider that predates this tracking, or a bug).
+    """
+    as_of = pd.to_datetime(group["metric_as_of"], errors="coerce")
+    candidate_date = pd.to_datetime(group["candidate_date"], errors="coerce")
+    if as_of.isna().all():
+        return None
+    staleness = (candidate_date - as_of).dt.days
+    return float(staleness.median())
+
+
 def _spearman(a: pd.Series, b: pd.Series) -> float:
     """Spearman correlation via rank + Pearson — pandas.Series.corr(method=
     "spearman") looks scipy-free but actually imports scipy.stats.spearmanr
@@ -70,8 +86,8 @@ def compute_uplift(store: StateStore) -> list[dict]:
             conn,
         )
         joined = pd.read_sql_query(
-            """SELECT sv.signal_name, sv.signal_version, sv.metric_name, sv.value,
-                      c.screen_score, c.fwd_ret_21d
+            """SELECT sv.signal_name, sv.signal_version, sv.metric_name, sv.value, sv.metric_as_of,
+                      c.screen_score, c.fwd_ret_21d, c.candidate_date
                FROM signal_values sv
                JOIN candidates c ON c.id = sv.candidate_id
                WHERE sv.status = 'ok' AND sv.value IS NOT NULL AND c.fwd_ret_21d IS NOT NULL""",
@@ -94,6 +110,7 @@ def compute_uplift(store: StateStore) -> list[dict]:
             "signal_version": signal_version,
             "metric_name": metric_name,
             "n": n,
+            "median_staleness_days": _median_staleness_days(group) if group is not None else None,
         }
         if n < _MIN_SAMPLE:
             row["status"] = "INSUFFICIENT SAMPLE"
@@ -137,10 +154,15 @@ def main() -> None:
     for r in results:
         header = f"{r['signal_name']} / {r['signal_version']} / {r['metric_name']}  (n={r['n']})"
         print(header)
+        staleness = r.get("median_staleness_days")
+        staleness_str = f"{staleness:.0f}d" if staleness is not None else "n/a"
+        print(f"  median staleness (candidate_date - metric_as_of): {staleness_str}")
         if r["status"] == "INSUFFICIENT SAMPLE":
             print("  INSUFFICIENT SAMPLE — no conclusions")
         else:
             print(f"  raw IC={r['raw_ic']:+.4f}  incremental IC={r['incremental_ic']:+.4f}  -> {r['verdict']}")
+            if staleness and staleness > 0:
+                print("  NOTE: non-zero staleness — per CLAUDE.md Signal lifecycle, any PROMOTE-CANDIDATE here needs manual staleness review before it's trusted.")
         print()
 
 

@@ -221,6 +221,17 @@ class Settings(BaseSettings):
     kronos_max_context: int = Field(default=512, alias="KRONOS_MAX_CONTEXT")
     kronos_inference_timeout_s: float = Field(default=120.0, alias="KRONOS_INFERENCE_TIMEOUT_S")
 
+    # --- Short interest / squeeze-potential shadow signal (measurement only) ---
+    # No free source has a point-in-time historical time series for this —
+    # only a "current" settlement snapshot, itself ~20 days stale (FINRA's
+    # bi-weekly reporting cadence). lookback_days=7 (not Kronos's 30) keeps
+    # the job scoped to reasonably fresh candidates; staleness_caveat_days=14
+    # is used by scripts/signal_uplift.py to flag verdicts that need manual
+    # review — see CLAUDE.md "Signal lifecycle".
+    short_interest_provider: str = Field(default="yfinance", alias="SHORT_INTEREST_PROVIDER")
+    short_interest_job_lookback_days: int = Field(default=7, alias="SHORT_INTEREST_JOB_LOOKBACK_DAYS")
+    short_interest_staleness_caveat_days: int = Field(default=14, alias="SHORT_INTEREST_STALENESS_CAVEAT_DAYS")
+
     # --- Recovery scanner (market rebound / oversold bounce plays) ---
     # Deterministic screen: pulled back from 60-day high but 5d momentum
     # positive, above MA20, volume picking up. Feeds into the same consensus

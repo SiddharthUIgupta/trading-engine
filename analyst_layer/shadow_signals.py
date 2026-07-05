@@ -29,6 +29,15 @@ class SignalProvider(Protocol):
     Raising, or exceeding the harness's timeout, is Failed. Either way the
     harness — not the provider — is responsible for making sure one
     candidate's problem never blocks or delays the next.
+
+    Optionally, a provider may also implement
+    `get_metric_as_of(ticker, candidate_date, result) -> str | None` if its
+    metrics reflect a different point in time than candidate_date itself
+    (e.g. short interest's settlement date, which lags candidate_date by
+    design — see data_layer.models.ShortInterestSnapshot). The harness
+    checks for this via getattr, so providers that don't need it (price-
+    history-only sources like Kronos, where candidate_date IS the correct
+    as-of date) require no changes.
     """
 
     name: str
@@ -114,6 +123,10 @@ def run_provider_on_candidates(
             continue
 
         counts["ok"] += 1
-        state_store.record_signal_values(candidate_id, provider.name, provider.version, result, status="ok")
+        get_metric_as_of = getattr(provider, "get_metric_as_of", None)
+        metric_as_of = get_metric_as_of(ticker, candidate_date, result) if get_metric_as_of else candidate_date
+        state_store.record_signal_values(
+            candidate_id, provider.name, provider.version, result, status="ok", metric_as_of=metric_as_of,
+        )
 
     return counts

@@ -32,6 +32,7 @@ from data_layer.models import (
     PriceSeries,
     SentimentPolarity,
     SentimentSnapshot,
+    ShortInterestSnapshot,
     ThesisCandidate,
     VolatilitySnapshot,
 )
@@ -259,6 +260,33 @@ class OpenBBDataClient:
             return int(row["shares_float"])
         except (KeyError, TypeError, ValueError) as exc:
             raise DataValidationError(f"shares_float for {symbol} failed validation: {exc}") from exc
+
+    @_RETRYABLE
+    def get_short_interest_snapshot(self, symbol: str, provider: str = "yfinance") -> ShortInterestSnapshot:
+        """FINRA bi-weekly settlement data, republished via this provider.
+        `as_of` is the report's own settlement date (~20 days stale is
+        typical and expected) — never today's date. Raises on failure like
+        every other method here; callers decide Empty vs Failed semantics.
+        """
+        obb = self._client()
+        try:
+            row = obb.equity.ownership.share_statistics(symbol=symbol, provider=provider).to_df().reset_index().iloc[0]
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderFetchError(f"share_statistics fetch failed for {symbol}: {exc}") from exc
+
+        try:
+            return ShortInterestSnapshot(
+                symbol=symbol,
+                as_of=row["date"],
+                shares_short=int(row["short_interest"]),
+                short_percent_of_float=_safe_float(row.get("short_percent_of_float")),
+                days_to_cover=_safe_float(row.get("days_to_cover")),
+                shares_short_prior_month=(
+                    int(row["short_interest_prev_month"]) if row.get("short_interest_prev_month") is not None else None
+                ),
+            )
+        except (ValidationError, KeyError, TypeError, ValueError) as exc:
+            raise DataValidationError(f"short interest for {symbol} failed validation: {exc}") from exc
 
     @_RETRYABLE
     def get_option_chain(self, symbol: str, provider: str = "yfinance") -> list[OptionContract]:
