@@ -18,6 +18,16 @@ from pathlib import Path
 
 from analyst_layer.schemas import ConsensusPayload
 
+# ORB options position cap fix (commit fb9f6d1, 2026-06-29 17:50:15 UTC) is the
+# only documented strategy-relevant change to the options bucket's risk
+# parameters so far (see ARCHITECTURE.md "Realized Performance" — before this,
+# the track accumulated 30 simultaneous positions with no cap). Historical
+# realized_option_sales rows are backfilled against this exact commit
+# timestamp by scripts/backfill_strategy_version.py, not guessed. Bump this
+# string (and add the next backfill date) the next time options risk
+# parameters materially change.
+CURRENT_OPTIONS_STRATEGY_VERSION = "orb_options_v2"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
     ticker TEXT PRIMARY KEY,
@@ -92,7 +102,8 @@ CREATE TABLE IF NOT EXISTS realized_option_sales (
     sale_price REAL NOT NULL,
     cost_basis REAL NOT NULL,
     realized_pnl REAL NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    strategy_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_lessons (
@@ -195,6 +206,20 @@ CREATE TABLE IF NOT EXISTS candidates (
     created_at TEXT NOT NULL,
     UNIQUE(candidate_date, strategy, ticker)
 );
+
+-- Shadow-only. Do not JOIN this into any prompt-construction or gating path
+-- without an explicit promotion decision (see CLAUDE.md Signal lifecycle).
+CREATE TABLE IF NOT EXISTS signal_values (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+    signal_name TEXT NOT NULL,
+    signal_version TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    value REAL,
+    status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','empty','failed')),
+    created_at TEXT NOT NULL,
+    UNIQUE(candidate_id, signal_name, signal_version, metric_name)
+);
 """
 
 
@@ -250,6 +275,9 @@ class StateStore:
             lesson_cols = {row[1] for row in conn.execute("PRAGMA table_info(agent_lessons)")}
             if "score" not in lesson_cols:
                 conn.execute("ALTER TABLE agent_lessons ADD COLUMN score REAL NOT NULL DEFAULT 1.0")
+            realized_opt_cols = {row[1] for row in conn.execute("PRAGMA table_info(realized_option_sales)")}
+            if "strategy_version" not in realized_opt_cols:
+                conn.execute("ALTER TABLE realized_option_sales ADD COLUMN strategy_version TEXT")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -449,21 +477,28 @@ class StateStore:
         return None if row is None else _row_to_option_position(row)
 
     def record_realized_option_sale(
-        self, contract_symbol: str, underlying_symbol: str, sale_date: date, contracts: int, sale_price: float, cost_basis: float
+        self, contract_symbol: str, underlying_symbol: str, sale_date: date, contracts: int, sale_price: float, cost_basis: float,
+        strategy_version: str = CURRENT_OPTIONS_STRATEGY_VERSION,
     ) -> float:
         """Mirrors record_realized_sale, but each contract controls 100
         shares — realized P&L must reflect that multiplier to be a real
         dollar figure, not just a per-share-equivalent difference.
+
+        strategy_version defaults to the current live version — every new
+        trade closes under today's code, so this needs no lookup. Historical
+        rows recorded before this column existed are backfilled separately
+        by scripts/backfill_strategy_version.py against the actual commit
+        timestamp of the last risk-relevant change, not guessed.
         """
         realized_pnl = (sale_price - cost_basis) * contracts * 100
         with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO realized_option_sales "
-                "(contract_symbol, underlying_symbol, sale_date, contracts, sale_price, cost_basis, realized_pnl, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(contract_symbol, underlying_symbol, sale_date, contracts, sale_price, cost_basis, realized_pnl, created_at, strategy_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     contract_symbol, underlying_symbol, sale_date.isoformat(), contracts,
-                    sale_price, cost_basis, realized_pnl, datetime.utcnow().isoformat(),
+                    sale_price, cost_basis, realized_pnl, datetime.utcnow().isoformat(), strategy_version,
                 ),
             )
             conn.commit()
@@ -472,7 +507,7 @@ class StateStore:
     def get_all_realized_option_sales(self, limit: int = 200) -> list[dict]:
         with closing(self._connect()) as conn:
             cursor = conn.execute(
-                "SELECT contract_symbol, underlying_symbol, sale_date, contracts, sale_price, cost_basis, realized_pnl, created_at "
+                "SELECT contract_symbol, underlying_symbol, sale_date, contracts, sale_price, cost_basis, realized_pnl, created_at, strategy_version "
                 "FROM realized_option_sales ORDER BY id DESC LIMIT ?",
                 (limit,),
             )
@@ -481,6 +516,29 @@ class StateStore:
             {
                 "contract_symbol": r[0], "underlying_symbol": r[1], "sale_date": r[2], "contracts": r[3],
                 "sale_price": r[4], "cost_basis": r[5], "realized_pnl": r[6], "created_at": r[7],
+                "strategy_version": r[8],
+            }
+            for r in rows
+        ]
+
+    def get_realized_option_pnl_by_strategy_version(self) -> list[dict]:
+        """For P&L reporting split by strategy_version — see CLAUDE.md
+        "Financial opinions require a data pull first": only
+        CURRENT_OPTIONS_STRATEGY_VERSION's stats are decision-relevant for a
+        new trade; older versions are context only, never evidence for or
+        against a new trade under the current code.
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(strategy_version, 'unversioned'), COUNT(*), SUM(realized_pnl) "
+                "FROM realized_option_sales GROUP BY COALESCE(strategy_version, 'unversioned')"
+            ).fetchall()
+        return [
+            {
+                "strategy_version": r[0],
+                "trade_count": r[1],
+                "total_realized_pnl": r[2],
+                "is_current": r[0] == CURRENT_OPTIONS_STRATEGY_VERSION,
             }
             for r in rows
         ]
@@ -1064,6 +1122,69 @@ class StateStore:
         with closing(self._connect()) as conn:
             conn.execute(f"UPDATE candidates SET {col}=? WHERE id=?", (ret, candidate_id))
             conn.commit()
+
+    def get_candidate_id(self, candidate_date: date, strategy: str, ticker: str) -> int | None:
+        """Read-only lookup by the same unique key log_candidate upserts on.
+        Deliberately NOT sourced from log_candidate's lastrowid — that's an
+        INSERT ON CONFLICT DO UPDATE, and lastrowid behavior on the conflict
+        path is fragile to rely on. log_candidate itself is untouched by this.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT id FROM candidates WHERE candidate_date=? AND strategy=? AND ticker=?",
+                (candidate_date.isoformat(), strategy, ticker),
+            ).fetchone()
+        return row[0] if row else None
+
+    def record_signal_values(
+        self,
+        candidate_id: int,
+        signal_name: str,
+        signal_version: str,
+        metrics: dict[str, float | None],
+        status: str = "ok",
+    ) -> None:
+        """Writes one row per metric for a single provider run against one
+        candidate. `status` applies to every metric in this call — a provider
+        that fails writes NULL values with status='failed' for every metric
+        it would otherwise have emitted, so failures are visible in the
+        ledger rather than silently absent rows.
+        """
+        now = datetime.utcnow().isoformat()
+        with closing(self._connect()) as conn:
+            for metric_name, value in metrics.items():
+                conn.execute(
+                    """INSERT INTO signal_values
+                           (candidate_id, signal_name, signal_version, metric_name, value, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(candidate_id, signal_name, signal_version, metric_name) DO UPDATE SET
+                           value=excluded.value,
+                           status=excluded.status""",
+                    (candidate_id, signal_name, signal_version, metric_name, value, status, now),
+                )
+            conn.commit()
+
+    def get_candidates_needing_signal(
+        self, signal_name: str, signal_version: str, lookback_days: int = 30
+    ) -> list[dict]:
+        """Candidates from the last `lookback_days` with no signal_values row
+        yet for this (signal_name, signal_version) — same NOT-EXISTS pattern
+        as the forward-return backfill, just against a different child table.
+        """
+        cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT c.id, c.ticker, c.candidate_date FROM candidates c
+                   WHERE c.candidate_date >= ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM signal_values sv
+                         WHERE sv.candidate_id = c.id
+                           AND sv.signal_name = ?
+                           AND sv.signal_version = ?
+                     )""",
+                (cutoff, signal_name, signal_version),
+            ).fetchall()
+        return [{"id": r[0], "ticker": r[1], "candidate_date": r[2]} for r in rows]
 
     def record_scan_session(
         self,

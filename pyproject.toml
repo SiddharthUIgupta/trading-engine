@@ -18,6 +18,16 @@ dependencies = [
     "plotly>=6.0",
     "pandas>=2.0",
     "requests>=2.31",
+    # Kronos-small shadow signal provider (analyst_layer/vendor/kronos, MIT license).
+    # IMPORTANT on aarch64: `pip install -e .` alone will resolve the CUDA-bundled
+    # torch build (~5GB of unused NVIDIA packages on this Pi). Install torch
+    # separately first via the CPU-only index:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+    "torch>=2.0",
+    "einops==0.8.1",
+    "huggingface_hub==0.33.1",
+    "safetensors==0.6.2",
+    "tqdm==4.67.1",
 ]
 
 [project.optional-dependencies]

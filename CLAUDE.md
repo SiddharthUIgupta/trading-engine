@@ -45,6 +45,16 @@ Each of these was learned from a real production defect. Any diff that weakens o
 - The candidate ledger is the measurement instrument: every screened candidate gets a row whether traded or not. Never bypass it.
 - LLM layers are advisory until the ledger shows uplift of approved vs rejected candidates. "Shadow mode" is the default for anything new.
 
+### Signal lifecycle
+
+A signal (any `analyst_layer/shadow_signals.py` provider) is always in exactly one of three states — no permanent shadow residents:
+
+1. **Shadow** — logged to `signal_values` for every candidate, influences nothing. Default state for anything new.
+2. **Promoted** — used in the risk gate. Requires an explicit, separate, approved task — never bundled into the same change that adds the signal.
+3. **Deleted** — removed once `scripts/signal_uplift.py` shows no edge at n>=300.
+
+`scripts/signal_uplift.py`'s verdict at n>=300 is authoritative: `PROMOTE-CANDIDATE` or `DELETE-CANDIDATE`. Below n=300, "INSUFFICIENT SAMPLE" — no conclusions, no promotion, no deletion.
+
 ---
 
 ## Evidence protocol — how to make claims
@@ -80,6 +90,8 @@ Escalate only when the current rung can't answer. Three failed attempts on one r
 ### Financial opinions require a data pull first
 
 Any financial judgment — sizing, strategy change, "should we exit X", "is this track working" — must be preceded by pulling: current regime (DB), open positions (broker), relevant candidate-ledger stats, and realized P&L for the bucket. An opinion without those four is speculation and must be labeled as such in its first line. Sample-size gate applies to advice too: no recommendation from n < 100 closed trades on frozen config — say "insufficient sample" instead of extrapolating.
+
+When a bucket has a `strategy_version` split (currently: options, via `CURRENT_OPTIONS_STRATEGY_VERSION` in `state_store.py`), pull P&L split by version. Only the current version's stats are decision-relevant. Older versions may be shown for context but must be labeled "prior strategy — not evidence about current agents" and never cited for or against a new trade.
 
 ---
 

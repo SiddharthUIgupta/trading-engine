@@ -210,6 +210,17 @@ class Settings(BaseSettings):
     thesis_trailing_stop_pct: float = Field(default=0.10, alias="THESIS_TRAILING_STOP_PCT")
     thesis_trailing_stop_activation_pct: float = Field(default=0.20, alias="THESIS_TRAILING_STOP_ACTIVATION_PCT")
 
+    # --- Kronos-small shadow signal (measurement only — see analyst_layer/shadow_signals.py) ---
+    # lookback_bars=64 (not the model's max_context=512) is a latency-gated choice:
+    # 30 paths at 512 bars measured 666s/ticker on this Pi's CPU; 64 bars/30 paths
+    # measured ~58s/ticker, the only tested config with real safety margin under
+    # a 90s/ticker budget for the nightly batch job.
+    kronos_mc_paths: int = Field(default=30, alias="KRONOS_MC_PATHS")
+    kronos_horizon_sessions: int = Field(default=21, alias="KRONOS_HORIZON_SESSIONS")
+    kronos_lookback_bars: int = Field(default=64, alias="KRONOS_LOOKBACK_BARS")
+    kronos_max_context: int = Field(default=512, alias="KRONOS_MAX_CONTEXT")
+    kronos_inference_timeout_s: float = Field(default=120.0, alias="KRONOS_INFERENCE_TIMEOUT_S")
+
     # --- Recovery scanner (market rebound / oversold bounce plays) ---
     # Deterministic screen: pulled back from 60-day high but 5d momentum
     # positive, above MA20, volume picking up. Feeds into the same consensus

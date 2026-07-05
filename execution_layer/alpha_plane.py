@@ -573,6 +573,21 @@ class AlphaRuntime:
 
         self._backfill_candidate_forward_returns()
 
+        if date.today().weekday() == 4:  # Friday — piggyback on this job rather than a new APScheduler entry
+            try:
+                from scripts.signal_uplift import compute_uplift
+                results = compute_uplift(self._state_store)
+                lines = []
+                for r in results:
+                    header = f"{r['signal_name']}/{r['signal_version']}/{r['metric_name']} (n={r['n']})"
+                    if r["status"] == "INSUFFICIENT SAMPLE":
+                        lines.append(f"{header}: INSUFFICIENT SAMPLE")
+                    else:
+                        lines.append(f"{header}: IC={r['incremental_ic']:+.4f} -> {r['verdict']}")
+                alerting.alert_signal_uplift_summary(lines)
+            except Exception:  # noqa: BLE001 — weekly report is non-decision-path, same as alert_daily_summary above
+                pass
+
     def check_manual_trigger(self) -> None:
         from execution_layer.manual_trigger import read_and_clear_trigger
         scan = read_and_clear_trigger()

@@ -170,6 +170,26 @@ def alert_daily_summary(equity: float, realized_pnl: float, open_positions: int)
     _send(subject, html)
 
 
+def alert_signal_uplift_summary(lines: list[str]) -> None:
+    """Weekly shadow-signal report — piggybacks on the Friday post_market_logging
+    tick rather than its own APScheduler job. `lines` is one row per
+    (signal_name, signal_version, metric_name) from scripts/signal_uplift.py,
+    e.g. "kronos_small/kronos-small-v1/p_touch_win (n=412): IC=+0.041 -> PROMOTE-CANDIDATE".
+    """
+    subject = f"📈 Weekly Signal Uplift Report — {len(lines)} signal(s)"
+    rows_html = "".join(f"<li style='margin-bottom:4px'>{line}</li>" for line in lines) or "<li>No signal data yet.</li>"
+    html = f"""
+    <h2 style='color:#2563eb;margin-bottom:4px'>📈 WEEKLY SIGNAL UPLIFT REPORT</h2>
+    <p style='color:#666;margin-top:0'>{_now()}</p>
+    <ul style='font-family:monospace;font-size:13px'>{rows_html}</ul>
+    <p style='color:#999;font-size:12px;margin-top:16px'>
+      Shadow signals only — not gating any trade decision. Promotion requires a separate explicit task.<br>
+      Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
+    </p>
+    """
+    _send(subject, html)
+
+
 def alert_startup(equity: float, env: str) -> None:
     subject = f"🚀 Engine Started — {env.upper()} | Equity ${equity:,.2f}"
     html = f"""

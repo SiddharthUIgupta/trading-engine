@@ -457,14 +457,34 @@ with tab_trades:
     if not option_sales:
         st.info("No closed option trades yet.")
     else:
+        from execution_layer.state_store import CURRENT_OPTIONS_STRATEGY_VERSION
+
         odf = pd.DataFrame(option_sales)
-        owins = (odf["realized_pnl"] > 0).sum()
-        ototal = len(odf)
-        oc1, oc2, oc3 = st.columns(3)
-        oc1.metric("Total trades", ototal)
-        oc2.metric("Win rate", f"{owins / ototal:.0%}" if ototal else "0%")
-        oc3.metric("Total realized P&L", f"${odf['realized_pnl'].sum():+,.2f}")
-        st.dataframe(odf, width="stretch", hide_index=True)
+        current_df = odf[odf["strategy_version"] == CURRENT_OPTIONS_STRATEGY_VERSION]
+        prior_df = odf[odf["strategy_version"] != CURRENT_OPTIONS_STRATEGY_VERSION]
+
+        st.caption(f"Current strategy version: `{CURRENT_OPTIONS_STRATEGY_VERSION}`")
+        if current_df.empty:
+            st.info("No closed trades yet under the current strategy version.")
+        else:
+            owins = (current_df["realized_pnl"] > 0).sum()
+            ototal = len(current_df)
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("Total trades", ototal)
+            oc2.metric("Win rate", f"{owins / ototal:.0%}" if ototal else "0%")
+            oc3.metric("Total realized P&L", f"${current_df['realized_pnl'].sum():+,.2f}")
+            st.dataframe(current_df, width="stretch", hide_index=True)
+
+        if not prior_df.empty:
+            with st.expander(f"Prior strategy version(s) — {len(prior_df)} trade(s), context only"):
+                st.warning(
+                    "Prior strategy — not evidence about current agents. These trades ran under "
+                    "different risk parameters (e.g. no position cap) and must never be used to "
+                    "argue for or against a new trade under the current strategy version."
+                )
+                for version, group in prior_df.groupby("strategy_version"):
+                    st.caption(f"`{version}` — {len(group)} trades, total P&L ${group['realized_pnl'].sum():+,.2f}")
+                st.dataframe(prior_df, width="stretch", hide_index=True)
 
 # ---- Performance ----
 with tab_performance:
@@ -477,11 +497,16 @@ with tab_performance:
     all_option_sales = store.get_all_realized_option_sales(limit=1000)
     combined_sales = all_equity_sales + all_option_sales
 
-    def _show_metrics(label: str, sales: list[dict]) -> None:
+    def _show_metrics(label: str, sales: list[dict], prior_strategy_warning: bool = False) -> None:
         st.subheader(label)
         if not sales:
             st.info(f"No closed {label.lower()} trades yet.")
             return
+        if prior_strategy_warning:
+            st.warning(
+                "Prior strategy — not evidence about current agents. Ran under different risk "
+                "parameters; must never be used to argue for or against a new trade."
+            )
         m = compute_metrics(sales)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Sharpe ratio", f"{m.sharpe_ratio:.2f}" if m.sharpe_ratio is not None else "—")
@@ -494,9 +519,15 @@ with tab_performance:
         d3.metric("Avg win", f"${m.avg_win:+,.2f}")
         d4.metric("Avg loss", f"${m.avg_loss:+,.2f}")
 
+    from execution_layer.state_store import CURRENT_OPTIONS_STRATEGY_VERSION
+    current_option_sales = [s for s in all_option_sales if s.get("strategy_version") == CURRENT_OPTIONS_STRATEGY_VERSION]
+    prior_option_sales = [s for s in all_option_sales if s.get("strategy_version") != CURRENT_OPTIONS_STRATEGY_VERSION]
+
     _show_metrics("Combined (equity + options)", combined_sales)
     _show_metrics("Equity trades", all_equity_sales)
-    _show_metrics("Options trades", all_option_sales)
+    _show_metrics(f"Options trades (current: {CURRENT_OPTIONS_STRATEGY_VERSION})", current_option_sales)
+    if prior_option_sales:
+        _show_metrics("Options trades (prior strategy version(s))", prior_option_sales, prior_strategy_warning=True)
 
 # ---- Agent Decisions ----
 with tab_decisions:
