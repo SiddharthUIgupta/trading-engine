@@ -31,12 +31,16 @@ class SignalProvider(Protocol):
     candidate's problem never blocks or delays the next.
 
     Optionally, a provider may also implement
-    `get_metric_as_of(ticker, candidate_date, result) -> str | None` if its
-    metrics reflect a different point in time than candidate_date itself
-    (e.g. short interest's settlement date, which lags candidate_date by
-    design — see data_layer.models.ShortInterestSnapshot). The harness
-    checks for this via getattr, so providers that don't need it (price-
-    history-only sources like Kronos, where candidate_date IS the correct
+    `get_metric_as_of(ticker, candidate_date, result) -> str | dict[str, str | None] | None`
+    if its metrics reflect a different point in time than candidate_date
+    itself (e.g. short interest's settlement date, which lags candidate_date
+    by design — see data_layer.models.ShortInterestSnapshot). Return a single
+    string if every metric in this call shares one as-of date, or a
+    per-metric dict if they genuinely differ (e.g. short interest's
+    settlement date vs. Alpaca's live-fetch-time shortable/easy_to_borrow
+    flags — these must never silently inherit an unrelated metric's as-of).
+    The harness checks for this via getattr, so providers that don't need it
+    (price-history-only sources like Kronos, where candidate_date IS the correct
     as-of date) require no changes.
     """
 

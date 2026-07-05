@@ -22,6 +22,15 @@ At n >= 300: PROMOTE-CANDIDATE if abs(incremental_ic) >= 0.03, else
 DELETE-CANDIDATE. This script only ever reports a verdict — promoting a
 signal into the risk gate is a separate, explicit, future task (see
 CLAUDE.md "Signal lifecycle").
+
+Lookahead exclusion: any row where metric_as_of > candidate_date (the
+metric is dated AFTER the candidate it's attached to — real information
+leakage, e.g. a batch job backfilling an old candidate with a live-fetched
+flag) is hard-excluded from n and every IC calculation, structurally, not
+just flagged for manual review. Ordinary staleness (metric_as_of BEFORE
+candidate_date — e.g. a 20-day-old FINRA settlement number, which is
+exactly what the live system would have had at decision time) is not a
+leak and is not excluded — it's honest, expected, and reported as context.
 """
 from __future__ import annotations
 
@@ -47,12 +56,32 @@ def _residualize(y: pd.Series, x: pd.Series) -> pd.Series:
     return y - (slope * x + intercept)
 
 
+def _split_lookahead_contaminated(group: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Hard-excludes rows where metric_as_of > candidate_date — the metric
+    is dated AFTER the candidate it's attached to, which is real information
+    leakage (e.g. a batch job backfilling an old candidate with a value
+    fetched live today). This is structural, not a manual-review flag: a
+    human remembering to check is exactly the kind of control this repo's
+    own history shows fails (see CLAUDE.md evidence protocol). NaT
+    (metric_as_of never recorded) is NOT treated as contaminated — that's
+    "unknown provenance", a different and separately-reported condition
+    (see the None-staleness case below), not a known future-dated leak.
+    Returns (clean_rows, n_excluded).
+    """
+    as_of = pd.to_datetime(group["metric_as_of"], errors="coerce")
+    candidate_date = pd.to_datetime(group["candidate_date"], errors="coerce")
+    contaminated = as_of > candidate_date  # NaT comparisons evaluate to False, not excluded
+    return group[~contaminated], int(contaminated.sum())
+
+
 def _median_staleness_days(group: pd.DataFrame) -> float | None:
-    """candidate_date - metric_as_of, in days. For PIT-clean sources (e.g.
-    Kronos, where metric_as_of == candidate_date always) this is always 0 —
-    a useful confirmation, not just an assumption. For current-snapshot-only
-    sources (e.g. short interest) this surfaces real staleness next to the
-    verdict rather than silently ignoring it. None if metric_as_of was never
+    """candidate_date - metric_as_of, in days, over already-lookahead-clean
+    rows. For PIT-clean sources (e.g. Kronos, where metric_as_of ==
+    candidate_date always) this is always 0 — a useful confirmation, not
+    just an assumption. For current-snapshot-only sources (e.g. short
+    interest) this surfaces real staleness next to the verdict rather than
+    silently ignoring it — this is honest lag, not a leak, and is reported
+    as context, never used to exclude a row. None if metric_as_of was never
     recorded (a provider that predates this tracking, or a bug).
     """
     as_of = pd.to_datetime(group["metric_as_of"], errors="coerce")
@@ -103,14 +132,16 @@ def compute_uplift(store: StateStore) -> list[dict]:
     for _, key_row in all_ok.iterrows():
         key = (key_row["signal_name"], key_row["signal_version"], key_row["metric_name"])
         signal_name, signal_version, metric_name = key
-        group = grouped.get(key)
+        raw_group = grouped.get(key)
+        group, n_excluded = _split_lookahead_contaminated(raw_group) if raw_group is not None else (None, 0)
         n = len(group) if group is not None else 0
         row = {
             "signal_name": signal_name,
             "signal_version": signal_version,
             "metric_name": metric_name,
             "n": n,
-            "median_staleness_days": _median_staleness_days(group) if group is not None else None,
+            "n_excluded_lookahead": n_excluded,
+            "median_staleness_days": _median_staleness_days(group) if group is not None and n > 0 else None,
         }
         if n < _MIN_SAMPLE:
             row["status"] = "INSUFFICIENT SAMPLE"
@@ -154,9 +185,11 @@ def main() -> None:
     for r in results:
         header = f"{r['signal_name']} / {r['signal_version']} / {r['metric_name']}  (n={r['n']})"
         print(header)
+        if r.get("n_excluded_lookahead"):
+            print(f"  EXCLUDED {r['n_excluded_lookahead']} row(s): metric_as_of > candidate_date (lookahead leak, not counted in n or IC)")
         staleness = r.get("median_staleness_days")
         staleness_str = f"{staleness:.0f}d" if staleness is not None else "n/a"
-        print(f"  median staleness (candidate_date - metric_as_of): {staleness_str}")
+        print(f"  median staleness (candidate_date - metric_as_of), clean rows only: {staleness_str}")
         if r["status"] == "INSUFFICIENT SAMPLE":
             print("  INSUFFICIENT SAMPLE — no conclusions")
         else:

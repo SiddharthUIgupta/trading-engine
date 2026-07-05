@@ -1147,7 +1147,7 @@ class StateStore:
         signal_version: str,
         metrics: dict[str, float | None],
         status: str = "ok",
-        metric_as_of: str | None = None,
+        metric_as_of: str | dict[str, str | None] | None = None,
     ) -> None:
         """Writes one row per metric for a single provider run against one
         candidate. `status` applies to every metric in this call — a provider
@@ -1164,10 +1164,19 @@ class StateStore:
         it away. Defaults to None, not "now" — a caller that doesn't pass
         this is a signal that staleness tracking wasn't considered, which
         should be visible as NULL, not silently backfilled with today's date.
+
+        Accepts either a single string (applied to every metric in this call
+        — correct when every metric shares one legitimate as-of, e.g. all of
+        Kronos's outputs come from the same price snapshot) or a per-metric
+        dict (correct when different metrics in the same call have genuinely
+        different as-of times — e.g. short interest's settlement date vs.
+        Alpaca's live-fetch-time shortable/easy_to_borrow flags, which must
+        not silently inherit an unrelated metric's as-of date).
         """
         now = datetime.utcnow().isoformat()
         with closing(self._connect()) as conn:
             for metric_name, value in metrics.items():
+                as_of = metric_as_of.get(metric_name) if isinstance(metric_as_of, dict) else metric_as_of
                 conn.execute(
                     """INSERT INTO signal_values
                            (candidate_id, signal_name, signal_version, metric_name, value, status, created_at, metric_as_of)
@@ -1176,7 +1185,7 @@ class StateStore:
                            value=excluded.value,
                            status=excluded.status,
                            metric_as_of=excluded.metric_as_of""",
-                    (candidate_id, signal_name, signal_version, metric_name, value, status, now, metric_as_of),
+                    (candidate_id, signal_name, signal_version, metric_name, value, status, now, as_of),
                 )
             conn.commit()
 

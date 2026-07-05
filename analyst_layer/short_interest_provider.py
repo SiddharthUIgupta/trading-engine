@@ -19,6 +19,7 @@ one. Let scripts/signal_uplift.py's per-metric IC decide.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from data_layer.alpaca_reference_client import AlpacaAssetReferenceClient
 from data_layer.exceptions import DataLayerError
@@ -26,6 +27,9 @@ from data_layer.models import PriceSeries
 from data_layer.openbb_client import OpenBBDataClient
 
 logger = logging.getLogger(__name__)
+
+_OPENBB_METRICS = ("short_percent_of_float", "days_to_cover", "short_interest_mom_change")
+_ALPACA_METRICS = ("shortable", "easy_to_borrow")
 
 
 class ShortInterestSignalProvider:
@@ -38,7 +42,16 @@ class ShortInterestSignalProvider:
     def __init__(self, openbb_client: OpenBBDataClient, alpaca_client: AlpacaAssetReferenceClient) -> None:
         self._openbb = openbb_client
         self._alpaca = alpaca_client
-        self._last_as_of: str | None = None
+        # Two separate as-of clocks — the OpenBB metrics reflect FINRA's
+        # settlement date, the Alpaca flags reflect live-fetch-time "now".
+        # Blending these into one value would mislabel the Alpaca flags with
+        # a stale settlement date they have nothing to do with, and would
+        # hide the real risk: if this job ever runs late/backfilled, the
+        # Alpaca flags (fetched "now") could be future-dated relative to an
+        # older candidate — exactly the lookahead scripts/signal_uplift.py's
+        # exclusion rule is built to catch, but only if tagged correctly.
+        self._last_openbb_as_of: str | None = None
+        self._last_alpaca_as_of: str | None = None
 
     def compute(self, ticker: str, pit_snapshot: PriceSeries) -> dict[str, float] | None:
         # pit_snapshot is unused — this provider's data doesn't come from
@@ -67,7 +80,8 @@ class ShortInterestSignalProvider:
         # compute() then, only on success, immediately calls
         # get_metric_as_of() for the same candidate before moving on; no
         # concurrent compute() calls ever overlap for this instance.
-        self._last_as_of = short_interest.as_of.isoformat()
+        self._last_openbb_as_of = short_interest.as_of.isoformat()
+        self._last_alpaca_as_of = datetime.now(timezone.utc).isoformat()
 
         # All 5 keys always present, even when a given metric couldn't be
         # computed for this ticker (e.g. no prior-month data for mom_change,
@@ -83,5 +97,8 @@ class ShortInterestSignalProvider:
             "easy_to_borrow": (1.0 if shortable_status.easy_to_borrow else 0.0) if shortable_status else None,
         }
 
-    def get_metric_as_of(self, ticker: str, candidate_date: str, result: dict[str, float]) -> str | None:
-        return self._last_as_of
+    def get_metric_as_of(self, ticker: str, candidate_date: str, result: dict[str, float]) -> dict[str, str | None]:
+        return {
+            **{m: self._last_openbb_as_of for m in _OPENBB_METRICS},
+            **{m: self._last_alpaca_as_of for m in _ALPACA_METRICS},
+        }

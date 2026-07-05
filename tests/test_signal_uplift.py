@@ -124,6 +124,50 @@ def test_current_snapshot_signal_reports_real_staleness(store: StateStore):
     assert results[0]["median_staleness_days"] == pytest.approx(20.0)
 
 
+def test_lookahead_rows_hard_excluded_from_n_and_ic(store: StateStore):
+    """Regression test for the real risk a peer review caught: metric_as_of
+    > candidate_date is lookahead leakage (a metric dated AFTER the
+    candidate it's attached to — e.g. a batch job backfilling an old
+    candidate with a value fetched live today). This must be excluded from
+    n and every IC calculation structurally, not just flagged for manual
+    review — a control that depends on a human remembering to check is
+    exactly the kind of thing this repo's own history shows fails.
+    """
+    n_clean = _MIN_SAMPLE + 10
+    n_leaked = 50
+
+    # n_clean honest rows: metric_as_of == candidate_date (zero staleness, legitimate).
+    _seed(store, n=n_clean, value_fn=lambda i, fwd_ret: fwd_ret)  # perfect correlation among clean rows
+
+    # n_leaked contaminated rows: metric_as_of is 5 days AFTER candidate_date —
+    # a real future-dated leak. Seeded with pure noise (uncorrelated with fwd_ret)
+    # so if they leaked into the IC calc, they'd measurably dilute the otherwise-
+    # perfect correlation from the clean rows above.
+    rng = np.random.default_rng(99)
+    for i in range(n_leaked):
+        d = date(2030, 1, 1) + timedelta(days=i)  # separate date range, no id collision with _seed's rows
+        store.log_candidate(
+            candidate_date=d, strategy="thesis", ticker=f"LEAK{i}",
+            llm_verdict="BUY", gate_result="APPROVED", traded=True,
+        )
+        cid = store.get_candidate_id(d, "thesis", f"LEAK{i}")
+        fwd_ret = rng.normal(0, 0.1)
+        store.update_candidate_forward_return(cid, 21, fwd_ret)
+        noise_value = rng.normal(0, 1)  # uncorrelated with fwd_ret — would dilute IC if included
+        future_as_of = (d + timedelta(days=5)).isoformat()  # AFTER candidate_date — the leak
+        store.record_signal_values(
+            cid, "kronos_small", "v1", {"p_touch_win": noise_value}, status="ok", metric_as_of=future_as_of,
+        )
+
+    results = compute_uplift(store)
+    assert len(results) == 1
+    r = results[0]
+
+    assert r["n"] == n_clean, "leaked rows must not count toward n"
+    assert r["n_excluded_lookahead"] == n_leaked
+    assert r["raw_ic"] == pytest.approx(1.0, abs=1e-6), "leaked noise must not dilute the clean rows' IC"
+
+
 def test_median_staleness_days_returns_none_when_never_recorded():
     import pandas as pd
     group = pd.DataFrame({"metric_as_of": [None, None], "candidate_date": ["2026-01-01", "2026-01-02"]})

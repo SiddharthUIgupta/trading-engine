@@ -87,6 +87,12 @@ def test_get_metric_as_of_returns_the_actual_settlement_date_not_candidate_date(
     short_interest.as_of (the real settlement date), never candidate_date —
     otherwise scripts/signal_uplift.py's staleness reporting would silently
     read 0 for a signal that is, in reality, ~20 days stale.
+
+    Returns a per-metric dict, not one scalar — the OpenBB-sourced metrics
+    (short_percent_of_float, days_to_cover, short_interest_mom_change) share
+    the settlement date, but the Alpaca-sourced flags (shortable,
+    easy_to_borrow) are fetched live and must carry their own fetch-time
+    as-of, never the unrelated settlement date.
     """
     openbb = MagicMock()
     openbb.get_short_interest_snapshot.return_value = _snapshot(as_of=date(2026, 6, 15))
@@ -97,5 +103,13 @@ def test_get_metric_as_of_returns_the_actual_settlement_date_not_candidate_date(
     result = provider.compute("GME", pit_snapshot=None)
     as_of = provider.get_metric_as_of("GME", "2026-07-05", result)
 
-    assert as_of == "2026-06-15"
-    assert as_of != "2026-07-05", "must not silently fall back to candidate_date"
+    assert as_of["short_percent_of_float"] == "2026-06-15"
+    assert as_of["days_to_cover"] == "2026-06-15"
+    assert as_of["short_interest_mom_change"] == "2026-06-15"
+    assert as_of["short_percent_of_float"] != "2026-07-05", "must not silently fall back to candidate_date"
+
+    # Alpaca flags must NOT inherit the OpenBB settlement date — they have
+    # their own live-fetch-time as-of, which must be materially different.
+    assert as_of["shortable"] != as_of["short_percent_of_float"]
+    assert as_of["easy_to_borrow"] != as_of["short_percent_of_float"]
+    assert as_of["shortable"].startswith("2026-07-05"), "Alpaca flags should be fetched 'now', during this test run"
