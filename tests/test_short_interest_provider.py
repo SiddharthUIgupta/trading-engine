@@ -112,4 +112,7 @@ def test_get_metric_as_of_returns_the_actual_settlement_date_not_candidate_date(
     # their own live-fetch-time as-of, which must be materially different.
     assert as_of["shortable"] != as_of["short_percent_of_float"]
     assert as_of["easy_to_borrow"] != as_of["short_percent_of_float"]
-    assert as_of["shortable"].startswith("2026-07-05"), "Alpaca flags should be fetched 'now', during this test run"
+    # Fetched "now" during this test run — check dynamically, not a hardcoded
+    # literal date (which breaks the moment a day passes, as this did).
+    assert as_of["shortable"].startswith(datetime.utcnow().strftime("%Y-%m-%d")), \
+        "Alpaca flags should be fetched 'now', during this test run"
