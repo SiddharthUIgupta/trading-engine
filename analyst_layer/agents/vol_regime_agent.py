@@ -120,12 +120,16 @@ Key signals to weigh:
             ratio = vix.vix_current / vix.vix3m_current
             term_structure_note = f"{ratio:.2f} (VIX/VIX3M) — {'backwardation (fear spike)' if ratio > 1.0 else 'contango (normal)'}"
 
+        vix_1w_ago_note = f"{vix.vix_1w_ago:.1f}" if vix.vix_1w_ago else "N/A"
+        vix_1m_ago_note = f"{vix.vix_1m_ago:.1f}" if vix.vix_1m_ago else "N/A"
+        vix3m_current_note = f"{vix.vix3m_current:.1f}" if vix.vix3m_current else "N/A"
+
         prompt = f"""Assess the macro volatility regime for new short-premium trades on {ticker}.
 
 Current VIX: {vix.vix_current:.1f}
-VIX 1 week ago: {vix.vix_1w_ago:.1f if vix.vix_1w_ago else 'N/A'}
-VIX 1 month ago: {vix.vix_1m_ago:.1f if vix.vix_1m_ago else 'N/A'}
-VIX3M (3-month implied): {vix.vix3m_current:.1f if vix.vix3m_current else 'N/A'}
+VIX 1 week ago: {vix_1w_ago_note}
+VIX 1 month ago: {vix_1m_ago_note}
+VIX3M (3-month implied): {vix3m_current_note}
 VIX/VIX3M term structure: {term_structure_note}
 Pre-classified regime: {regime.value}
 

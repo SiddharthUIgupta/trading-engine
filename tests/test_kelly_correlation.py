@@ -153,6 +153,53 @@ def test_uncorrelated_returns_low_value():
     assert max_r < 0.7  # not guaranteed but extremely likely with random data
 
 
+# ── Regression: a strong INVERSE correlation must never be treated the same
+# as a duplicate-exposure (positive) correlation — this guard exists to catch
+# "buying QQQ when already long SPY", not to flag hedges. Previously used
+# abs(max_r), so a strongly negative (hedging) correlation was hard-blocked/
+# size-reduced exactly like a strongly positive one.
+
+def _inverse_pair(n: int = 60) -> tuple[list[float], list[float]]:
+    import math
+    import random
+    rng = random.Random(7)
+    returns = [rng.gauss(0, 0.02) for _ in range(n)]
+    up: list[float] = [100.0]
+    down: list[float] = [100.0]
+    for ret in returns:
+        up.append(up[-1] * math.exp(ret))
+        down.append(down[-1] * math.exp(-ret))
+    return up, down
+
+
+def test_strong_inverse_correlation_returns_zero_not_absolute_value():
+    proposed, held = _inverse_pair()
+    max_r, desc = check_portfolio_correlation(proposed, {"HEDGE": held})
+    assert max_r == 0.0  # not ~1.0, which abs(-0.99...) would have produced
+    assert "HEDGE" in desc  # still reported for visibility, just not penalized
+
+
+def test_strong_inverse_correlation_does_not_hard_block_via_full_pipeline():
+    proposed, held = _inverse_pair()
+    max_r, desc = check_portfolio_correlation(proposed, {"HEDGE": held})
+    fraction, reason, blocked = apply_correlation_adjustment(
+        kelly_fraction=0.04, max_correlation=max_r, correlation_description=desc,
+    )
+    assert blocked is False
+    assert fraction == 0.04  # unpenalized — a hedge is not overlapping exposure
+
+
+def test_positive_correlation_still_picked_over_inverse_when_both_held():
+    """When one held position is a near-duplicate and another is an inverse
+    hedge, the duplicate (positive) correlation must still be the one that
+    drives the block/reduce decision, not get averaged away or masked."""
+    proposed = _trending_series(60)
+    _, inverse_held = _inverse_pair()
+    max_r, desc = check_portfolio_correlation(proposed, {"DUPLICATE": proposed, "HEDGE": inverse_held})
+    assert max_r > 0.9
+    assert "DUPLICATE" in desc
+
+
 # ── apply_correlation_adjustment ─────────────────────────────────────────────
 
 def test_hard_block_above_threshold():

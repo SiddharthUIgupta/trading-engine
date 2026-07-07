@@ -29,7 +29,59 @@ from __future__ import annotations
 
 import math
 
-from data_layer.models import PriceSeries
+from data_layer.models import OptionType, PriceSeries
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def black_scholes_greeks(
+    underlying_price: float,
+    strike: float,
+    dte: int,
+    iv: float,
+    option_type: OptionType,
+    risk_free_rate: float = 0.0,
+) -> tuple[float, float, float]:
+    """Per-contract delta, vega, theta (Black-Scholes, r=0 dividend yield —
+    a disclosed simplification; short-dated equity options' dividend drag
+    on the Greeks is small relative to the position-sizing decisions this
+    feeds). vega is per 1.0 (100 percentage points) of IV change; theta is
+    per calendar day, already divided by 365.
+
+    Returns (0.0, 0.0, 0.0) for an expired/zero-DTE or non-positive-IV
+    contract rather than raising — the caller sums Greeks across a whole
+    portfolio and one bad contract must not blank out every other position.
+    """
+    t = dte / 365.0
+    if t <= 0 or iv <= 0 or underlying_price <= 0 or strike <= 0:
+        return 0.0, 0.0, 0.0
+
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(underlying_price / strike) + (risk_free_rate + 0.5 * iv * iv) * t) / (iv * sqrt_t)
+    d2 = d1 - iv * sqrt_t
+
+    vega = underlying_price * _norm_pdf(d1) * sqrt_t
+
+    if option_type == OptionType.CALL:
+        delta = _norm_cdf(d1)
+        theta_annual = (
+            -underlying_price * _norm_pdf(d1) * iv / (2 * sqrt_t)
+            - risk_free_rate * strike * math.exp(-risk_free_rate * t) * _norm_cdf(d2)
+        )
+    else:
+        delta = _norm_cdf(d1) - 1.0
+        theta_annual = (
+            -underlying_price * _norm_pdf(d1) * iv / (2 * sqrt_t)
+            + risk_free_rate * strike * math.exp(-risk_free_rate * t) * _norm_cdf(-d2)
+        )
+
+    return delta, vega, theta_annual / 365.0
 
 
 def estimate_garch_rv(

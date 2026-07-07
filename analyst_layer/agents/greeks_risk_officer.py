@@ -17,6 +17,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TypedDict
 
+from pydantic import Field
+
 from analyst_layer.agents.base import BaseAgent
 from analyst_layer.schemas import (
     GreeksRiskReview,
@@ -37,7 +39,16 @@ class PortfolioGreeks(TypedDict):
 
 
 class GreeksRiskOfficerOutput(GreeksRiskReview):
-    """Structured output from the Greeks Risk Officer."""
+    """Structured output from the Greeks Risk Officer.
+
+    reviewed_at is overridden with a default: it's a system-managed
+    timestamp, never asked of the LLM in the prompt, and always overwritten
+    with datetime.now() by the caller below regardless of what's returned
+    here. Without a default, GreeksRiskReview's required reviewed_at field
+    makes it part of the tool's required JSON schema — the LLM never
+    supplies it, so every real call failed schema validation.
+    """
+    reviewed_at: datetime = Field(default_factory=datetime.now)
 
 
 class GreeksRiskOfficer(BaseAgent):

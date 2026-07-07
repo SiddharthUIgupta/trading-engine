@@ -174,6 +174,11 @@ def build_vol_consensus_graph(
                 proposal=structure_result.proposal,
                 portfolio=state["portfolio"],
             )
+            if state["errors"]:
+                # Partial failure: enough agents succeeded to reach a real
+                # verdict, but the ones that failed must stay visible — a
+                # degraded 2-of-3 consensus is not the same as a healthy one.
+                review = review.model_copy(update={"reasons": [*review.reasons, *state["errors"]]})
             return {"proposal": structure_result.proposal, "risk_review": review}
         except Exception as exc:  # noqa: BLE001
             return _reject(f"greeks_risk_officer failed: {exc}")

@@ -12,6 +12,7 @@ Both planes share the same state_store (SQLite WAL mode allows concurrent reader
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 from anthropic import Anthropic
 
 from analyst_layer import lesson_store, prefilter
+from analyst_layer.pricing import estimate_cost_usd
 from analyst_layer.reflection_agent import ReflectionAgent
 from analyst_layer.agents.intraday_exit_agent import IntradayExitAgent
 from analyst_layer.vw_bandit import VWSignalBandit
@@ -32,6 +34,7 @@ from execution_layer.broker import AlpacaBroker
 from execution_layer.guardrails import (
     CircuitBreaker,
     CircuitBreakerTripped,
+    GlobalRiskState,
     execute_global_shutdown,
 )
 from execution_layer.state_store import StateStore
@@ -66,6 +69,7 @@ class ProtectionRuntime:
         thesis_breaker: CircuitBreaker,
         swing_breaker: CircuitBreaker,
         wash_sale_guard: WashSaleGuard | None = None,
+        global_risk_state: GlobalRiskState | None = None,
     ) -> None:
         self._settings = settings
         self._broker = broker
@@ -77,6 +81,7 @@ class ProtectionRuntime:
         self._thesis_breaker = thesis_breaker
         self._swing_breaker = swing_breaker
         self._breaker = intraday_breaker  # backward compat alias
+        self._global_risk_state = global_risk_state
         self._wash_sale_guard = wash_sale_guard or WashSaleGuard(state_store)
         self._exit_agent = IntradayExitAgent(
             anthropic_client, settings.anthropic_subagent_model, usage_callback=self._record_usage
@@ -94,6 +99,20 @@ class ProtectionRuntime:
         # Daily regime snapshot — shared via DB event on each intraday_monitoring tick.
         # Needed only for adverse-news swing exits; loaded from state_store events.
         self._daily_news_ticker_signals: list[dict] = []
+
+    def _load_daily_news_signals(self) -> None:
+        """Alpha writes a 'daily_regime_news_signals' event (JSON-encoded
+        per-ticker bearish/bullish catalysts) once per day when it assesses
+        the regime. Pick up the most recent one so the adverse-news swing
+        exit has real data instead of a permanently-empty list.
+        """
+        events = self._state_store.get_events(event_type_like="daily_regime_news_signals", limit=1)
+        if not events:
+            return
+        try:
+            self._daily_news_ticker_signals = json.loads(events[0]["detail"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to parse daily_regime_news_signals event: %s", exc)
 
     # ── Entry consumption: reads order_intents written by Alpha Plane ─────────
 
@@ -127,7 +146,10 @@ class ProtectionRuntime:
             # Mark processed first — prevents double-submission on crash/restart
             self._state_store.mark_order_intent_processed(intent["client_order_id"], "submitted")
 
-            if breaker.is_stock_halted:
+            # Halted state gates ENTRIES only (invariant #1) — a SELL intent is a
+            # discretionary exit (e.g. "thesis broken, exit early") and must never
+            # be blocked by a halted/tripped/profit-locked breaker.
+            if action == Action.BUY and breaker.is_stock_halted:
                 logger.info("[%s] %s: breaker halted, skipping intent", breaker.name, ticker)
                 self._state_store.mark_order_intent_processed(intent["client_order_id"], "skipped_halted")
                 continue
@@ -150,7 +172,8 @@ class ProtectionRuntime:
                 self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
 
             try:
-                breaker.assert_not_tripped()
+                if action == Action.BUY:
+                    breaker.assert_not_tripped()
                 breaker.validate_position_size(proposal, equity)
 
                 use_bracket = (
@@ -200,8 +223,8 @@ class ProtectionRuntime:
         check that runs on the same tick.
         """
         self._reconcile_positions()
-        if self._settings.options_track_enabled or self._settings.vol_options_track_enabled:
-            self._reconcile_option_positions()
+        self._reconcile_option_positions()
+        self._load_daily_news_signals()
 
         today = date.today()
         equity = self._broker.get_equity()
@@ -210,6 +233,12 @@ class ProtectionRuntime:
                 equity=equity, today=today,
                 profit_target_pct=self._settings.daily_profit_target_pct,
             )
+
+        if self._global_risk_state is not None:
+            newly_halted, reason = self._global_risk_state.update(equity, today)
+            if newly_halted:
+                logger.critical("GlobalRisk newly halted: %s", reason)
+            self._global_risk_state.sync_to_db(self._state_store)
         logger.info("Protection tick: equity=%.2f", equity)
 
         # Drawdown + profit-lock checks per agent
@@ -246,15 +275,14 @@ class ProtectionRuntime:
         # Consume pending order intents from Alpha Plane
         self.consume_order_intents(today, equity)
 
-        # Exit checks — unconditional, breakers gate entries only
+        # Exit checks — unconditional, breakers gate entries only. Track-enabled
+        # settings must never gate these: they're meant to stop NEW entries
+        # (Alpha Plane's job), not skip stop-loss checks on positions already open.
         self._check_intraday_exits(equity)
         self._check_orb_exits(equity)
-        if self._settings.options_track_enabled:
-            self._check_options_exits(equity)
-        if self._settings.vol_options_track_enabled:
-            self._check_vol_options_exits(equity)
-        if self._settings.swing_track_enabled:
-            self._check_swing_exits(equity)
+        self._check_options_exits(equity)
+        self._check_vol_options_exits(equity)
+        self._check_swing_exits(equity)
 
     def _sync_breaker_state_to_db(self) -> None:
         """Writes each breaker's live in-memory halted state to breaker_state
@@ -725,7 +753,11 @@ class ProtectionRuntime:
     def _reconcile_positions(self) -> None:
         for position in self._state_store.get_positions():
             ticker = position["ticker"]
-            detail = self._broker.get_position_detail(ticker)
+            try:
+                detail = self._broker.get_position_detail(ticker)
+            except Exception as exc:  # noqa: BLE001 — one ticker's API failure must not skip reconciling/protecting every other position this tick
+                logger.error("%s: position detail fetch failed — skipping reconciliation this tick: %s", ticker, exc)
+                continue
             real_qty = int(detail["qty"]) if detail else 0
             if real_qty != position["quantity"]:
                 logger.warning(
@@ -742,7 +774,11 @@ class ProtectionRuntime:
     def _reconcile_option_positions(self) -> None:
         for position in self._state_store.get_option_positions():
             contract_symbol = position["contract_symbol"]
-            detail = self._broker.get_position_detail(contract_symbol)
+            try:
+                detail = self._broker.get_position_detail(contract_symbol)
+            except Exception as exc:  # noqa: BLE001 — one contract's API failure must not skip reconciling/protecting every other position this tick
+                logger.error("%s: option position detail fetch failed — skipping reconciliation this tick: %s", contract_symbol, exc)
+                continue
             real_qty = int(detail["qty"]) if detail else 0
             if real_qty != position["quantity"]:
                 logger.warning(
@@ -905,7 +941,17 @@ class ProtectionRuntime:
                         bp = broker_by_symbol[pos["contract_symbol"]]
                         pnl += (bp["current_price"] - bp["avg_entry_price"]) * bp["qty"] * 100
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not fetch live positions for P&L computation: %s", exc)
+            # Today's unrealized P&L on positions opened today is silently
+            # dropped from the total below — the realized portion computed
+            # above is still correct, but this could understate a real
+            # drawdown and let it slip past check_drawdown(). Loud, not a
+            # WARNING: a breaker miss because of a transient API blip is a
+            # risk-safety event, not routine noise.
+            logger.error("Could not fetch live positions for P&L computation — today_pnl may be understated: %s", exc)
+            self._state_store.record_event(
+                event_type="pnl_computation_degraded",
+                detail=f"live position fetch failed, unrealized-today P&L excluded from drawdown check: {exc}",
+            )
         return pnl
 
     def _should_escalate_to_llm(self, ticker: str, position: dict, today: date) -> bool:
@@ -1120,7 +1166,13 @@ class ProtectionRuntime:
             logger.debug("Post-trade reflection failed for %s: %s", ticker, exc)
 
     def _record_usage(self, agent_name: str, model: str, usage) -> None:
+        cost = estimate_cost_usd(model, usage)
         self._state_store.record_token_usage(
-            agent_name=agent_name, model=model,
-            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+            agent_name=agent_name,
+            model=model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            estimated_cost_usd=cost,
         )

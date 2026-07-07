@@ -7,10 +7,11 @@ If this process crashes (LLM timeout, OpenBB outage, scan exception), the
 Protection Plane continues running and existing positions remain protected.
 
 Schedule (ET):
-  8:15 AM   — thesis_scan_and_trade (pre-market universe + LLM consensus)
+  8:15 AM   — pre_market_scan (regime assessment, day-start equity)
   9:05 AM   — gap_scan_and_queue (pre-market gap up candidates)
   9:30 AM   — market_open_execution (queue any pending intents for 9:30 open)
   9:35 AM   — swing_scan_and_trade
+  10:00 AM  — thesis_scan_and_trade (pre-market universe + LLM consensus)
   Every 15m 9:30–16:00 — momentum_scan_and_trade (ORB equity), options_scan_and_trade
   10:00 AM, 1:00 PM — vol_options_scan_and_trade
   16:30 PM  — post_market_logging
@@ -49,7 +50,11 @@ from execution_layer import alerting
 
 ET = "America/New_York"
 
-WATCHLIST = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ", "AMZN", "META", "TSLA"]
+WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "SPY", "QQQ", "AMZN", "META", "TSLA",
+    # Added 2026-07-06, Sid's watch list from an external source (not a discovery screen).
+    "SHAZ", "NNBR", "LAES", "WULF", "MARA",
+]
 
 settings = get_settings()
 state_store = StateStore(settings.state_db_path)
@@ -178,7 +183,16 @@ logger.info("=== TRADING ENGINE: ALPHA PLANE STARTED ===")
 logger.info("Intents will be written to order_intents table for Protection to execute")
 
 try:
+    alerting.alert_startup(equity=broker.get_equity(), env=settings.trading_env)
+except Exception as exc:  # noqa: BLE001 — a broken startup alert must never block the process from starting
+    logger.warning("Startup alert failed: %s", exc)
+
+try:
     scheduler.start()
 except Exception as exc:
     logger.critical("Alpha Plane scheduler crashed: %s", exc, exc_info=True)
+    try:
+        alerting.alert_crash(str(exc))
+    except Exception as alert_exc:  # noqa: BLE001 — the crash alert itself must not mask the real crash
+        logger.warning("Crash alert failed: %s", alert_exc)
     sys.exit(1)

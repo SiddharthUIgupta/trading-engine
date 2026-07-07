@@ -67,14 +67,22 @@ def check_portfolio_correlation(
     proposed_closes: list[float],
     held_closes: dict[str, list[float]],   # ticker -> daily closes
 ) -> tuple[float, str]:
-    """Compute the highest absolute correlation between the proposed ticker
+    """Compute the highest (signed) correlation between the proposed ticker
     and all currently held positions.
+
+    Signed, not absolute: this guard exists to catch duplicate exposure
+    (e.g. buying QQQ when already long SPY), not to flag hedges. A strong
+    NEGATIVE correlation is an inverse/hedging relationship — it reduces net
+    portfolio risk and should never be treated the same as a near-duplicate
+    long position.
 
     Returns
     -------
     (max_correlation, description)
-        max_correlation: highest |r| found; 0.0 if no held positions or
-                         insufficient history.
+        max_correlation: highest signed r found (most positive, i.e. most
+                         duplicate-like); 0.0 if no held positions,
+                         insufficient history, or the highest value found
+                         is negative (nothing to warn about).
         description:     human-readable summary for logging / risk officer.
     """
     if not held_closes:
@@ -89,12 +97,12 @@ def check_portfolio_correlation(
     if not results:
         return 0.0, "insufficient price history for correlation check"
 
-    max_ticker, max_r = max(results, key=lambda x: abs(x[1]))
+    max_ticker, max_r = max(results, key=lambda x: x[1])
     all_str = ", ".join(
-        f"{t}={r:+.2f}" for t, r in sorted(results, key=lambda x: -abs(x[1]))
+        f"{t}={r:+.2f}" for t, r in sorted(results, key=lambda x: -x[1])
     )
     desc = f"highest correlation: {max_ticker}={max_r:+.2f} (all held: {all_str})"
-    return abs(max_r), desc
+    return max(max_r, 0.0), desc
 
 
 def apply_correlation_adjustment(

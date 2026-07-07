@@ -89,6 +89,11 @@ def build_consensus_graph(
 
         try:
             proposal, review = risk_agent.review(state["ticker"], state["signals"], state["account"], lessons=state.get("lessons", ""))
+            if state["errors"]:
+                # Partial failure: enough agents succeeded to reach a real
+                # verdict, but the ones that failed must stay visible — a
+                # degraded 2-of-3 consensus is not the same as a healthy one.
+                review = review.model_copy(update={"reasons": [*review.reasons, *state["errors"]]})
             return {"proposal": proposal, "risk_review": review}
         except Exception as exc:  # noqa: BLE001 — a malformed/failed risk officer call must never crash the run
             now = datetime.utcnow()

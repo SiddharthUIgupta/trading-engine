@@ -98,7 +98,7 @@ can verify your reasoning independently.
 IV Rank: {vol.iv_rank:.1f} / 100
 IV Percentile: {vol.iv_percentile:.1f} / 100
 IV 30-day (implied): {vol.iv_30:.1%}
-HV 20-day (realized): {vol.iv_hv_spread + vol.hv_30 - (vol.iv_30 - vol.hv_30):.1%}
+HV 20-day (realized): {vol.hv_20:.1%}
 HV 30-day (realized): {vol.hv_30:.1%}
 IV-HV Spread: {vol.iv_hv_spread:+.1%}  (positive = options overpriced vs realized){garch_lines}
 Term Structure Ratio (front/back): {vol.term_structure_ratio if vol.term_structure_ratio else 'N/A (single expiration)'}

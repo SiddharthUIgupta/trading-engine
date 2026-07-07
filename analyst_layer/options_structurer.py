@@ -107,7 +107,6 @@ def build_structure(
         )
 
     short_call = min(liquid_calls, key=lambda c: abs(c.strike - call_target))
-    short_put = max(liquid_puts, key=lambda c: abs(c.strike - put_target) * -1)
     short_put = min(liquid_puts, key=lambda c: abs(c.strike - put_target))
 
     short_call_mid = (short_call.bid + short_call.ask) / 2

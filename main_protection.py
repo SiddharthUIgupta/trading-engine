@@ -35,7 +35,7 @@ from anthropic import Anthropic
 from config.settings import get_settings
 from data_layer.openbb_client import OpenBBDataClient
 from execution_layer.broker import AlpacaBroker
-from execution_layer.guardrails import RobustCircuitBreaker
+from execution_layer.guardrails import GlobalRiskState, RobustCircuitBreaker
 from execution_layer.state_store import StateStore
 from execution_layer.protection_plane import ProtectionRuntime
 from execution_layer import alerting
@@ -48,12 +48,18 @@ broker = AlpacaBroker.from_settings(settings)
 anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
 data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
 
+global_risk_state = GlobalRiskState(
+    max_weekly_drawdown_pct=settings.max_weekly_drawdown_pct,
+    max_trailing_drawdown_pct=settings.max_trailing_drawdown_pct,
+)
+
 intraday_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
     max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
     capital_limit_pct=settings.intraday_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="intraday",
+    global_state=global_risk_state,
 )
 options_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -61,6 +67,7 @@ options_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.options_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="options",
+    global_state=global_risk_state,
 )
 thesis_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -68,6 +75,7 @@ thesis_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.thesis_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="thesis",
+    global_state=global_risk_state,
 )
 swing_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -75,6 +83,7 @@ swing_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.swing_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="swing",
+    global_state=global_risk_state,
 )
 
 runtime = ProtectionRuntime(
@@ -87,6 +96,7 @@ runtime = ProtectionRuntime(
     options_breaker=options_breaker,
     thesis_breaker=thesis_breaker,
     swing_breaker=swing_breaker,
+    global_risk_state=global_risk_state,
 )
 
 scheduler = BlockingScheduler(timezone=ET)
@@ -122,7 +132,16 @@ logger.info("Intraday monitoring every 15 min (9:30-16:00 ET)")
 logger.info("Pre-close ORB exit at 15:30 ET")
 
 try:
+    alerting.alert_startup(equity=broker.get_equity(), env=settings.trading_env)
+except Exception as exc:  # noqa: BLE001 — a broken startup alert must never block the process from starting
+    logger.warning("Startup alert failed: %s", exc)
+
+try:
     scheduler.start()
 except Exception as exc:
     logger.critical("Protection Plane scheduler crashed: %s", exc, exc_info=True)
+    try:
+        alerting.alert_crash(str(exc))
+    except Exception as alert_exc:  # noqa: BLE001 — the crash alert itself must not mask the real crash
+        logger.warning("Crash alert failed: %s", alert_exc)
     sys.exit(1)

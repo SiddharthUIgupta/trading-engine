@@ -127,3 +127,66 @@ def test_vrp_positive_when_iv_above_garch():
     assert garch_rv is not None
     vrp = iv_30 - garch_rv
     assert vrp > 0.0  # options are overpriced vs expected realized vol
+
+
+# ── black_scholes_greeks ─────────────────────────────────────────────────────
+# Regression for a real production bug: _build_portfolio_greeks fed the Greeks
+# Risk Officer entirely fabricated numbers (net_delta hardcoded to 0.0, net_vega/
+# theta derived from just a position count) instead of real Greeks. This function
+# replaces that fabrication with actual Black-Scholes math.
+
+from analyst_layer.vol_analytics import black_scholes_greeks
+from data_layer.models import OptionType
+
+
+def test_atm_call_delta_near_half():
+    delta, vega, theta = black_scholes_greeks(
+        underlying_price=100.0, strike=100.0, dte=30, iv=0.25, option_type=OptionType.CALL,
+    )
+    assert 0.45 < delta < 0.60
+
+
+def test_atm_put_delta_near_negative_half():
+    delta, vega, theta = black_scholes_greeks(
+        underlying_price=100.0, strike=100.0, dte=30, iv=0.25, option_type=OptionType.PUT,
+    )
+    assert -0.60 < delta < -0.45
+
+
+def test_deep_itm_call_delta_near_one():
+    delta, _, _ = black_scholes_greeks(
+        underlying_price=200.0, strike=50.0, dte=30, iv=0.25, option_type=OptionType.CALL,
+    )
+    assert delta > 0.95
+
+
+def test_deep_otm_call_delta_near_zero():
+    delta, _, _ = black_scholes_greeks(
+        underlying_price=50.0, strike=200.0, dte=30, iv=0.25, option_type=OptionType.CALL,
+    )
+    assert delta < 0.05
+
+
+def test_vega_identical_for_call_and_put_at_same_strike():
+    """Put-call vega parity: vega depends only on d1, which is the same for
+    a call and put at the same strike/expiration/IV."""
+    _, vega_call, _ = black_scholes_greeks(100.0, 100.0, 30, 0.25, OptionType.CALL)
+    _, vega_put, _ = black_scholes_greeks(100.0, 100.0, 30, 0.25, OptionType.PUT)
+    assert vega_call == pytest.approx(vega_put, rel=1e-9)
+    assert vega_call > 0.0
+
+
+def test_vega_positive_and_theta_negative_for_long_option():
+    """A long option always has positive vega (gains from rising IV) and
+    negative theta (loses value as time passes, r=0 with no dividend)."""
+    delta, vega, theta = black_scholes_greeks(100.0, 100.0, 30, 0.25, OptionType.CALL)
+    assert vega > 0.0
+    assert theta < 0.0
+
+
+def test_zero_dte_returns_zero_greeks_not_a_crash():
+    assert black_scholes_greeks(100.0, 100.0, 0, 0.25, OptionType.CALL) == (0.0, 0.0, 0.0)
+
+
+def test_zero_iv_returns_zero_greeks_not_a_crash():
+    assert black_scholes_greeks(100.0, 100.0, 30, 0.0, OptionType.CALL) == (0.0, 0.0, 0.0)

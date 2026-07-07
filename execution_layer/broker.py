@@ -13,6 +13,7 @@ import logging
 import time
 from datetime import date
 
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
@@ -77,19 +78,28 @@ class AlpacaBroker:
         try:
             position = self._client.get_open_position(ticker)
             return float(position.qty)
-        except Exception:  # noqa: BLE001 — Alpaca raises when there's no open position
-            return 0.0
+        except APIError as exc:
+            if exc.status_code == 404:
+                return 0.0
+            raise
 
     def get_position_detail(self, ticker: str) -> dict | None:
         """Live position snapshot straight from Alpaca — authoritative for
         unrealized P&L, unlike recomputing it from our own avg_entry_price
         bookkeeping (which can drift from partial fills, splits, etc.).
-        Returns None if there's no open position.
+        Returns None only on a genuine 404 (no open position) — any other
+        API failure (network, 5xx, rate limit) is raised, not swallowed,
+        because callers treat None as "position is closed" and some
+        (reconciliation) delete the local record on that basis. Silently
+        returning None on a transient error would permanently strip a
+        still-open position of its stop-loss protection.
         """
         try:
             position = self._client.get_open_position(ticker)
-        except Exception:  # noqa: BLE001 — Alpaca raises when there's no open position
-            return None
+        except APIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
         return {
             "qty": float(position.qty),
             "avg_entry_price": float(position.avg_entry_price),

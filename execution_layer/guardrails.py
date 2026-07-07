@@ -329,6 +329,28 @@ class GlobalRiskState:
         self.trailing_halted = False
         self.halt_reason = ""
 
+    def sync_to_db(self, state_store) -> None:
+        """Persist the halted flags/reason under breaker_name='global' in the
+        existing breaker_state table — the same IPC mechanism per-strategy
+        breakers already use to cross the Alpha/Protection process boundary.
+        Call this from whichever process actually calls update() (Protection,
+        since it ticks continuously); equity_peak/week_start_equity are this
+        process's own bookkeeping and don't need to cross the boundary, only
+        the resulting halted/reason do.
+        """
+        state_store.set_breaker_state("global", "halted", "true" if self.is_halted else "false")
+        state_store.set_breaker_state("global", "halt_reason", self.halt_reason)
+
+    @staticmethod
+    def is_halted_in_db(state_store) -> tuple[bool, str]:
+        """Read-only check for the other process (Alpha) — returns
+        (is_halted, halt_reason) as last written by sync_to_db(), without
+        needing its own GlobalRiskState instance or equity-peak tracking.
+        """
+        halted = state_store.is_breaker_halted("global")
+        reason = state_store.get_breaker_state("global", "halt_reason", "")
+        return halted, reason
+
     def status(self) -> str:
         if self.trailing_halted:
             return f"TRAILING HALT | {self.halt_reason}"

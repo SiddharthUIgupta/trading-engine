@@ -13,6 +13,7 @@ and all existing positions stay protected.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Callable
@@ -51,7 +52,7 @@ from data_layer.occ_symbol import parse_occ_symbol
 from data_layer.openbb_client import OpenBBDataClient
 from execution_layer import alerting, exit_rules
 from execution_layer.broker import AlpacaBroker
-from execution_layer.guardrails import CircuitBreaker, CircuitBreakerTripped
+from execution_layer.guardrails import CircuitBreaker, CircuitBreakerTripped, GlobalRiskState
 from execution_layer.state_store import StateStore
 from execution_layer.tax_compliance import WashSaleGuard
 
@@ -166,11 +167,14 @@ class AlphaRuntime:
                 else self._swing_breaker if strategy in _SWING_STRATEGIES
                 else self._intraday_breaker
             )
-            # Check both in-memory state and DB state (Protection writes to DB on trip)
+            # Halted state gates ENTRIES only (invariant #1) — a discretionary SELL
+            # (e.g. "thesis broken, exit early") must never be blocked by a
+            # halted/tripped/profit-locked/globally-halted breaker.
             db_halted = self._state_store.is_breaker_halted(breaker.name)
-            if breaker.is_stock_halted or db_halted:
-                logger.info("[%s] %s: breaker halted (in_memory=%s db=%s), skipping.",
-                            breaker.name, ticker, breaker.is_stock_halted, db_halted)
+            globally_halted, global_reason = GlobalRiskState.is_halted_in_db(self._state_store)
+            if payload.proposal.action == Action.BUY and (breaker.is_stock_halted or db_halted or globally_halted):
+                logger.info("[%s] %s: breaker halted (in_memory=%s db=%s global=%s %s), skipping.",
+                            breaker.name, ticker, breaker.is_stock_halted, db_halted, globally_halted, global_reason)
                 continue
 
             self._executed_tickers_today.add(ticker)
@@ -189,7 +193,8 @@ class AlphaRuntime:
                 self._wash_sale_guard.warn_before_sell(ticker, proposal.limit_price, today)
 
             try:
-                breaker.assert_not_tripped()
+                if proposal.action == Action.BUY:
+                    breaker.assert_not_tripped()
                 breaker.validate_position_size(proposal, equity)
             except CircuitBreakerTripped as exc:
                 logger.error("Circuit breaker blocked intent for %s: %s", ticker, exc)
@@ -212,6 +217,18 @@ class AlphaRuntime:
 
             if proposal.action == Action.BUY and strategy in _THESIS_STRATEGIES:
                 self._thesis_session_buys += 1
+
+    def _assert_not_globally_halted(self) -> None:
+        """ORB equity/options and vol_options entries submit directly (this
+        file's own docstring: "still submit directly here") and so never pass
+        through _queue_pending_as_intents' breaker checks. Call this right
+        before each of those direct submissions so a global weekly/trailing
+        halt (set by Protection, read via the shared breaker_state table)
+        blocks them too, not just the order-intent-queued equity/swing paths.
+        """
+        halted, reason = GlobalRiskState.is_halted_in_db(self._state_store)
+        if halted:
+            raise CircuitBreakerTripped(f"globally halted: {reason}")
 
     # ── Scanning entry points ─────────────────────────────────────────────────
 
@@ -249,7 +266,6 @@ class AlphaRuntime:
             logger.info("=== PRE-MARKET: dynamic universe mode — momentum scan runs intraday instead ===")
 
     def momentum_scan_and_trade(self) -> None:
-        from execution_layer.runtime import TradingRuntime
         # ORB equity: deterministic screen, submits directly (same-day, no overnight protection needed)
         if not self._settings.orb_equity_enabled:
             return
@@ -508,18 +524,52 @@ class AlphaRuntime:
             self._scanned_vol_tickers_today.add(ticker)
 
             try:
-                snapshot = vol_analytics.get_vol_snapshot(ticker, self._data_client)
-            except (DataLayerError, Exception) as exc:  # noqa: BLE001
-                logger.debug("%s: vol snapshot failed — %s", ticker, exc)
+                vol_snapshot = self._data_client.get_volatility_snapshot(ticker)
+                chain = self._data_client.get_option_chain(ticker)
+            except DataLayerError as exc:
+                logger.error("%s: vol scan data fetch failed — skipping: %s", ticker, exc)
                 continue
+
+            # Hard gate: never sell premium through an earnings event. The LLM
+            # agents see earnings_within_dte but this is enforced here too so a
+            # miscalibrated agent can't override a fundamental risk constraint.
+            if vol_snapshot.earnings_within_dte:
+                logger.info(
+                    "%s: vol scan skipped — earnings within expiration window (next: %s)",
+                    ticker, vol_snapshot.next_earnings_date,
+                )
+                self._state_store.record_event(
+                    event_type="vol_scan_skipped_earnings",
+                    detail=f"{ticker}: earnings {vol_snapshot.next_earnings_date} within DTE window — no new positions",
+                )
+                continue
+
+            # GARCH(1,1) realized vol forecast — best-effort, enriches the
+            # IVSurfaceAgent's prompt with a forward-looking VRP signal rather
+            # than the backward-looking HV. Failure is silent: HV-based VRP
+            # in the snapshot is the fallback.
+            try:
+                price_hist = self._data_client.get_price_history(
+                    ticker, start_date=today - timedelta(days=90), end_date=today
+                )
+                garch_rv = vol_analytics.estimate_garch_rv(
+                    price_hist, forecast_horizon=self._settings.vol_options_target_dte
+                )
+                if garch_rv is not None:
+                    vol_snapshot = vol_snapshot.model_copy(update={"garch_rv_forecast": garch_rv})
+            except DataLayerError as exc:
+                logger.debug("%s: GARCH price fetch failed — using HV-based VRP only: %s", ticker, exc)
 
             payload = run_vol_consensus(
                 client=self._anthropic,
                 model=self._settings.anthropic_model,
                 ticker=ticker,
-                snapshot=snapshot,
+                vol_snapshot=vol_snapshot,
+                option_chain=chain,
                 vix_context=vix_context,
                 portfolio=portfolio,
+                max_position_size_pct=self._settings.max_position_size_pct,
+                allow_uncovered=self._settings.is_uncovered_allowed,
                 subagent_model=self._settings.anthropic_subagent_model,
                 usage_callback=self._record_usage,
             )
@@ -527,7 +577,7 @@ class AlphaRuntime:
                 logger.info("%s: vol consensus not executable (verdict=%s)", ticker, payload.risk_review.verdict.value)
                 continue
 
-            self._open_vol_options_position(ticker, payload, equity, today)
+            self._open_vol_options_position(ticker, payload, chain, equity, today)
 
     def post_market_logging(self) -> None:
         logger.info("=== POST-MARKET LOGGING ===")
@@ -756,20 +806,59 @@ class AlphaRuntime:
     # ── Supporting methods (same as runtime.py) ───────────────────────────────
 
     def _assess_market_regime(self, today: date) -> DailyRegime | None:
+        macro_sentiment: str | None = None
+        macro_confidence: float = 0.0
+        macro_themes: list[str] = []
+        news_ticker_signals: list[dict] = []
+        if self._settings.macro_news_enabled:
+            try:
+                macro = assess_macro_sentiment(
+                    client=self._anthropic,
+                    model=self._settings.anthropic_subagent_model,
+                    today=today,
+                    finnhub_api_key=self._settings.finnhub_api_key,
+                )
+                macro_sentiment = macro.sentiment
+                macro_confidence = macro.confidence
+                macro_themes = list(macro.key_themes)
+                news_ticker_signals = [
+                    {"ticker": s.ticker, "catalyst": s.catalyst, "direction": s.direction}
+                    for s in macro.news_tickers
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Macro news assessment failed — proceeding without it: %s", exc)
+
         try:
-            macro = get_macro_snapshot()
-            self._macro_snapshot = macro
+            self._macro_snapshot = get_macro_snapshot()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Macro snapshot fetch failed: %s", exc)
+
         try:
+            spy_series = self._data_client.get_price_history(
+                "SPY", start_date=today - timedelta(days=60), end_date=today
+            )
+            vix_series = self._data_client.get_price_history(
+                "^VIX", start_date=today - timedelta(days=45), end_date=today
+            )
             regime = assess_daily_regime(
-                self._data_client,
-                vix_bearish_threshold=self._settings.regime_vix_bearish_threshold,
-                vix_neutral_threshold=self._settings.regime_vix_neutral_threshold,
-                macro_snapshot=self._macro_snapshot,
+                [b.close for b in spy_series.bars],
+                vix_series.bars,
+                macro_sentiment=macro_sentiment,
+                macro_confidence=macro_confidence,
+                macro_themes=macro_themes,
+                macro_vix_adjustment=self._settings.macro_news_vix_adjustment,
+                macro_min_confidence=self._settings.macro_news_min_confidence,
+                news_ticker_signals=news_ticker_signals,
             )
             logger.info("Daily regime assessed: %s", regime)
             self._state_store.record_event(event_type="daily_regime", detail=str(regime))
+            # Separate machine-readable event so Protection Plane (a different
+            # process, no in-memory access to this DailyRegime) can pick up
+            # per-ticker bearish news catalysts for its adverse-news swing exit.
+            self._state_store.record_event(
+                event_type="daily_regime_news_signals",
+                detail=json.dumps(regime.news_ticker_signals),
+            )
             return regime
         except Exception as exc:  # noqa: BLE001
             logger.error("Market regime assessment failed: %s", exc)
@@ -797,40 +886,61 @@ class AlphaRuntime:
             logger.error("vol universe refresh failed — keeping existing universe: %s", exc)
 
     def _build_thesis_candidates(self, today: date, universe=None) -> list[str]:
-        candidates = []
         source = universe or []
-        for candidate_obj in source:
-            symbol = getattr(candidate_obj, "symbol", str(candidate_obj))
+        passed: list[tuple[str, float]] = []
+        for candidate in source:
+            symbol = candidate.symbol
             if symbol in self._scanned_tickers_today:
                 continue
-            try:
-                price_series = self._data_client.get_price_history(
-                    symbol, start_date=today - timedelta(days=365), end_date=today
-                )
-            except DataLayerError:
-                continue
-            closes = [b.close for b in price_series.bars]
-            if not closes:
-                continue
-            candidate = thesis_scanner.build_thesis_candidate(symbol, closes)
-            if candidate and thesis_scanner.evaluate_thesis_candidate(candidate).passed:
-                candidates.append(symbol)
-        return candidates
+            signal = thesis_scanner.evaluate_thesis_candidate(
+                candidate,
+                self._settings.thesis_min_pullback_pct,
+                self._settings.thesis_max_pullback_pct,
+            )
+            if signal.passed:
+                logger.info("%s: thesis scan PASSED (%s)", symbol, "; ".join(signal.reasons))
+                passed.append((symbol, signal.score))
+        passed.sort(key=lambda pair: pair[1], reverse=True)
+        capped = [ticker for ticker, _ in passed[: self._settings.thesis_max_daily_candidates]]
+        self._state_store.record_event(
+            event_type="thesis_scan_summary",
+            detail=f"passed={len(passed)}/{len(source)} thesis-universe candidates, capped to {len(capped)}",
+        )
+        return capped
 
     def _build_recovery_candidates(self, today: date, universe=None) -> list[str]:
-        candidates = []
         source = universe or []
-        for candidate_obj in source:
-            symbol = getattr(candidate_obj, "symbol", str(candidate_obj))
+        passed: list[tuple[str, float]] = []
+        for candidate in source:
+            symbol = candidate.symbol
             if symbol in self._scanned_tickers_today:
                 continue
             try:
-                result = evaluate_recovery_candidate(symbol, self._data_client, today)
-            except Exception:  # noqa: BLE001
+                series = self._data_client.get_price_history(
+                    symbol, start_date=today - timedelta(days=65), end_date=today
+                )
+            except DataLayerError as exc:
+                logger.debug("%s: recovery price fetch failed — %s", symbol, exc)
                 continue
-            if result and result.passed:
-                candidates.append(symbol)
-        return candidates
+            signal = evaluate_recovery_candidate(
+                series,
+                min_pullback_pct=self._settings.recovery_min_pullback_pct,
+                max_pullback_pct=self._settings.recovery_max_pullback_pct,
+                volume_pickup_ratio=self._settings.recovery_volume_pickup_ratio,
+            )
+            if signal.passed:
+                logger.info("%s: recovery scan PASSED (%s)", symbol, "; ".join(signal.reasons))
+                self._price_cache[symbol] = [b.close for b in series.bars]
+                passed.append((symbol, signal.score))
+            else:
+                logger.debug("%s: recovery scan failed — %s", symbol, signal.reasons[0] if signal.reasons else "")
+        passed.sort(key=lambda pair: pair[1], reverse=True)
+        capped = [ticker for ticker, _ in passed[: self._settings.recovery_max_daily_candidates]]
+        self._state_store.record_event(
+            event_type="recovery_scan_summary",
+            detail=f"passed={len(passed)}/{len(source)} candidates, capped to {len(capped)}",
+        )
+        return capped
 
     def _build_momentum_candidates(self, today: date) -> list[str]:
         try:
@@ -892,8 +1002,13 @@ class AlphaRuntime:
     def _record_usage(self, agent_name: str, model: str, usage) -> None:
         cost = estimate_cost_usd(model, usage)
         self._state_store.record_token_usage(
-            agent_name=agent_name, model=model,
-            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+            agent_name=agent_name,
+            model=model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            estimated_cost_usd=cost,
         )
 
     def _get_deployed_notional(self, ticker: str) -> float:
@@ -1026,6 +1141,7 @@ class AlphaRuntime:
 
         proposal = TradeProposal(ticker=ticker, action=Action.BUY, quantity=quantity, limit_price=current_price)
         try:
+            self._assert_not_globally_halted()
             self._breaker.assert_not_tripped()
             self._breaker.validate_position_size(proposal, equity)
             result = self._broker.submit_order(proposal)
@@ -1104,6 +1220,7 @@ class AlphaRuntime:
             return
 
         try:
+            self._assert_not_globally_halted()
             self._options_breaker.assert_options_trading_allowed()
             result = self._broker.submit_option_order(
                 contract.contract_symbol, side=Action.BUY, contracts=contracts, limit_price=contract.ask
@@ -1153,10 +1270,45 @@ class AlphaRuntime:
             return VixContext(vix_current=18.0)
 
     def _build_portfolio_greeks(self, equity: float) -> PortfolioGreeks:
+        """Real per-leg Black-Scholes Greeks, signed by each leg's stored
+        quantity (Alpaca reports qty negative for a short leg, so summing
+        quantity * per-contract Greeks already nets shorts against longs
+        correctly — no separate short/long branch needed).
+        """
         option_positions = self._state_store.get_option_positions()
         vol_short_positions = [p for p in option_positions if p.get("strategy") == "vol_short" and p["quantity"] != 0]
         n = len(vol_short_positions)
-        return PortfolioGreeks(net_delta=0.0, net_vega=-10.0 * n, net_theta=1.0 * n, portfolio_value=equity, num_open_positions=n)
+
+        net_delta = net_vega = net_theta = 0.0
+        chains_by_underlying: dict[str, list] = {}
+        for position in vol_short_positions:
+            underlying = position["underlying_symbol"]
+            if underlying not in chains_by_underlying:
+                try:
+                    chains_by_underlying[underlying] = self._data_client.get_option_chain(underlying)
+                except DataLayerError as exc:
+                    logger.warning("%s: option chain fetch failed for Greeks calc — %s", underlying, exc)
+                    chains_by_underlying[underlying] = []
+
+            option_type = OptionType.CALL if position["option_type"] == "call" else OptionType.PUT
+            contract = self._find_option_contract(
+                chains_by_underlying[underlying], option_type,
+                date.fromisoformat(position["expiration"]), position["strike"],
+            )
+            if contract is None or contract.implied_volatility is None:
+                logger.debug("%s: no live quote for Greeks calc — excluded from portfolio Greeks", position["contract_symbol"])
+                continue
+
+            delta, vega, theta = vol_analytics.black_scholes_greeks(
+                contract.underlying_price, contract.strike, contract.dte,
+                contract.implied_volatility, option_type,
+            )
+            qty = position["quantity"] * 100  # already signed: negative for a short leg
+            net_delta += delta * qty
+            net_vega += vega * qty
+            net_theta += theta * qty
+
+        return PortfolioGreeks(net_delta=net_delta, net_vega=net_vega, net_theta=net_theta, portfolio_value=equity, num_open_positions=n)
 
     def _find_option_contract(self, chain, option_type: OptionType, expiration: date, strike: float):
         for c in chain:
@@ -1232,6 +1384,7 @@ class AlphaRuntime:
         ]
 
         try:
+            self._assert_not_globally_halted()
             self._options_breaker.assert_options_trading_allowed()
             result = self._broker.submit_spread_order(
                 legs=spread_legs, contracts=proposal.quantity, net_credit=net_credit,

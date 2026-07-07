@@ -287,8 +287,14 @@ def test_broker_get_position_detail_returns_live_snapshot():
 
 
 def test_broker_get_position_detail_returns_none_with_no_position():
+    import json
+    from alpaca.common.exceptions import APIError
+
     mock_client = MagicMock()
-    mock_client.get_open_position.side_effect = RuntimeError("no position")
+    error = json.dumps({"code": 40410000, "message": "position does not exist"})
+    http_error = MagicMock()
+    http_error.response.status_code = 404
+    mock_client.get_open_position.side_effect = APIError(error, http_error)
     broker = AlpacaBroker(trading_client=mock_client, is_live=False)
 
     assert broker.get_position_detail("AAPL") is None
