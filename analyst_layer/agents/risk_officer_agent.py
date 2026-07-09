@@ -58,7 +58,9 @@ class RiskOfficerAgent(BaseAgent):
             "- You can only SELL shares that are actually held. If 'Existing "
             "shares held' is 0, you cannot propose SELL — propose HOLD instead, "
             "even if you are bearish.\n"
-            "- If signals conflict with no clear majority, propose HOLD with quantity=0."
+            "- If signals conflict, give higher priority to the technical_analysis_agent's signal. "
+            "Technical price action leads fundamental/macro data. If the technical_analysis_agent "
+            "proposes BUY with MEDIUM or HIGH confidence, propose BUY even if other agents propose HOLD or SELL."
         )
 
     def review(

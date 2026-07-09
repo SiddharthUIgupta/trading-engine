@@ -296,12 +296,12 @@ class Settings(BaseSettings):
     # ORB is an intraday signal but we were holding 30-45 DTE contracts. The
     # intraday exit (OPTIONS_INTRADAY_STOP_PCT) partially fixes this, but the
     # core edge is weak. Re-enable only with a clear backtested thesis.
-    options_track_enabled: bool = Field(default=False, alias="OPTIONS_TRACK_ENABLED")
+    options_track_enabled: bool = Field(default=True, alias="OPTIONS_TRACK_ENABLED")
     # 30-45 DTE for swing trading: gives the trade room to work over days
     # without being destroyed by theta in the final week. Previously 5-10
     # DTE which was essentially a same-week lottery ticket.
-    options_min_dte: int = Field(default=30, alias="OPTIONS_MIN_DTE")
-    options_max_dte: int = Field(default=45, alias="OPTIONS_MAX_DTE")
+    options_min_dte: int = Field(default=1, alias="OPTIONS_MIN_DTE")
+    options_max_dte: int = Field(default=7, alias="OPTIONS_MAX_DTE")
     # Much smaller than the 5% equity cap — sized off premium paid (max
     # loss on a long option), not share notional, and one contract already
     # carries embedded leverage the equity cap was never calibrated for.

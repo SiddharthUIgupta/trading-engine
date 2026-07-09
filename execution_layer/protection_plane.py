@@ -475,7 +475,13 @@ class ProtectionRuntime:
             else:
                 et_now = datetime.now(ZoneInfo("America/New_York"))
                 opened_today = (position.get("opened_at") or "")[:10] == today.isoformat()
-                if (
+                if not opened_today:
+                    should_exit = True
+                    reason = f"options intraday track: held past entry day ({position.get('opened_at')}) — force-closing"
+                elif et_now.hour >= 15 and et_now.minute >= 45:
+                    should_exit = True
+                    reason = "options EOD exit: closing directional options before market close (3:45 PM ET)"
+                elif (
                     opened_today
                     and et_now.hour >= 15
                     and premium_drawdown_pct >= self._settings.options_intraday_stop_pct
