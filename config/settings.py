@@ -312,7 +312,7 @@ class Settings(BaseSettings):
     # should not be carried overnight as a multi-week theta bleed.
     options_intraday_stop_pct: float = Field(default=0.20, alias="OPTIONS_INTRADAY_STOP_PCT")
     # Force-close at 7 DTE to avoid gamma/theta spike in final week.
-    options_force_close_days_before_expiration: int = Field(default=7, alias="OPTIONS_FORCE_CLOSE_DAYS_BEFORE_EXPIRATION")
+    options_force_close_days_before_expiration: int = Field(default=0, alias="OPTIONS_FORCE_CLOSE_DAYS_BEFORE_EXPIRATION")
 
     # --- Vol options track (short premium — Natenberg/tastylive framework) ---
     # CAPABILITY FLAG: set True once when your broker account has options
