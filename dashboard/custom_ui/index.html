@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+    function sendMessageToStreamlitClient(type, data) {
+        var outData = Object.assign({
+            isStreamlitMessage: true,
+            type: type,
+        }, data);
+        window.parent.postMessage(outData, "*");
+    }
+
+    function init() {
+        sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1});
+    }
+
+    function setFrameHeight(height) {
+        sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height});
+    }
+
+    window.addEventListener("message", function(event) {
+        if (event.data.type === "streamlit:render") {
+            setFrameHeight(document.documentElement.scrollHeight);
+        }
+    });
+
+    window.addEventListener("load", function() {
+        init();
+        window.setTimeout(function() {
+            setFrameHeight(document.documentElement.scrollHeight);
+        }, 100);
+
+        const observer = new MutationObserver(function() {
+             setFrameHeight(document.documentElement.scrollHeight);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+</script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:#0a0e14;color:#e9eef7;font-family:'Space Grotesk',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  a{color:#38cfd6;text-decoration:none}
+  a:hover{color:#5fe0e6}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  ::-webkit-scrollbar{height:8px;width:8px}
+  ::-webkit-scrollbar-thumb{background:#232d40;border-radius:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+</style>
+</helmet>
+
+<div style="max-width:1500px;margin:0 auto;padding:22px 26px 60px;display:flex;flex-direction:column;gap:16px">
+
+  <!-- HALT BANNER -->
+  <sc-if value="{{ halted }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;align-items:center;gap:12px;background:#2a0f14;border:1px solid #ff5b6b;border-radius:10px;padding:12px 16px">
+      <div style="width:9px;height:9px;border-radius:50%;background:#ff5b6b;animation:pulse 1.1s infinite"></div>
+      <div style="font:600 12px/1.3 'Space Grotesk';letter-spacing:.06em;color:#ff8f9a">GLOBAL HALT ACTIVE — all capital buckets stopped, no new entries. Open positions still managed by exit rules.</div>
+    </div>
+  </sc-if>
+
+  <!-- HEADER -->
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:20px;background:#0f141e;border:1px solid #1e2839;border-radius:12px;padding:16px 20px">
+    <div style="display:flex;align-items:center;gap:16px">
+      <div style="width:38px;height:38px;border-radius:9px;background:linear-gradient(150deg,#38cfd6,#1c7a8a);display:flex;align-items:center;justify-content:center;font:700 18px 'Space Grotesk';color:#03181c">◈</div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <div style="font:600 16px/1 'Space Grotesk';letter-spacing:.02em">Autonomous Trading Engine</div>
+        <div style="font:500 11px/1 'IBM Plex Mono';color:#57647a;letter-spacing:.02em">Alpaca · Level 3 options · claude-sonnet-4-6 + haiku sub-agents</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="display:flex;align-items:center;gap:7px;background:{{ modeBg }};border:1px solid {{ modeColor }};border-radius:7px;padding:7px 11px">
+        <div style="width:8px;height:8px;border-radius:50%;background:{{ modeColor }};animation:pulse 1.4s infinite"></div>
+        <span style="font:600 11px/1 'Space Grotesk';letter-spacing:.1em;color:{{ modeColor }}">{{ modeLabel }}</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;padding:5px 12px;border:1px solid #1e2839;border-radius:7px">
+        <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">RASPBERRY PI 5</span>
+        <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">up 14d 06h · healthy</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;padding:5px 12px;border:1px solid #1e2839;border-radius:7px">
+        <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">NEXT JOB</span>
+        <span style="font:500 11px/1 'IBM Plex Mono';color:#38cfd6">intraday_monitoring · 4m</span>
+      </div>
+      <button style="display:flex;align-items:center;gap:8px;background:#1c0f13;border:1px solid #7a2530;border-radius:8px;padding:9px 14px;cursor:pointer;color:#ff8f9a;font:600 11px/1 'Space Grotesk';letter-spacing:.08em" style-hover="background:#2a0f14;border-color:#ff5b6b">
+        <span style="font-size:13px">⏻</span> KILL SWITCH
+      </button>
+    </div>
+  </div>
+
+  <!-- STAT TILES -->
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px">
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:11px;padding:15px 16px;display:flex;flex-direction:column;gap:9px">
+      <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">ACCOUNT EQUITY</span>
+      <span style="font:600 24px/1 'IBM Plex Mono';letter-spacing:-.02em">$84,216.40</span>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">cash $38,904 · invested $45,312</span>
+    </div>
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:11px;padding:15px 16px;display:flex;flex-direction:column;gap:9px">
+      <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">DAY P&L</span>
+      <span style="font:600 24px/1 'IBM Plex Mono';letter-spacing:-.02em;color:#2fd39a">+$612.18</span>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#2fd39a">+0.73% · lock at +2.0%</span>
+    </div>
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:11px;padding:15px 16px;display:flex;flex-direction:column;gap:9px">
+      <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">THESIS WIN RATE</span>
+      <span style="font:600 24px/1 'IBM Plex Mono';letter-spacing:-.02em">56.7%</span>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">1,385 backtest trades · PF 1.67</span>
+    </div>
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:11px;padding:15px 16px;display:flex;flex-direction:column;gap:9px">
+      <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">OPEN POSITIONS</span>
+      <span style="font:600 24px/1 'IBM Plex Mono';letter-spacing:-.02em">7<span style="color:#57647a">/15</span> <span style="font-size:15px;color:#57647a">eq</span></span>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#f2b34a">19 options · legacy (cap 8)</span>
+    </div>
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:11px;padding:15px 16px;display:flex;flex-direction:column;gap:9px">
+      <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">MARKET REGIME</span>
+      <span style="font:600 24px/1 'IBM Plex Mono';letter-spacing:-.02em">VIX 21.4</span>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#2fd39a">5d avg · risk-on · 4 armed</span>
+    </div>
+  </div>
+
+  <!-- MAIN GRID -->
+  <div style="display:grid;grid-template-columns:1.7fr 1fr;gap:16px;align-items:start">
+
+    <!-- CONSENSUS -->
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 18px;border-bottom:1px solid #18202e">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font:600 13px/1 'Space Grotesk';letter-spacing:.02em">Multi-Agent Consensus</span>
+          <span style="font:500 10px/1 'IBM Plex Mono';color:#38cfd6;background:#0c2124;border:1px solid #17494d;border-radius:5px;padding:4px 7px">LangGraph · parallel</span>
+        </div>
+        <span style="font:500 11px/1 'IBM Plex Mono';color:#57647a">thesis_scan · 08:15 ET · 20 → 4 to LLM</span>
+      </div>
+
+      <!-- queue -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:16px 18px 6px">
+        <sc-for list="{{ candidates }}" as="c" hint-placeholder-count="4">
+          <div onClick="{{ c.onSelect }}" style="{{ c.cardStyle }}">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+              <span style="font:600 16px/1 'Space Grotesk';letter-spacing:.01em">{{ c.ticker }}</span>
+              <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.08em;color:{{ c.statusColor }};background:{{ c.statusBg }};border:1px solid {{ c.statusColor }};border-radius:5px;padding:4px 6px">{{ c.status }}</span>
+            </div>
+            <span style="font:500 10px/1.2 'IBM Plex Mono';color:#57647a">{{ c.sector }}</span>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:2px">
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">score {{ c.scoreStr }}</span>
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#ff8f9a">{{ c.ddStr }} 52w</span>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+
+      <!-- detail -->
+      <div style="padding:12px 18px 20px;display:flex;flex-direction:column;gap:14px">
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding-top:6px">
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font:600 20px/1 'Space Grotesk'">{{ sel.ticker }}</span>
+              <span style="font:500 12px/1 'IBM Plex Mono';color:#8a97a9">{{ sel.name }}</span>
+            </div>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#57647a">last {{ sel.priceStr }} · {{ sel.ddStr }} from 52-wk high · {{ sel.sector }}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px;background:{{ sel.autoBg }};border:1px solid {{ sel.autoColor }};border-radius:7px;padding:7px 11px">
+            <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.06em;color:{{ sel.autoColor }}">{{ sel.autoLabel }}</span>
+          </div>
+        </div>
+
+        <!-- 3 sub agents -->
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+          <sc-for list="{{ sel.sub }}" as="a" hint-placeholder-count="3">
+            <div style="background:#0c111a;border:1px solid #18202e;border-radius:10px;padding:13px 14px;display:flex;flex-direction:column;gap:10px">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+                <span style="font:600 11px/1 'Space Grotesk';letter-spacing:.02em;color:#c4cddb">{{ a.role }}</span>
+                <span style="font:500 9px/1 'IBM Plex Mono';color:#57647a;border:1px solid #232d40;border-radius:4px;padding:3px 5px">{{ a.model }}</span>
+              </div>
+              <div style="display:flex;align-items:baseline;gap:8px">
+                <span style="font:600 15px/1 'Space Grotesk';letter-spacing:.03em;color:{{ a.stanceColor }}">{{ a.stance }}</span>
+                <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">{{ a.confStr }}</span>
+              </div>
+              <div style="height:4px;border-radius:3px;background:#18202e;overflow:hidden">
+                <div style="height:100%;width:{{ a.confW }};background:{{ a.stanceColor }};border-radius:3px"></div>
+              </div>
+              <p style="margin:0;font:400 11px/1.5 'Space Grotesk';color:#8a97a9">{{ a.note }}</p>
+            </div>
+          </sc-for>
+        </div>
+
+        <!-- risk officer -->
+        <div style="display:flex;gap:0;background:#0c1418;border:1px solid #17494d;border-radius:11px;overflow:hidden">
+          <div style="width:4px;background:#38cfd6"></div>
+          <div style="flex:1;padding:15px 16px;display:flex;flex-direction:column;gap:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="font:600 11px/1 'Space Grotesk';letter-spacing:.1em;color:#38cfd6">RISK OFFICER</span>
+                <span style="font:500 9px/1 'IBM Plex Mono';color:#57647a;border:1px solid #232d40;border-radius:4px;padding:3px 5px">Sonnet</span>
+              </div>
+              <span style="font:600 15px/1 'Space Grotesk';letter-spacing:.04em;color:{{ sel.statusColor }}">{{ sel.status }}</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">POSITION SIZE</span>
+                <span style="font:600 14px/1 'IBM Plex Mono';color:#e9eef7">{{ sel.sizeStr }}</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">KELLY</span>
+                <span style="font:600 14px/1 'IBM Plex Mono';color:#e9eef7">{{ sel.kellyStr }}</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">MAX CORRELATION</span>
+                <span style="font:600 14px/1 'IBM Plex Mono';color:{{ sel.corrColor }}">{{ sel.corrStr }}</span>
+              </div>
+            </div>
+            <p style="margin:0;font:400 12px/1.55 'Space Grotesk';color:#b4bdcc">{{ sel.ro.note }}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div style="display:flex;flex-direction:column;gap:16px">
+
+      <!-- GUARDRAILS -->
+      <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid #18202e">
+          <span style="font:600 13px/1 'Space Grotesk'">Safety Guardrails</span>
+          <span style="font:500 10px/1 'IBM Plex Mono';color:#2fd39a">4 circuit breakers</span>
+        </div>
+        <div style="padding:14px 18px;display:flex;flex-direction:column;gap:12px">
+          <sc-for list="{{ breakers }}" as="b" hint-placeholder-count="4">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                <span style="font:500 12px/1 'Space Grotesk';color:#c4cddb">{{ b.bucket }}</span>
+                <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.06em;color:{{ b.color }}">{{ b.state }}</span>
+              </div>
+              <div style="height:5px;border-radius:3px;background:#161d29;overflow:hidden">
+                <div style="height:100%;width:{{ b.barW }};background:{{ b.color }};border-radius:3px"></div>
+              </div>
+              <span style="font:500 10px/1 'IBM Plex Mono';color:#57647a">{{ b.note }}</span>
+            </div>
+          </sc-for>
+          <div style="height:1px;background:#18202e;margin:2px 0"></div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">Weekly drawdown</span>
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#2fd39a">−2.1% / −10.0% cap</span>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">Daily profit lock</span>
+              <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">+0.73% / +2.0% target</span>
+            </div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:2px">
+            <span style="font:500 9.5px/1 'IBM Plex Mono';color:#8a97a9;background:#0c111a;border:1px solid #1e2839;border-radius:5px;padding:5px 7px">wash-sale 30d</span>
+            <span style="font:500 9.5px/1 'IBM Plex Mono';color:#8a97a9;background:#0c111a;border:1px solid #1e2839;border-radius:5px;padding:5px 7px">corr ≤ 0.85</span>
+            <span style="font:500 9.5px/1 'IBM Plex Mono';color:#8a97a9;background:#0c111a;border:1px solid #1e2839;border-radius:5px;padding:5px 7px">max pos 5%</span>
+            <span style="font:500 9.5px/1 'IBM Plex Mono';color:#8a97a9;background:#0c111a;border:1px solid #1e2839;border-radius:5px;padding:5px 7px">caps 15 / 8</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- REGIME & TRACKS -->
+      <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid #18202e">
+          <span style="font:600 13px/1 'Space Grotesk'">Regime &amp; Strategy Tracks</span>
+          <span style="font:500 10px/1 'IBM Plex Mono';color:#57647a">08:00 ET</span>
+        </div>
+        <div style="padding:14px 18px;display:flex;flex-direction:column;gap:12px">
+          <div style="display:flex;gap:10px">
+            <div style="flex:1;background:#0c111a;border:1px solid #18202e;border-radius:9px;padding:11px 12px;display:flex;flex-direction:column;gap:5px">
+              <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">VIX 5D / SPOT</span>
+              <span style="font:600 15px/1 'IBM Plex Mono'">21.4 <span style="color:#57647a;font-size:11px">/ 20.9</span></span>
+            </div>
+            <div style="flex:1;background:#0c111a;border:1px solid #18202e;border-radius:9px;padding:11px 12px;display:flex;flex-direction:column;gap:5px">
+              <span style="font:600 9px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">SPY STRUCTURE</span>
+              <span style="font:600 13px/1 'IBM Plex Mono';color:#2fd39a">&gt; SMA50 &gt; SMA200</span>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;background:#0c111a;border:1px solid #18202e;border-radius:9px;padding:10px 12px">
+            <span style="font:500 11px/1 'Space Grotesk';color:#8a97a9">Macro sentiment (Haiku)</span>
+            <span style="font:600 12px/1 'Space Grotesk';color:#2fd39a">NEUTRAL-BULLISH · 0.61</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:7px;margin-top:2px">
+            <sc-for list="{{ tracks }}" as="t" hint-placeholder-count="6">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                <div style="display:flex;align-items:center;gap:9px">
+                  <div style="width:7px;height:7px;border-radius:2px;background:{{ t.color }}"></div>
+                  <span style="font:500 12px/1 'Space Grotesk';color:#c4cddb">{{ t.name }}</span>
+                </div>
+                <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.06em;color:{{ t.color }}">{{ t.state }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- POSITIONS -->
+  <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #18202e">
+      <div style="display:flex;align-items:center;gap:6px">
+        <button onClick="{{ selectEquity }}" style="{{ tabEquityStyle }}">Equity · 7</button>
+        <button onClick="{{ selectOptions }}" style="{{ tabOptionsStyle }}">Options · 19 legacy</button>
+      </div>
+      <span style="font:500 11px/1 'IBM Plex Mono';color:#57647a">reconciled vs broker · every 15 min</span>
+    </div>
+
+    <sc-if value="{{ showEquity }}" hint-placeholder-val="{{ true }}">
+      <div>
+        <div style="display:grid;grid-template-columns:1fr 1fr .8fr 1fr 1fr 1.1fr .9fr 1fr 1.3fr;gap:10px;padding:11px 18px;border-bottom:1px solid #18202e">
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">TICKER</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">STRATEGY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">QTY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">ENTRY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">LAST</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">P&L $</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">P&L %</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">STOP −18%</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">TRAILING</span>
+        </div>
+        <sc-for list="{{ equityPos }}" as="p" hint-placeholder-count="7">
+          <div style="display:grid;grid-template-columns:1fr 1fr .8fr 1fr 1fr 1.1fr .9fr 1fr 1.3fr;gap:10px;padding:12px 18px;border-bottom:1px solid #12192442;align-items:center">
+            <span style="font:600 13px/1 'Space Grotesk'">{{ p.ticker }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">{{ p.strat }}</span>
+            <span style="font:500 12px/1 'IBM Plex Mono';color:#c4cddb;text-align:right">{{ p.qty }}</span>
+            <span style="font:500 12px/1 'IBM Plex Mono';color:#c4cddb;text-align:right">{{ p.entryStr }}</span>
+            <span style="font:500 12px/1 'IBM Plex Mono';color:#e9eef7;text-align:right">{{ p.lastStr }}</span>
+            <span style="font:600 12px/1 'IBM Plex Mono';color:{{ p.pnlColor }};text-align:right">{{ p.pnlD }}</span>
+            <span style="font:600 12px/1 'IBM Plex Mono';color:{{ p.pnlColor }};text-align:right">{{ p.pnlPct }}</span>
+            <span style="font:500 12px/1 'IBM Plex Mono';color:#8a97a9;text-align:right">{{ p.stopStr }}</span>
+            <span style="font:500 10px/1 'IBM Plex Mono';color:{{ p.trailColor }};text-align:right">{{ p.trail }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ showOptions }}" hint-placeholder-val="{{ false }}">
+      <div>
+        <div style="display:flex;align-items:center;gap:9px;padding:10px 18px;background:#1c160a;border-bottom:1px solid #3a2d12">
+          <span style="font-size:12px">⚠</span>
+          <span style="font:500 11px/1.3 'IBM Plex Mono';color:#f2b34a">19 legacy positions from pre-fix ORB-options track (disabled). Downside capped at zero, no action planned. No new options entries until cleared.</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1.4fr .8fr .8fr .6fr .6fr 1fr 1fr 1fr .9fr;gap:10px;padding:11px 18px;border-bottom:1px solid #18202e">
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">CONTRACT</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">UNDERLYING</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a">EXPIRY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">DTE</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">QTY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">ENTRY</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">LAST</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">P&L %</span>
+          <span style="font:600 9.5px/1 'Space Grotesk';letter-spacing:.12em;color:#57647a;text-align:right">TAG</span>
+        </div>
+        <sc-for list="{{ optionPos }}" as="o" hint-placeholder-count="4">
+          <div style="display:grid;grid-template-columns:1.4fr .8fr .8fr .6fr .6fr 1fr 1fr 1fr .9fr;gap:10px;padding:12px 18px;border-bottom:1px solid #12192442;align-items:center">
+            <span style="font:600 12px/1 'IBM Plex Mono'">{{ o.contract }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">{{ o.und }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#8a97a9">{{ o.exp }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#c4cddb;text-align:right">{{ o.dte }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#c4cddb;text-align:right">{{ o.qty }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#c4cddb;text-align:right">${{ o.entry }}</span>
+            <span style="font:500 11px/1 'IBM Plex Mono';color:#e9eef7;text-align:right">${{ o.last }}</span>
+            <span style="font:600 12px/1 'IBM Plex Mono';color:{{ o.pnlColor }};text-align:right">{{ o.pnlPct }}</span>
+            <span style="font:500 9px/1 'Space Grotesk';letter-spacing:.08em;color:#f2b34a;text-align:right">{{ o.tag }}</span>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+  </div>
+
+  <!-- BOTTOM: LEARNING + SIGNAL SCORING -->
+  <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:start">
+
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid #18202e">
+        <span style="font:600 13px/1 'Space Grotesk'">Learning Loop</span>
+        <span style="font:500 10px/1 'IBM Plex Mono';color:#57647a">ReflectionAgent · Sonnet</span>
+      </div>
+      <div style="padding:16px 18px;display:flex;flex-direction:column;gap:14px">
+        <div style="background:#0c111a;border:1px solid #18202e;border-radius:10px;padding:14px 15px;display:flex;flex-direction:column;gap:9px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font:600 13px/1 'Space Grotesk'">ENR · Energizer</span>
+            <span style="font:600 11px/1 'IBM Plex Mono';color:#ff8f9a">OPEN · −2.9%</span>
+          </div>
+          <p style="margin:0;font:400 11.5px/1.55 'Space Grotesk';color:#b4bdcc"><span style="color:#57647a">what happened · </span>Bought on 22% pullback + insider-buying headline. Position drifting sideways below entry, no trailing-stop trigger yet.</p>
+          <p style="margin:0;font:400 11.5px/1.55 'Space Grotesk';color:#b4bdcc"><span style="color:#57647a">root cause · </span>Entry technical stance was NEUTRAL (0.52) — thesis leaned entirely on fundamentals. Flagged as a repeat of the "require technical ≥ 0.55 confirmation" lesson.</p>
+        </div>
+        <span style="font:600 10px/1 'Space Grotesk';letter-spacing:.14em;color:#57647a">ACTIVE LESSONS · injected into prompts</span>
+        <sc-for list="{{ lessons }}" as="l" hint-placeholder-count="3">
+          <div style="display:flex;flex-direction:column;gap:6px;border-left:2px solid {{ l.scoreColor }};padding:2px 0 2px 12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+              <span style="font:500 11px/1 'IBM Plex Mono';color:{{ l.scoreColor }}">{{ l.tag }}</span>
+              <span style="font:500 10px/1 'IBM Plex Mono';color:#8a97a9">score {{ l.scoreStr }} · {{ l.delta }}</span>
+            </div>
+            <p style="margin:0;font:400 11px/1.5 'Space Grotesk';color:#8a97a9">{{ l.note }}</p>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <div style="background:#0f141e;border:1px solid #1e2839;border-radius:12px;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid #18202e">
+        <span style="font:600 13px/1 'Space Grotesk'">Agent Signal Scoring</span>
+        <span style="font:500 10px/1 'IBM Plex Mono';color:#57647a">hit rate · closed trades</span>
+      </div>
+      <div style="padding:16px 18px;display:flex;flex-direction:column;gap:14px">
+        <sc-for list="{{ hitRates }}" as="h" hint-placeholder-count="3">
+          <div style="display:flex;flex-direction:column;gap:7px">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span style="font:500 12px/1 'Space Grotesk';color:#c4cddb">{{ h.role }}</span>
+              <span style="font:600 12px/1 'IBM Plex Mono';color:{{ h.color }}">{{ h.rateStr }}</span>
+            </div>
+            <div style="height:6px;border-radius:3px;background:#161d29;overflow:hidden">
+              <div style="height:100%;width:{{ h.barW }};background:{{ h.color }};border-radius:3px"></div>
+            </div>
+          </div>
+        </sc-for>
+        <div style="height:1px;background:#18202e;margin:2px 0"></div>
+        <div style="display:flex;flex-direction:column;gap:9px">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font:500 11px/1 'Space Grotesk';color:#8a97a9">LLM cost · today</span>
+            <span style="font:600 12px/1 'IBM Plex Mono';color:#e9eef7">$0.84 · 214 calls</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font:500 11px/1 'Space Grotesk';color:#8a97a9">Cost · month to date</span>
+            <span style="font:600 12px/1 'IBM Plex Mono';color:#e9eef7">$18.42</span>
+          </div>
+          <p style="margin:6px 0 0;font:400 11px/1.5 'Space Grotesk';color:#57647a">Fundamental stance is the most predictive signal; macro sentiment near coin-flip — weighting adjusts as the sample grows.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1500,&quot;height&quot;:1220},&quot;tradingMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Live&quot;,&quot;Paper&quot;],&quot;default&quot;:&quot;Paper&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Engine&quot;},&quot;autonomyMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Fully autonomous&quot;,&quot;Approve before trade&quot;],&quot;default&quot;:&quot;Fully autonomous&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Engine&quot;},&quot;engineArmed&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Engine&quot;}}">
+
+class Component extends DCLogic {
+  state = { selected: this.props.candidates && this.props.candidates.length > 0 ? this.props.candidates[0].ticker : '', posTab: 'equity' };
+
+  get candidates() { return this.props.candidates || []; }
+  get equityPos() { return this.props.equityPos || []; }
+  get optionPos() { return this.props.optionPos || []; }
+  get breakers() { return this.props.breakers || []; }
+  get tracks() { return this.props.tracks || []; }
+  get lessons() { return this.props.lessons || []; }
+  get hitRates() { return this.props.hitRates || []; }
+
+  select = (id) => this.setState({ selected: id });
+  selectEquity = () => this.setState({ posTab: 'equity' });
+  selectOptions = () => this.setState({ posTab: 'options' });
+
+
+  _c(s){
+    const m={BULLISH:'#2fd39a',APPROVED:'#2fd39a',DONE:'#2fd39a',ARMED:'#2fd39a',
+      BEARISH:'#ff5b6b',REJECTED:'#ff5b6b',HALTED:'#ff5b6b',
+      NEUTRAL:'#f2b34a',AMENDED:'#f2b34a',
+      RUNNING:'#38cfd6',ANALYZING:'#38cfd6',
+      PENDING:'#57647a',DISABLED:'#57647a'};
+    return m[s]||'#8a97a9';
+  }
+  _bg(hex){
+    const m={'#2fd39a':'#0c2119','#ff5b6b':'#221114','#f2b34a':'#241c0d','#38cfd6':'#0c2124','#57647a':'#141b28'};
+    return m[hex]||'#141b28';
+  }
+  _money(n){ const s=n<0?'−':'+'; return s+'$'+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  _plain(n){ return '$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  _pct(n){ const v=n*100; const sign=v>0?'+':(v<0?'−':''); return sign+Math.abs(v).toFixed(1)+'%'; }
+
+  renderVals(){
+    const mode = this.props.tradingMode || 'Paper';
+    const autonomy = this.props.autonomyMode || 'Fully autonomous';
+    const armed = this.props.engineArmed === undefined ? true : this.props.engineArmed;
+    const halted = !armed;
+
+    const candidates = this.candidates.map(c=>{
+      const isSel = c.ticker===this.state.selected;
+      const sc=this._c(c.status);
+      const base='display:flex;flex-direction:column;gap:6px;cursor:pointer;border-radius:10px;padding:11px 12px;transition:border-color .12s,background .12s;';
+      const cardStyle = base + (isSel
+        ? 'background:#131c2a;border:1px solid '+sc+';box-shadow:0 0 0 1px '+sc+'33;'
+        : 'background:#0c111a;border:1px solid #18202e;');
+      return { ...c, isSel, onSelect:()=>this.select(c.ticker),
+        scoreStr: c.score==null?'· · ·':c.score.toFixed(1),
+        ddStr:this._pct(c.dd), statusColor:sc, statusBg:this._bg(sc), cardStyle };
+    });
+
+    const selRaw = this.candidates.find(c=>c.ticker===this.state.selected) || this.candidates[0];
+    const sc=this._c(selRaw.status);
+    let autoLabel, autoColor;
+    if(selRaw.status==='REJECTED'){ autoLabel='BLOCKED — no order placed'; autoColor='#ff5b6b'; }
+    else if(selRaw.status==='ANALYZING'){ autoLabel='CONSENSUS IN PROGRESS'; autoColor='#38cfd6'; }
+    else if(autonomy==='Fully autonomous'){ autoLabel='AUTO-EXECUTED · 9:30 OPEN'; autoColor='#2fd39a'; }
+    else { autoLabel='AWAITING YOUR APPROVAL'; autoColor='#f2b34a'; }
+
+    const sel = { ...selRaw,
+      ddStr:this._pct(selRaw.dd), priceStr:this._plain(selRaw.price), statusColor:sc,
+      sizeStr: selRaw.size?selRaw.size.toFixed(1)+'%':'—',
+      kellyStr: selRaw.kelly==null?'—':'f = '+selRaw.kelly.toFixed(3),
+      corrStr: selRaw.corr==null?'—':selRaw.corr.toFixed(2)+' vs '+selRaw.corrVs,
+      corrColor: selRaw.corr==null?'#8a97a9':(selRaw.corr>0.85?'#ff5b6b':'#c4cddb'),
+      autoLabel, autoColor, autoBg:this._bg(autoColor),
+      sub: selRaw.sub.map(a=>{ const ac=this._c(a.stance); return {...a, stanceColor:ac,
+        confStr: a.conf==null?'—':Math.round(a.conf*100)+'%', confW:(a.conf==null?0:a.conf*100)+'%'}; }),
+      ro: { ...selRaw.ro } };
+
+    const equityPos = this.equityPos.map(p=>{
+      const pnl=(p.last-p.entry)*p.qty, pct=p.last/p.entry-1, stop=p.entry*0.82, on=pct>=0.20;
+      return { ...p, pnlD:this._money(pnl), pnlPct:this._pct(pct),
+        pnlColor: pct>=0?'#2fd39a':'#ff5b6b',
+        entryStr:this._plain(p.entry), lastStr:this._plain(p.last), stopStr:this._plain(stop),
+        trail: on?'TRAILING −10%':'armed at +20%', trailColor: on?'#2fd39a':'#57647a' };
+    });
+
+    const optionPos = this.optionPos.map(o=>{ const pct=o.last/o.entry-1;
+      return { ...o, entry:o.entry.toFixed(2), last:o.last.toFixed(2),
+        pnlPct:this._pct(pct), pnlColor: pct>=0?'#2fd39a':'#ff5b6b' }; });
+
+    const breakers = this.breakers.map(b=>{
+      if(b.disabled) return { ...b, state:'DISABLED', color:'#57647a', barW:'0%' };
+      if(halted) return { ...b, state:'HALTED', color:'#ff5b6b', barW:'100%', note:'global halt — bucket stopped' };
+      const ratio=Math.min(1,Math.abs(b.dd/b.cap));
+      const color = ratio<0.6?'#2fd39a':(ratio<0.9?'#f2b34a':'#ff5b6b');
+      return { ...b, state:'ARMED', color, barW:(ratio*100).toFixed(0)+'%' };
+    });
+
+    const tracks = this.tracks.map(t=>({ ...t, color: t.on?(halted?'#ff5b6b':'#2fd39a'):'#57647a',
+      state: t.on&&halted?'HALTED':t.state }));
+
+    const lessons = this.lessons.map(l=>({ ...l, scoreStr:l.score.toFixed(1),
+      scoreColor: l.score>=1?'#2fd39a':(l.score>=0.5?'#f2b34a':'#ff5b6b') }));
+
+    const hitRates = this.hitRates.map(h=>({ ...h, rateStr:(h.rate*100).toFixed(0)+'%',
+      barW:(h.rate*100)+'%', color: h.rate>=0.6?'#2fd39a':(h.rate>=0.5?'#f2b34a':'#8a97a9') }));
+
+    const modeLabel = mode==='Live'?'● LIVE CAPITAL':'● PAPER';
+    const modeColor = mode==='Live'?'#2fd39a':'#f2b34a';
+    const modeBg = this._bg(modeColor);
+
+    const tabBase='cursor:pointer;border-radius:7px;padding:8px 13px;font:600 11px/1 \'Space Grotesk\';letter-spacing:.03em;transition:all .12s;';
+    const tabOn=tabBase+'background:#131c2a;border:1px solid #2a3446;color:#e9eef7;';
+    const tabOff=tabBase+'background:transparent;border:1px solid transparent;color:#57647a;';
+    const showEquity = this.state.posTab==='equity';
+
+    return { halted, candidates, sel, equityPos, optionPos, breakers, tracks, lessons, hitRates,
+      modeLabel, modeColor, modeBg,
+      selectEquity:this.selectEquity, selectOptions:this.selectOptions,
+      showEquity, showOptions:!showEquity,
+      tabEquityStyle: showEquity?tabOn:tabOff, tabOptionsStyle: showEquity?tabOff:tabOn };
+  }
+}
+</script>
+</body>
+</html>
