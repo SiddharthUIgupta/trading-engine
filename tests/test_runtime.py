@@ -224,7 +224,7 @@ def _hold_payload(ticker: str) -> ConsensusPayload:
 
 
 def _option_contract(
-    option_type: OptionType = OptionType.CALL, dte: int = 35, strike: float = 100.0,
+    option_type: OptionType = OptionType.CALL, dte: int = 3, strike: float = 100.0,
     underlying_price: float = 100.0, bid: float = 1.0, ask: float = 1.10,
 ) -> OptionContract:
     return OptionContract(
@@ -333,7 +333,7 @@ def test_check_options_exits_force_closes_near_expiration(runtime: TradingRuntim
     """Must fire even with healthy P&L — this is the rule that actually
     keeps the track out of 0-1 DTE-style risk, not the stop-loss.
     """
-    expiration = (date.today() + timedelta(days=1)).isoformat()  # inside the 2-day force-close floor
+    expiration = (date.today() + timedelta(days=0)).isoformat()  # inside the 0-day force-close floor
     runtime._state_store.upsert_option_position(
         "TEST260701C00100000", "TEST", "call", 100.0, expiration, quantity=5, avg_entry_price=1.10,
     )

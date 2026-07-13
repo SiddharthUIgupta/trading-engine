@@ -194,6 +194,7 @@ def test_fresh_order_intent_still_executes(protection: ProtectionRuntime):
 # for Alpha Plane's entry decisions, never for Protection's exit checks.
 
 def test_options_exit_fires_even_when_options_track_disabled(protection: ProtectionRuntime):
+    protection._settings.options_track_enabled = False
     assert protection._settings.options_track_enabled is False  # the exact bug condition
 
     protection._state_store.upsert_option_position(
