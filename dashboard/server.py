@@ -16,10 +16,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from config.settings import get_settings
 from execution_layer.broker import AlpacaBroker
@@ -347,6 +348,34 @@ def api_performance():
         "hit_rates": hit_rates,
         "lessons": lessons,
     }
+
+
+class TriggerRequest(BaseModel):
+    scan: str = "thesis"
+    tickers: list[str] = []
+
+
+@app.post("/api/trigger")
+def api_trigger(req: TriggerRequest):
+    """Write a manual trigger for the Alpha plane to pick up within 15 seconds."""
+    from execution_layer.manual_trigger import write_trigger, VALID_SCANS
+    if req.scan not in VALID_SCANS:
+        raise HTTPException(status_code=400, detail=f"scan must be one of {VALID_SCANS}")
+    tickers = [t.upper().strip() for t in req.tickers if t.strip()]
+    ts = write_trigger(req.scan, tickers or None)
+    return {
+        "ok": True,
+        "scan": req.scan,
+        "tickers": tickers,
+        "queued_at": ts,
+        "message": f"Queued {req.scan} scan for {', '.join(tickers) if tickers else 'full universe'} — engine picks up within 15s",
+    }
+
+
+@app.get("/api/trigger/history")
+def api_trigger_history():
+    from execution_layer.manual_trigger import read_trigger_history
+    return {"history": read_trigger_history()}
 
 
 @app.get("/api/research")

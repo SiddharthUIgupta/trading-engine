@@ -678,12 +678,32 @@ class AlphaRuntime:
 
     def check_manual_trigger(self) -> None:
         from execution_layer.manual_trigger import read_and_clear_trigger
-        scan = read_and_clear_trigger()
-        if scan is None:
+        trigger = read_and_clear_trigger()
+        if trigger is None:
             return
+        scan = trigger["scan"]
+        tickers = trigger["tickers"]
         today = date.today()
         equity = self._broker.get_equity()
-        logger.info("Manual trigger fired: scan=%r", scan)
+        logger.info("Manual trigger fired: scan=%r tickers=%s", scan, tickers or "full screen")
+
+        if tickers:
+            # Per-ticker path: bypass screen, run consensus directly on the given tickers.
+            # Dedup against today's already-scanned set so we don't re-evaluate the same
+            # ticker twice in one session if the scheduled scan already caught it.
+            new_tickers = [t for t in tickers if t not in self._scanned_tickers_today]
+            if not new_tickers:
+                logger.info("All requested tickers already scanned today: %s", tickers)
+                return
+            self._thesis_breaker.ensure_day_started(
+                equity=equity, today=today,
+                profit_target_pct=self._settings.daily_profit_target_pct,
+            )
+            logger.info("=== MANUAL TICKER SCAN: %s ===", new_tickers)
+            self._scan_and_run_consensus(new_tickers, today, equity, strategy=scan)
+            self._queue_pending_as_intents(today)
+            return
+
         if scan == "thesis":
             self.thesis_scan_and_trade()
         elif scan == "swing":

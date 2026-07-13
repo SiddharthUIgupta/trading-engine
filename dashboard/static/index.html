@@ -20,7 +20,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Space 
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 
 /* layout */
-.shell{display:grid;grid-template-rows:56px 1fr;height:100vh;overflow:hidden}
+.shell{display:grid;grid-template-rows:56px auto 1fr;height:100vh;overflow:hidden}
 .topbar{display:flex;align-items:center;gap:20px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
 .main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
 .sidebar{overflow-y:auto;padding:16px 12px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:12px}
@@ -42,6 +42,19 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Space 
 .refresh-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
 .last-update{font:400 11px/1 var(--mono);color:var(--muted)}
+
+/* trigger bar */
+.trigger-bar{display:flex;align-items:center;gap:8px;padding:8px 24px;background:var(--surface2);border-bottom:1px solid var(--border)}
+.trigger-input{flex:1;max-width:320px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:7px 12px;color:var(--text);font:500 13px/1 var(--mono);outline:none;transition:border-color .15s}
+.trigger-input:focus{border-color:var(--accent)}
+.trigger-input::placeholder{color:var(--muted)}
+.scan-select{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:7px 10px;color:var(--text);font:500 12px/1 'Space Grotesk';outline:none;cursor:pointer}
+.run-btn{padding:7px 18px;border-radius:7px;border:none;background:var(--accent);color:#0a0e14;font:600 12px/1 'Space Grotesk';cursor:pointer;transition:opacity .15s}
+.run-btn:hover{opacity:.85}
+.run-btn:disabled{opacity:.4;cursor:not-allowed}
+.trigger-status{font:400 11px/1 var(--mono);color:var(--muted);transition:color .3s}
+.trigger-status.ok{color:var(--green)}
+.trigger-status.err{color:var(--red)}
 
 /* cards */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
@@ -131,7 +144,7 @@ tr:hover td{background:var(--surface2)}
 <div class="shell">
 
 <!-- topbar -->
-<header class="topbar">
+<header class="topbar" style="grid-row:1">
   <span class="logo">trading-engine</span>
   <span id="mode-badge" class="badge paper">PAPER</span>
   <span id="armed-badge" class="badge armed">ARMED</span>
@@ -145,6 +158,18 @@ tr:hover td{background:var(--surface2)}
     <span id="last-update" class="last-update">—</span>
   </div>
 </header>
+
+<!-- trigger bar -->
+<div class="trigger-bar">
+  <input id="ticker-input" class="trigger-input" type="text" placeholder="Ticker(s) e.g. NVDA, AAPL" autocomplete="off" autocapitalize="characters" spellcheck="false">
+  <select id="scan-select" class="scan-select">
+    <option value="thesis">Thesis</option>
+    <option value="swing">Swing</option>
+    <option value="gap">Gap</option>
+  </select>
+  <button id="run-btn" class="run-btn" onclick="runTrigger()">▶ Run Scan</button>
+  <span id="trigger-status" class="trigger-status"></span>
+</div>
 
 <div class="main">
 
@@ -464,6 +489,45 @@ async function refresh() {
     $('last-update').textContent = 'error: ' + e.message;
   }
 }
+
+// ── manual trigger ─────────────────────────────────────────────────────────
+async function runTrigger() {
+  const input = $('ticker-input');
+  const btn = $('run-btn');
+  const status = $('trigger-status');
+  const raw = input.value.trim();
+  const tickers = raw ? raw.split(/[\s,]+/).map(t => t.toUpperCase()).filter(Boolean) : [];
+  const scan = $('scan-select').value;
+
+  btn.disabled = true;
+  status.className = 'trigger-status';
+  status.textContent = 'Queuing…';
+
+  try {
+    const r = await fetch('/api/trigger', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scan, tickers}),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    status.className = 'trigger-status ok';
+    status.textContent = d.message;
+    input.value = '';
+    // Switch to candidates tab so user sees result arrive
+    switchTab('candidates');
+    // Refresh candidates after 18s (engine picks up in ≤15s, consensus ~5-30s more)
+    setTimeout(refresh, 18000);
+  } catch(e) {
+    status.className = 'trigger-status err';
+    status.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Allow Enter key in input
+$('ticker-input').addEventListener('keydown', e => { if (e.key === 'Enter') runTrigger(); });
 
 refresh();
 setInterval(refresh, 30000);
