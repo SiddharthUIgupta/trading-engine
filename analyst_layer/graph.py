@@ -21,6 +21,7 @@ from analyst_layer.agents.macro_sentiment_agent import MacroSentimentAgent
 from analyst_layer.agents.risk_officer_agent import AccountContext, RiskOfficerAgent
 from analyst_layer.agents.technical_agent import TechnicalAgent
 from analyst_layer.schemas import AgentSignal, ConsensusPayload, RiskReview, TradeProposal
+from analyst_layer import vibe_data
 from data_layer.models import FilingSummary, FundamentalsSnapshot, PriceSeries, SentimentSnapshot
 
 
@@ -62,14 +63,22 @@ def build_consensus_graph(
 
     def fundamental_node(state: ConsensusState) -> dict:
         try:
-            signal = fundamental_agent.analyze(state["ticker"], state["fundamentals"], state["filings"], lessons=state.get("lessons", ""))
+            sec_context = vibe_data.fetch_sec_context(state["ticker"])
+            signal = fundamental_agent.analyze(
+                state["ticker"], state["fundamentals"], state["filings"],
+                lessons=state.get("lessons", ""), sec_context=sec_context,
+            )
             return {"signals": [signal]}
         except Exception as exc:  # noqa: BLE001
             return {"errors": [f"fundamental_sec_agent failed: {exc}"]}
 
     def technical_node(state: ConsensusState) -> dict:
         try:
-            signal = technical_agent.analyze(state["ticker"], state["price_series"], lessons=state.get("lessons", ""))
+            extra_context = vibe_data.compute_technical_signals(state["price_series"])
+            signal = technical_agent.analyze(
+                state["ticker"], state["price_series"],
+                lessons=state.get("lessons", ""), extra_context=extra_context,
+            )
             return {"signals": [signal]}
         except Exception as exc:  # noqa: BLE001
             return {"errors": [f"technical_analysis_agent failed: {exc}"]}

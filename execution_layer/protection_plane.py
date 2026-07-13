@@ -24,6 +24,8 @@ from anthropic import Anthropic
 from analyst_layer import lesson_store, prefilter
 from analyst_layer.pricing import estimate_cost_usd
 from analyst_layer.reflection_agent import ReflectionAgent
+from execution_layer.postmortem_writer import write_postmortem
+from execution_layer.wiki_writer import write_wiki_note
 from analyst_layer.agents.intraday_exit_agent import IntradayExitAgent
 from analyst_layer.vw_bandit import VWSignalBandit
 from config.settings import Settings
@@ -771,6 +773,12 @@ class ProtectionRuntime:
                     ticker, position["quantity"], real_qty,
                 )
                 if real_qty == 0:
+                    fill_price = self._broker.get_last_fill_price(ticker) or position["avg_entry_price"]
+                    pnl = self._state_store.record_realized_sale(
+                        ticker=ticker, sale_date=date.today(), quantity=position["quantity"],
+                        sale_price=fill_price, cost_basis=position["avg_entry_price"],
+                    )
+                    self._trigger_reflection(ticker, position.get("strategy") or "unknown", pnl)
                     self._state_store.delete_position(ticker)
                 else:
                     self._state_store.upsert_position(
@@ -792,6 +800,13 @@ class ProtectionRuntime:
                     contract_symbol, position["quantity"], real_qty,
                 )
                 if real_qty == 0:
+                    fill_price = self._broker.get_last_fill_price(contract_symbol) or position["avg_entry_price"]
+                    pnl = self._state_store.record_realized_option_sale(
+                        contract_symbol=contract_symbol, underlying_symbol=position["underlying_symbol"],
+                        sale_date=date.today(), contracts=position["quantity"],
+                        sale_price=fill_price, cost_basis=position["avg_entry_price"],
+                    )
+                    self._trigger_reflection(position["underlying_symbol"], position.get("strategy") or "unknown", pnl)
                     self._state_store.delete_option_position(contract_symbol)
                 else:
                     self._state_store.upsert_option_position(
@@ -1116,6 +1131,8 @@ class ProtectionRuntime:
                 regime=regime_at_entry,
                 signals=agent_signals,
                 pnl=pnl,
+                ticker=ticker,
+                promoted_factors=self._settings.promoted_vw_factors,
             )
 
             if not agent_signals:
@@ -1175,6 +1192,37 @@ class ProtectionRuntime:
                     "Reflection complete for %s (P&L $%+.2f): %d lesson(s) stored",
                     ticker, pnl, len(reflection.lessons),
                 )
+
+                if reflection.lessons:
+                    outcome_label = "WIN" if pnl > 0 else "LOSS"
+                    lesson_lines = "\n".join(f"- {lo.lesson}" for lo in reflection.lessons)
+                    setup_tags = list({
+                        tag for lo in reflection.lessons for tag in lo.setup_tags
+                    })
+                    body = (
+                        f"Strategy: {strategy}  Regime: {regime_at_entry}  Outcome: {outcome_label}\n\n"
+                        f"## Root cause\n{reflection.root_cause}\n\n"
+                        f"## What happened\n{reflection.what_happened}\n\n"
+                        f"## Rules derived\n{lesson_lines}"
+                    )
+                    write_wiki_note(
+                        title=f"{strategy} in {regime_at_entry} regime — {ticker} pattern",
+                        body=body,
+                        category="patterns",
+                        tags=[strategy, regime_at_entry, ticker, outcome_label.lower()] + setup_tags,
+                    )
+
+            write_postmortem(
+                ticker=ticker,
+                strategy=strategy,
+                regime=regime_at_entry,
+                entry_price=market_context.get("entry_price"),
+                pnl=pnl,
+                agent_signals=agent_signals,
+                what_happened=reflection.what_happened,
+                root_cause=reflection.root_cause,
+                lessons=[lo.lesson for lo in reflection.lessons],
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Post-trade reflection failed for %s: %s", ticker, exc)
 

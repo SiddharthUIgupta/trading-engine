@@ -2655,6 +2655,8 @@ class TradingRuntime:
                     regime=regime_at_entry,
                     signals=agent_signals,
                     pnl=pnl,
+                    ticker=ticker,
+                    promoted_factors=self._settings.promoted_vw_factors,
                 )
 
             # Update robust circuit breaker consecutive loss counter

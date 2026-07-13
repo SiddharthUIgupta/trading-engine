@@ -221,11 +221,11 @@ class VolatilitySnapshot(StrictModel):
 
 
 class ThesisCandidate(StrictModel):
-    """One row from OpenBB's aggressive_small_caps/undervalued_growth
-    discovery screens — the thesis track's universe. Unlike MarketMover,
-    these screens already carry the fields the pullback-from-high check
+    """One row from OpenBB's discovery screens (undervalued_growth,
+    aggressive_small_caps, gainers, active — any market cap). Unlike
+    MarketMover, these screens already carry the fields the thesis screen
     needs (year_high, moving averages, basic earnings context), so no
-    extra per-ticker fetch is needed to run the deterministic screen.
+    extra per-ticker fetch is needed before the LLM consensus run.
     """
 
     symbol: str

@@ -5,10 +5,10 @@ MAX_POSITION_SIZE_PCT, MAX_DAILY_DRAWDOWN_PCT, or the paper/live switch.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 LIVE_CONFIRM_TOKEN = "I_UNDERSTAND_THIS_IS_LIVE_CAPITAL"
 UNCOVERED_CONFIRM_TOKEN = "I_UNDERSTAND_STRANGLES_HAVE_UNBOUNDED_RISK"
@@ -101,7 +101,17 @@ class Settings(BaseSettings):
     # Env-configurable tickers appended to the dynamic discovery universe.
     # Comma-separated: EXTRA_WATCHLIST_TICKERS=AAPL,MSFT,NVDA
     # Default is empty — universe comes from OpenBB screens per CLAUDE.md invariant.
-    extra_watchlist_tickers: list[str] = Field(default_factory=list, alias="EXTRA_WATCHLIST_TICKERS")
+    extra_watchlist_tickers: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="EXTRA_WATCHLIST_TICKERS"
+    )
+
+    # --- Vibe-Trading factor enrichment (shadow only — see CLAUDE.md Phase 2) ---
+    # Empty until scripts/signal_uplift.py shows edge at n>=300 closed trades.
+    # Non-empty here does NOT enable sizing impact by itself; that's a separate,
+    # explicitly-approved change to the Kelly fraction in alpha_plane.py.
+    promoted_vw_factors: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="PROMOTED_VW_FACTORS"
+    )
 
     # --- Dynamic universe (replaces a fixed watchlist) ---
     # Built daily from OpenBB's active/gainers/losers discovery screens
@@ -204,11 +214,15 @@ class Settings(BaseSettings):
     # daily, not every 30 min — fundamentals don't change intraday.
     # See analyst_layer/thesis_scanner.py.
     thesis_track_enabled: bool = Field(default=True, alias="THESIS_TRACK_ENABLED")
-    thesis_min_pullback_pct: float = Field(default=0.20, alias="THESIS_MIN_PULLBACK_PCT")
-    # Ceiling, not just a floor — beyond this, a pullback is statistically
-    # much more likely to be a genuinely impaired business than a quality
-    # name temporarily out of favor (failed trial, accounting issue,
-    # secular decline, vs. RDW-style dislocation).
+    # 0.0 = no minimum pullback required; breakout and momentum names near
+    # their highs pass through and are evaluated by the LLM agents. The
+    # original 0.20 default was backtest-era logic that blocked high-quality
+    # breakout names (e.g. stocks near 52w highs). Set THESIS_MIN_PULLBACK_PCT
+    # in .env to restore the floor if needed. Backtest artifact (PF 1.49) was
+    # run at 0.20; the floor is now removed so the LLM decides, not the screen.
+    thesis_min_pullback_pct: float = Field(default=0.0, alias="THESIS_MIN_PULLBACK_PCT")
+    # Ceiling still in place — beyond 50% drawdown the stock passes to the
+    # recovery track (which handles deeper dips with its own parameters).
     thesis_max_pullback_pct: float = Field(default=0.50, alias="THESIS_MAX_PULLBACK_PCT")
     # Raised from 10: backtest shows 58% win rate and +6.27% avg return on thesis.
     # More candidates = more quality setups reviewed by the LLM each day.
@@ -376,6 +390,13 @@ class Settings(BaseSettings):
     def _parse_csv_tickers(cls, v: object) -> list[str]:
         if isinstance(v, str):
             return [t.strip().upper() for t in v.split(",") if t.strip()]
+        return v  # type: ignore[return-value]
+
+    @field_validator("promoted_vw_factors", mode="before")
+    @classmethod
+    def _parse_csv_factors(cls, v: object) -> list[str]:
+        if isinstance(v, str):
+            return [f.strip() for f in v.split(",") if f.strip()]
         return v  # type: ignore[return-value]
 
     @field_validator("max_position_size_pct", "max_daily_drawdown_pct", "options_max_risk_pct", "options_stop_loss_pct", "vol_options_max_risk_pct", "vol_options_profit_target_pct", "exit_trailing_stop_activation_pct", "exit_trailing_stop_pct", "exit_stop_loss_pct", "vol_universe_max_spread_pct", "intraday_capital_pct", "options_capital_pct", "thesis_capital_pct", "swing_capital_pct", "swing_stop_loss_pct", "swing_trailing_stop_pct", "swing_trailing_stop_activation_pct")

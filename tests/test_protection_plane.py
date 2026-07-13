@@ -274,6 +274,54 @@ def test_reconcile_option_positions_one_contract_api_failure_does_not_block_othe
     assert positions["FINE260731C00050000"]["quantity"] == 1
 
 
+# ── Regression: a bracket stop/target filling directly at the broker (not via
+# our own submit_order call) must still be recorded in the ledger. Before this
+# fix, _reconcile_positions/_reconcile_option_positions just deleted the local
+# position on real_qty == 0 with no record_realized_sale/record_realized_option_sale
+# call — silently dropping the trade from realized_sales. Found via a 31-trade
+# gap between Alpaca's filled-order history and the local ledger (2026-07-12).
+
+def test_reconcile_positions_records_realized_sale_when_broker_closed_flat(protection: ProtectionRuntime):
+    protection._state_store.upsert_position(
+        "AAPL", quantity=10, avg_entry_price=100.0,
+        last_buy_at=date.today().isoformat(), strategy="thesis",
+    )
+    protection._broker.get_position_detail.return_value = {
+        "qty": 0.0, "avg_entry_price": 100.0, "current_price": 0.0, "unrealized_plpc": 0.0,
+    }
+    protection._broker.get_last_fill_price.return_value = 118.0
+
+    protection._reconcile_positions()
+
+    sales = protection._state_store.get_all_realized_sales()
+    assert len(sales) == 1
+    assert sales[0]["ticker"] == "AAPL"
+    assert sales[0]["sale_price"] == 118.0
+    assert sales[0]["realized_pnl"] == pytest.approx((118.0 - 100.0) * 10)
+    assert protection._state_store.get_position("AAPL") is None
+
+
+def test_reconcile_option_positions_records_realized_sale_when_broker_closed_flat(protection: ProtectionRuntime):
+    protection._state_store.upsert_option_position(
+        contract_symbol="AAPL260731C00200000", underlying_symbol="AAPL", option_type="call",
+        strike=200.0, expiration="2026-07-31", quantity=2, avg_entry_price=5.0,
+        opened_at=date.today().isoformat(), strategy="orb_options",
+    )
+    protection._broker.get_position_detail.return_value = {
+        "qty": 0.0, "avg_entry_price": 5.0, "current_price": 0.0, "unrealized_plpc": 0.0,
+    }
+    protection._broker.get_last_fill_price.return_value = 8.0
+
+    protection._reconcile_option_positions()
+
+    sales = protection._state_store.get_all_realized_option_sales()
+    assert len(sales) == 1
+    assert sales[0]["contract_symbol"] == "AAPL260731C00200000"
+    assert sales[0]["sale_price"] == 8.0
+    assert sales[0]["realized_pnl"] == pytest.approx((8.0 - 5.0) * 2 * 100)
+    assert protection._state_store.get_option_position("AAPL260731C00200000") is None
+
+
 # ── Regression: swing_track_enabled gated _check_swing_exits the same way
 # options_track_enabled gated options exits (bug #4/#6 in the 2026-07-06
 # audit). Dormant only because the flag defaults True — if it's ever

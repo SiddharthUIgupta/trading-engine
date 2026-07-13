@@ -23,7 +23,7 @@ claudian (role TBD — investigate on first Pi session)
 
 ### What each repo does
 
-**trading-engine** (`~/Projects/trading-engine`) — *this repo, the live executor*
+**trading-engine** (`~/trading-engine`) — *this repo, the live executor*
 - Two-plane architecture: Alpha Plane (scans + LLM consensus + order intent writes) + Protection Plane (exits + brackets + reconciliation)
 - IPC via SQLite WAL — Alpha writes `order_intents` table, Protection reads and executes
 - 4-agent LLM consensus: sentiment + fundamental + technical analysts + Risk Officer (Claude Sonnet)
@@ -35,7 +35,7 @@ claudian (role TBD — investigate on first Pi session)
 **Vibe-Trading** (`~/Projects/Vibe-Trading`) — *research and backtest lab*
 - Source: `HKUDS/Vibe-Trading`, install as package: `pip install vibe-trading-ai` (NOT `pip install -e .`)
 - **460 pre-built alpha factors** grouped as: alpha101 (Qlib — 101 price/volume), gtja191 (GTJA — 191 factors), qlib158 (quant lib academic), and additional academic set. All point-in-time safe.
-- **Alpha bench**: `from src.tools.alpha_bench_tool import run_alpha_bench` — call with `(universe=tickers, start=..., end=...)`, returns list of `{factor_id, ic, n}` rows. IC = Spearman correlation of factor rank vs next-day return.
+- **Alpha bench**: use `scripts/alpha_bench_custom.py` (not `run_alpha_bench` directly — it only supports csi300/sp500/btc-usdt, which are fixed indices that don't match our actual traded tickers). Our universe is whatever OpenBB screens surface each day — any market cap. IC = Spearman correlation of factor rank vs next-day return. Threshold: ic_mean > 0.03, ic_count ≥ 300.
 - **Factor compute pattern**: `Registry().compute(alpha_id, panel)` where `panel = {ticker: OHLCV_DataFrame}`. Returns a DataFrame indexed by date with ticker columns. Find `Registry` class with: `grep -r "class Registry" ~/Projects/Vibe-Trading/src/`
 - **Multi-agent swarm**: natural-language research goals run by an investment committee agent
 - **MCP server**: `vibe-trading-mcp` (stdio), 54+ tools — can be added to `.mcp.json` for use in Claude Code sessions
@@ -66,20 +66,32 @@ claude-obsidian is the memory layer. Every closed trade writes a structured post
   ```
 - **Re-index after adding pages**: run `bash bin/setup-retrieve.sh` again (fast, incremental)
 - **Skills available inside the claude-obsidian directory**: `/wiki` (scaffold new topic), `/autoresearch [topic]` (3-round web research → files in wiki), `/wiki-retrieve` (ad-hoc search), `/think`, `/canvas`
-- **What to put in the vault** (drop into `.raw/` then run `/wiki`):
+- **The vault is the shared brain — both human and AI write to it.** It is not a passive log. Every session, Claude should write what was discovered. Every closed trade, the agents write what was learned. Sid drops in notes, transcripts, strategy docs. The retrieval API surfaces all of it to future sessions and to the Risk Officer. Nothing is forgotten.
+- **What goes in the vault:**
   - Sid's post-trade notes ("bought MSFT thesis at 420, stopped at 415, resistance was the breakout level not support")
   - Sector-level market structure notes ("tech in bull regime: wait for consolidation > 3 days before thesis entry")
   - Earnings calendar context, Fed decision notes, any macro event that changes regime behaviour
   - The trading-engine's own ARCHITECTURE.md and strategy documentation
-  - Auto-written post-mortems (these go directly into `vaults/trading/postmortems/` — see Phase 3)
-- **Integration point with trading-engine**:
-  - Risk Officer prompt enrichment: `scripts/retrieve.py "TICKER SECTOR REGIME"` → prepend top-3 snippets to Risk Officer system prompt at `analyst_layer/agents/risk_officer_agent.py:44`
-  - Post-mortem ingest: after each closed trade, write a markdown file to `vaults/trading/postmortems/TICKER-DATE.md` → BM25 index picks it up → future trades in the same setup get the memory
-  - See Phase 3 for exact implementation.
+  - **Claude's session discoveries** — any non-obvious finding from a session: wrong import path, bug root cause, regime pattern, architectural decision. Written via `python3 scripts/wiki_note.py "Title" "Body" --category sessions`
+  - **Agent pattern notes** — written automatically by `wiki_writer.py` from `_run_reflection()` when non-noise lessons are extracted from a closed trade. Goes to `wiki/patterns/`
+  - **Post-mortems** — written automatically by `postmortem_writer.py` after every closed trade. Goes to `wiki/postmortems/`
+- **Claude Code session protocol** — at the end of any session where something non-obvious was learned, write it to the vault:
+  ```bash
+  # From ~/trading-engine:
+  python3 scripts/wiki_note.py "Title" "Body" --category sessions   # architectural/technical
+  python3 scripts/wiki_note.py "Title" "Body" --category strategy   # trading patterns/rules
+  ```
+  Examples of what to write: wrong import paths corrected, why a bug happened, regime observations from backtests, why a strategy was disabled, what a config flag actually does in production.
+- **Integration point with trading-engine (Phase 3 — IMPLEMENTED 2026-07-12)**:
+  - Post-mortem ingest: `execution_layer/postmortem_writer.py` — called from `_run_reflection()` after each closed trade → writes `wiki/postmortems/TICKER-DATE.md` → incremental BM25 re-index → future trades in the same setup get the memory
+  - Trade memory retrieval: `_fetch_trade_memory()` in `execution_layer/alpha_plane.py` — called before each consensus run → queries `scripts/retrieve.py "TICKER STRATEGY REGIME"` → top-3 snippets prepended to `lessons_text` fed to all 4 agents
+  - **Pi-only setup required**: run `bash bin/setup-vault.sh` then `bash bin/setup-retrieve.sh --no-llm` once to provision the BM25 index
 
-**claudian** (`~/Projects/claudian`) — *unknown — investigate on first Pi session*
-- Source: `YishenTu/claudian` — not yet cloned on Mac, role not yet determined
-- **First action on Pi**: `cat ~/Projects/claudian/README.md` — read it, understand what it does, then update this CLAUDE.md section via `/preserve` with what you learned and where it fits in the integration plan
+**claudian** (`~/Projects/claudian`) — *Obsidian plugin — NOT a trading system integration*
+- Source: `YishenTu/claudian` — TypeScript Obsidian plugin that embeds Claude Code, Codex, and other AI coding agents inside an Obsidian vault
+- **What it does**: chat sidebar inside Obsidian, inline edit with word-level diff, slash commands, MCP server support, multi-tab conversations
+- **Role in this system**: none. It is a UI plugin for Obsidian, not a Python library. There is no importable API. It has no connection to trading-engine and no planned integration phase.
+- **Do not attempt to import or call claudian from Python**
 
 **cpr-compress-preserve-resume** (`~/Projects/cpr-compress-preserve-resume`) — *session context preservation*
 - Source: `EliaAlberti/cpr-compress-preserve-resume`
@@ -113,7 +125,7 @@ git clone https://github.com/AgriciDaniel/claude-obsidian.git
 git clone https://github.com/EliaAlberti/cpr-compress-preserve-resume.git
 
 # ── 1. Pull trading-engine changes ──────────────────────────────────────────
-cd ~/Projects/trading-engine && git pull
+cd ~/trading-engine && git pull
 
 # ── 2. Add to .env (get bot token from @BotFather on Telegram) ─────────────
 #    TELEGRAM_BOT_TOKEN=<token>
@@ -130,7 +142,7 @@ cd ~/Projects/trading-engine && git pull
 sudo systemctl restart trading-engine-alpha trading-engine-protection
 ```
 
-### Phase 2 — Next (NOT started)
+### Phase 2 — IMPLEMENTED (2026-07-12, shadow mode)
 
 **Why:** The VW bandit currently learns from only 3 feature namespaces: `track`, `regime`, and `agent_votes`. These are high-level categorical signals. Vibe-Trading has 460 pre-built quantitative alpha factors (momentum, reversal, vol-adjusted, cross-sectional rank) that are point-in-time safe. Adding these as VW feature namespaces gives the bandit richer context → better win-probability estimates → less Kelly-size waste on low-confidence setups. The alpha bench step ensures we only promote factors with proven IC on our actual thesis universe, satisfying the "no strategy without a backtest artifact" invariant.
 
@@ -141,12 +153,12 @@ sudo systemctl restart trading-engine-alpha trading-engine-protection
 ```bash
 # Install as pip package (do NOT pip install -e . — the package is on PyPI)
 cd ~/Projects/Vibe-Trading
-~/Projects/trading-engine/.venv/bin/pip install vibe-trading-ai
+~/trading-engine/.venv/bin/pip install vibe-trading-ai
 
 # Interactive setup — writes keys to ~/.vibe-trading/.env
 vibe-trading init
 # Prompts for: ANTHROPIC_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY, FINNHUB_API_KEY
-# Keys must also exist in ~/Projects/trading-engine/.env (already set for the engine)
+# Keys must also exist in ~/trading-engine/.env (already set for the engine)
 
 # Verify install
 vibe-trading --help    # should print CLI help
@@ -154,104 +166,33 @@ vibe-trading --help    # should print CLI help
 
 **Step 2 — Discover which factors have edge on thesis universe**
 
-Run the alpha bench against the thesis universe (100+ closed trade tickers). This step determines the `PROMOTED_FACTORS` list used in Step 4.
+Run the custom alpha bench against our actual realized-sale tickers. `run_alpha_bench()` from Vibe-Trading only supports fixed indices (csi300/sp500/btc-usdt) — our universe is whatever OpenBB screens surface each day, any market cap, so a generic index is the wrong population. We use `scripts/alpha_bench_custom.py` which calls `Registry.compute()` + `compute_ic_series()` directly on yfinance-downloaded OHLCV for our actual realized_sales tickers.
 
 ```bash
-# Run bench from Vibe-Trading repo (use trading-engine .venv which has the package)
-cd ~/Projects/Vibe-Trading
-~/Projects/trading-engine/.venv/bin/python - <<'EOF'
-from src.tools.alpha_bench_tool import run_alpha_bench
-# thesis_universe: list of tickers from your closed trades
-# Fetch from DB: SELECT DISTINCT ticker FROM realized_sales
-import sqlite3
-conn = sqlite3.connect("/home/sid/Projects/trading-engine/state/trading_engine.sqlite3")
-tickers = [r[0] for r in conn.execute("SELECT DISTINCT ticker FROM realized_sales").fetchall()]
-conn.close()
-
-# IC threshold: Spearman IC > 0.03 at n≥300 = candidate for promotion
-results = run_alpha_bench(universe=tickers, start="2024-01-01", end="2025-12-31")
-# Print factors above threshold
-for row in results:
-    if row["ic"] > 0.03 and row["n"] >= 300:
-        print(row["factor_id"], row["ic"])
-EOF
+cd ~/trading-engine
+# Blocked until ~100+ closed thesis trades exist (n_threshold=300 dates of IC)
+.venv/bin/python scripts/alpha_bench_custom.py --zoo alpha101   # start with alpha101 (fastest)
+.venv/bin/python scripts/alpha_bench_custom.py                   # full 460-factor run (slow)
 ```
-Copy the printed factor IDs — these become `PROMOTED_FACTORS` in `settings.py`.
 
-**Step 3 — Add promoted_factors setting to settings.py**
+Output prints `PROMOTE CANDIDATES` (ic_mean > 0.03, ic_count ≥ 300) and the exact `PROMOTED_VW_FACTORS=...` line to paste into `.env`. Full results also written to `state/alpha_bench_results.csv`.
 
-In `config/settings.py`, add alongside the other fields:
-```python
-promoted_vw_factors: list[str] = Field(
-    default_factory=list, alias="PROMOTED_VW_FACTORS"
-)
+**API note (do not use run_alpha_bench for this):**
+`run_alpha_bench(universe="sp500", period="2025-2026")` is the correct call signature (period is always relative — update the year range when running) but tests on a fixed index, not our actual traded tickers. It returns `{"status": "ok", "top": [{"id": ..., "ic_mean": ..., "ir": ..., "ic_count": ...}]}` — fields named `id`/`ic_mean`/`ic_count`, NOT `factor_id`/`ic`/`n` as an earlier CLAUDE.md draft assumed.
 
-@field_validator("promoted_vw_factors", mode="before")
-@classmethod
-def _parse_csv_factors(cls, v: object) -> list[str]:
-    if isinstance(v, str):
-        return [f.strip() for f in v.split(",") if f.strip()]
-    return v
-```
-Then add to `.env`: `PROMOTED_VW_FACTORS=alpha101_001,gtja191_030,...` (from Step 2 output).
+Copy the printed factor IDs — these become `PROMOTED_VW_FACTORS` in `.env`.
 
-**Step 4 — Create factor_provider.py**
+**Step 3 — Add promoted_factors setting to settings.py — IMPLEMENTED (2026-07-12)**
 
-Create `analyst_layer/factor_provider.py`:
-```python
-from __future__ import annotations
-import logging, sys
-from pathlib import Path
-import pandas as pd
+`config/settings.py` already has `promoted_vw_factors` with CSV validator. After Step 2, add to `.env`: `PROMOTED_VW_FACTORS=alpha101_001,gtja191_030,...` (from `scripts/alpha_bench_custom.py` output).
 
-_VIBE_PATH = Path.home() / "Projects" / "Vibe-Trading"
-_log = logging.getLogger(__name__)
+**Step 4 — Create factor_provider.py — IMPLEMENTED (2026-07-12)**
 
-def compute_factor_features(ticker: str, factor_ids: list[str]) -> dict[str, float]:
-    """Returns {factor_id: latest_value} for each promoted factor. Empty dict on failure."""
-    if not factor_ids or not (_VIBE_PATH / "src").exists():
-        return {}
-    try:
-        sys.path.insert(0, str(_VIBE_PATH))
-        from src.alpha.factor_registry import Registry  # confirmed location in Vibe-Trading repo
-        reg = Registry()
-        # panel = {ticker: OHLCV DataFrame for last 252 trading days}
-        # Vibe-Trading's data adapters wrap yfinance — use the same period as backtest
-        import yfinance as yf
-        raw = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
-        panel = {ticker: raw}
-        out: dict[str, float] = {}
-        for fid in factor_ids:
-            try:
-                result: pd.DataFrame = reg.compute(fid, panel)
-                latest = float(result[ticker].dropna().iloc[-1])
-                out[fid] = latest
-            except Exception as exc:
-                _log.debug("factor %s failed for %s: %s", fid, ticker, exc)
-        return out
-    except Exception as exc:
-        _log.warning("factor_provider unavailable: %s", exc)
-        return {}
-```
-If the exact import path `src.alpha.factor_registry.Registry` doesn't exist, run `grep -r "class Registry" ~/Projects/Vibe-Trading/` to find it before writing this file.
+`analyst_layer/factor_provider.py` already exists. Correct import path: `from src.factors.registry import Registry` (NOT `src.alpha.factor_registry` — that path does not exist). The file is fully inert when `promoted_vw_factors` is empty.
 
-**Step 5 — Enrich VW bandit features in vw_bandit.py**
+**Step 5 — Enrich VW bandit features in vw_bandit.py — IMPLEMENTED (2026-07-12)**
 
-In `analyst_layer/vw_bandit.py`, find the `_full_features()` method. Add a `|factors` namespace after the existing namespaces:
-
-```python
-# At top of vw_bandit.py — add import
-from analyst_layer.factor_provider import compute_factor_features
-
-# Inside _full_features(self, ctx: dict) — add AFTER existing namespaces:
-promoted = getattr(settings, "promoted_vw_factors", [])
-if promoted:
-    factor_vals = compute_factor_features(ctx.get("ticker", ""), promoted)
-    if factor_vals:
-        factor_ns = " ".join(f"{k}:{v:.4f}" for k, v in factor_vals.items())
-        vw_str += f" |factors {factor_ns}"
-```
-This adds a `|factors` VW namespace with the promoted factor values. VW learns weights per feature automatically.
+`analyst_layer/vw_bandit.py` already has `|factors` namespace support. `_full_features()` appends it when `ticker` + `promoted_factors` are passed. `learn()` and `predict_full()` both accept `ticker`/`promoted_factors` kwargs. No changes needed here.
 
 **Step 6 — Wire vw_prob into Kelly sizing (alpha_plane.py)**
 
@@ -272,11 +213,11 @@ Do NOT implement this step until ≥300 closed trades exist and `scripts/signal_
 
 ---
 
-### Phase 3 — Future
+### Phase 3 — IMPLEMENTED (2026-07-12)
 
 **Why:** The Risk Officer makes decisions in a vacuum. It doesn't know that the last 4 times we bought MSFT in a bull regime at resistance, we got stopped out. claude-obsidian is a hybrid-retrieval knowledge system that builds a searchable wiki from trade post-mortems. By wiring it into the Risk Officer system prompt, the LLM gets memory of prior trades in the same setup — reducing repeated mistakes. This closes the loop: live trades → markdown post-mortems → BM25 index → LLM context → better decisions.
 
-**Why claudian matters here (TBD):** YishenTu/claudian's role is not yet known. It may be a Claude agent orchestration framework that could replace or augment the 4-agent consensus. Investigate before Phase 3 begins.
+**claudian note:** Investigated — it's an Obsidian UI plugin (TypeScript). Not an agent SDK, not importable from Python, no role in Phase 3 or beyond.
 
 **Pre-conditions:** claude-obsidian cloned on Pi. At least 50 closed trades exist (enough post-mortems to make retrieval useful).
 
@@ -289,15 +230,16 @@ cd ~/Projects/claude-obsidian
 bash bin/setup-vault.sh
 
 # One-time BM25 index build (run again after adding new pages)
-bash bin/setup-retrieve.sh
+bash bin/setup-retrieve.sh --no-llm   # --no-llm forces tier-3 (synthetic, no external calls)
 
-# Create the trading vault directory
-mkdir -p vaults/trading/postmortems
+# Create the postmortems directory (postmortem_writer.py also creates this on first write)
+mkdir -p wiki/postmortems
 
-# Test retrieval works
+# Test retrieval works (needs index to exist first)
 python3 scripts/retrieve.py "MSFT thesis bull"
 # Should return JSON: {"candidates": [{"page_path": "...", "snippet": "..."}]}
 ```
+Note: postmortems go in `wiki/postmortems/` (not `vaults/trading/postmortems/`). The `wiki/` directory is what contextual-prefix.py and bm25-index.py crawl.
 
 **Step 2 — Auto post-mortem writer in protection_plane.py**
 
@@ -310,7 +252,7 @@ import logging, subprocess
 from datetime import date
 from pathlib import Path
 
-_VAULT = Path.home() / "Projects" / "claude-obsidian" / "vaults" / "trading" / "postmortems"
+_VAULT = Path.home() / "Projects" / "claude-obsidian" / "wiki" / "postmortems"
 _RETRIEVE_SCRIPT = Path.home() / "Projects" / "claude-obsidian" / "scripts" / "retrieve.py"
 _log = logging.getLogger(__name__)
 
@@ -385,15 +327,9 @@ memory_context = _fetch_trade_memory(self.ticker, self.sector, self.regime)
 return memory_context + existing_prompt_text
 ```
 
-**Step 4 — Investigate claudian and update plan**
+**Step 4 — COMPLETE (investigated 2026-07-12)**
 
-```bash
-cat ~/Projects/claudian/README.md
-# Read it. Determine: is it an agent SDK, a Claude wrapper, a UI framework?
-# Then run /preserve to update this CLAUDE.md section with what it does and where it fits.
-```
-
-If claudian turns out to be an agent orchestration layer, it may be able to replace the manual 4-agent loop in `analyst_layer/` — but do not integrate until you fully understand its threading/async model and confirm it doesn't violate the "Protection never imports LLM clients" invariant.
+claudian (`YishenTu/claudian`) is a TypeScript Obsidian plugin. It has no Python API and no role in the trading system. Nothing to do here.
 
 ### Key architecture facts (do not re-derive without reading the code)
 

@@ -41,7 +41,7 @@ class TechnicalAgent(BaseAgent):
             "indicator values provided."
         )
 
-    def analyze(self, ticker: str, series: PriceSeries, lessons: str = "") -> AgentSignal:
+    def analyze(self, ticker: str, series: PriceSeries, lessons: str = "", extra_context: str = "") -> AgentSignal:
         closes = [bar.close for bar in series.bars]
         sma_short = _simple_moving_average(closes, window=min(10, len(closes)))
         sma_long = _simple_moving_average(closes, window=min(30, len(closes)))
@@ -61,8 +61,9 @@ class TechnicalAgent(BaseAgent):
             f"SMA(long): {sma_long}\n"
             f"Realized volatility (stdev of returns): {volatility}\n"
             f"Regime classification: {regime}\n"
-            f"Bars analyzed: {len(closes)}\n\n"
-            "Based solely on these precomputed indicators, emit your signal."
+            f"Bars analyzed: {len(closes)}\n"
+            f"{extra_context}"
+            "\nBased solely on these precomputed indicators, emit your signal."
         )
         signal = self._call_structured(prompt, AgentSignal, tool_name="emit_signal")
         return signal.model_copy(update={"agent_name": self.name, "generated_at": datetime.utcnow()})

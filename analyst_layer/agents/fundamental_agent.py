@@ -26,7 +26,12 @@ class FundamentalAgent(BaseAgent):
         )
 
     def analyze(
-        self, ticker: str, fundamentals: FundamentalsSnapshot, filings: list[FilingSummary], lessons: str = ""
+        self,
+        ticker: str,
+        fundamentals: FundamentalsSnapshot,
+        filings: list[FilingSummary],
+        lessons: str = "",
+        sec_context: str = "",
     ) -> AgentSignal:
         revisions_text = "\n".join(
             f"  - {r.firm}: {r.rating} (target {r.target_price})" for r in fundamentals.revisions
@@ -43,8 +48,9 @@ class FundamentalAgent(BaseAgent):
             f"Revenue: {fundamentals.revenue}\n"
             f"P/E: {fundamentals.pe_ratio}\n"
             f"Analyst revisions:\n{revisions_text}\n"
-            f"Recent filings:\n{filings_text}\n\n"
-            "Based solely on this fundamentals data, emit your signal."
+            f"Recent filings:\n{filings_text}\n"
+            f"{sec_context}"
+            "\nBased solely on this fundamentals data, emit your signal."
         )
         signal = self._call_structured(prompt, AgentSignal, tool_name="emit_signal")
         return signal.model_copy(update={"agent_name": self.name, "generated_at": datetime.utcnow()})

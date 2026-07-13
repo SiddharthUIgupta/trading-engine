@@ -118,12 +118,20 @@ class VWSignalBandit:
         logger.info("VWSignalBandit: warm-started on %d historical examples", count)
         return count
 
-    def learn(self, track: str, regime: str, signals: list[dict], pnl: float) -> None:
-        """Update model from a just-closed trade. Thread-safe."""
+    def learn(
+        self, track: str, regime: str, signals: list[dict], pnl: float,
+        ticker: str | None = None, promoted_factors: list[str] | None = None,
+    ) -> None:
+        """Update model from a just-closed trade. Thread-safe.
+
+        ticker/promoted_factors are optional Vibe-Trading factor enrichment
+        (CLAUDE.md Phase 2) — omit both to train on track+regime+signals only,
+        exactly as before this was added.
+        """
         if self._vw is None:
             return
         with self._lock:
-            self._learn_unlocked(track, regime, signals, pnl)
+            self._learn_unlocked(track, regime, signals, pnl, ticker, promoted_factors)
             self._save_unlocked()
 
     def predict_context(self, track: str, regime: str) -> float | None:
@@ -140,7 +148,10 @@ class VWSignalBandit:
                 logger.debug("VWSignalBandit.predict_context failed: %s", exc)
                 return None
 
-    def predict_full(self, track: str, regime: str, signals: list[dict]) -> float | None:
+    def predict_full(
+        self, track: str, regime: str, signals: list[dict],
+        ticker: str | None = None, promoted_factors: list[str] | None = None,
+    ) -> float | None:
         """Win-probability estimate using track+regime+agent signals (post-consensus).
 
         Returns None if the model hasn't seen enough examples yet.
@@ -149,7 +160,8 @@ class VWSignalBandit:
             return None
         with self._lock:
             try:
-                return float(self._vw.predict(_full_features(track, regime, signals)))
+                features = _full_features(track, regime, signals, ticker, promoted_factors)
+                return float(self._vw.predict(features))
             except Exception as exc:  # noqa: BLE001
                 logger.debug("VWSignalBandit.predict_full failed: %s", exc)
                 return None
@@ -167,9 +179,13 @@ class VWSignalBandit:
 
     # ── private ──────────────────────────────────────────────────────────────
 
-    def _learn_unlocked(self, track: str, regime: str, signals: list[dict], pnl: float) -> None:
+    def _learn_unlocked(
+        self, track: str, regime: str, signals: list[dict], pnl: float,
+        ticker: str | None = None, promoted_factors: list[str] | None = None,
+    ) -> None:
         label = "1" if pnl > 0 else "-1"
-        example_str = f"{label} {_full_features(track, regime, signals)}"
+        features = _full_features(track, regime, signals, ticker, promoted_factors)
+        example_str = f"{label} {features}"
         try:
             self._vw.learn(example_str)
             self._example_count += 1
@@ -196,8 +212,16 @@ def _context_features(track: str, regime: str) -> str:
     return f"| track={_safe(track)} regime={_safe(regime)}"
 
 
-def _full_features(track: str, regime: str, signals: list[dict]) -> str:
-    """Full feature set including per-agent stance and confidence."""
+def _full_features(
+    track: str, regime: str, signals: list[dict],
+    ticker: str | None = None, promoted_factors: list[str] | None = None,
+) -> str:
+    """Full feature set including per-agent stance and confidence.
+
+    ticker/promoted_factors add a separate |factors namespace of Vibe-Trading
+    alpha values (CLAUDE.md Phase 2, shadow mode). Both default to None/empty,
+    which reproduces the exact feature string from before this was added.
+    """
     parts = [f"track={_safe(track)}", f"regime={_safe(regime)}"]
 
     buy_count = sum(1 for s in signals if s.get("stance", "").upper() == "BUY")
@@ -218,4 +242,13 @@ def _full_features(track: str, regime: str, signals: list[dict]) -> str:
         conf = s.get("confidence", "LOW").upper()
         parts.append(f"{name}_{stance}_{conf}:1")
 
-    return "| " + " ".join(parts)
+    feature_str = "| " + " ".join(parts)
+
+    if ticker and promoted_factors:
+        from analyst_layer.factor_provider import compute_factor_features
+        factor_vals = compute_factor_features(ticker, promoted_factors)
+        if factor_vals:
+            factor_ns = " ".join(f"{_safe(k)}:{v:.4f}" for k, v in factor_vals.items())
+            feature_str += f" |factors {factor_ns}"
+
+    return feature_str

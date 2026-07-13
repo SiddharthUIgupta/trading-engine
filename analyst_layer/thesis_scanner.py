@@ -1,11 +1,13 @@
-"""Thesis-track screen — deterministic, zero-LLM, the opposite shape of
-the momentum scanner's net. Where momentum requires a stock already moving
-up fast, this looks for quality-pool names having a quiet pullback: down
-some % from their 52-week high. It's deliberately permissive (no hard
-profitability bar) — the screen's only job is "is this worth a closer
-look," not "is this a good business." That judgment belongs to the
-Fundamental/SEC and Macro/Sentiment agents downstream, the same way the
-momentum scanner only screens, it doesn't decide.
+"""Thesis-track screen — deterministic, zero-LLM. The screen's only job
+is "is this worth a closer look," not "is this a good business." That
+judgment belongs to the Fundamental/SEC and Macro/Sentiment agents
+downstream. The min-pullback floor is 0.0 by default (configurable via
+THESIS_MIN_PULLBACK_PCT), meaning breakout names near their 52-week highs
+pass through and are evaluated by the LLM — the screen does not hard-block
+momentum or high-performing stocks. The only structural gate is the
+max-pullback ceiling (default 50%): beyond that, a drawdown is more likely
+to be genuine impairment than dislocation, and the recovery track handles
+those with different parameters.
 """
 from __future__ import annotations
 
@@ -18,19 +20,18 @@ from data_layer.models import PriceSeries, ThesisCandidate
 class ThesisSignal:
     passed: bool
     reasons: list[str] = field(default_factory=list)
-    score: float = 0.0  # pullback magnitude, for ranking among passed candidates only
+    score: float = 0.0  # range extremity: 0=middle of 52w range (least notable), 1=at either extreme
 
 
 def evaluate_thesis_candidate(
     candidate: ThesisCandidate, min_pullback_pct: float, max_pullback_pct: float
 ) -> ThesisSignal:
-    """Pullback must fall within [min_pullback_pct, max_pullback_pct] — a
-    floor to filter out noise, and a ceiling because a pullback beyond
-    ~50% is statistically much more likely to be a genuinely impaired
-    business (failed trial, accounting problem, secular decline) than a
-    quality name temporarily out of favor. The screen stays permissive
-    inside that band; it's not trying to call which businesses are sound,
-    just which ones are worth the Fundamental/SEC agent's attention.
+    """With min_pullback_pct=0.0 (default): always passes the floor check,
+    so breakout names near their 52-week highs reach the LLM alongside
+    classic pullback plays. Score = range extremity: how close the stock is
+    to either end of its 52-week range (1.0 = at high or low, 0.0 = dead
+    middle). This ranks both breakouts AND deep dislocations above boring
+    mid-range drifters, without bias toward either direction.
     """
     pullback_pct = (candidate.year_high - candidate.price) / candidate.year_high
     passed = min_pullback_pct <= pullback_pct <= max_pullback_pct
@@ -39,9 +40,20 @@ def evaluate_thesis_candidate(
     else:
         reason = (
             f"pulled back {pullback_pct:.1%} from 52w high {candidate.year_high:.2f} "
-            f"{'>=' if pullback_pct >= min_pullback_pct else '<'} {min_pullback_pct:.1%} minimum"
+            f"(range: {candidate.year_low:.2f}–{candidate.year_high:.2f})"
         )
-    return ThesisSignal(passed=passed, reasons=[reason], score=pullback_pct if passed else 0.0)
+
+    if not passed:
+        return ThesisSignal(passed=False, reasons=[reason], score=0.0)
+
+    range_width = candidate.year_high - candidate.year_low
+    if range_width > 0:
+        range_pos = (candidate.price - candidate.year_low) / range_width  # 0=at 52w low, 1=at 52w high
+        score = abs(range_pos - 0.5) * 2  # 0=middle of range, 1=at either extreme
+    else:
+        score = 0.5
+
+    return ThesisSignal(passed=True, reasons=[reason], score=round(score, 4))
 
 
 def evaluate_shrink_volume_pullback(price_series: PriceSeries) -> ThesisSignal:

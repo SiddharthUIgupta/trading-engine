@@ -58,6 +58,44 @@ from execution_layer.tax_compliance import WashSaleGuard
 
 logger = logging.getLogger(__name__)
 
+_OBSIDIAN_RETRIEVE = (
+    __import__("pathlib").Path.home() / "Projects" / "claude-obsidian" / "scripts" / "retrieve.py"
+)
+
+
+def _fetch_trade_memory(ticker: str, strategy: str, regime: str) -> str:
+    """Return a formatted snippet block from claude-obsidian for similar past setups.
+
+    Returns empty string when the vault is not provisioned or retrieval fails.
+    Calls are subprocess-isolated with a hard 5-second timeout so a hung index
+    never stalls the consensus loop.
+    """
+    import json as _json
+    import subprocess as _subprocess
+
+    if not _OBSIDIAN_RETRIEVE.exists():
+        return ""
+    try:
+        query = f"{ticker} {strategy} {regime} trade setup"
+        result = _subprocess.run(
+            ["python3", str(_OBSIDIAN_RETRIEVE), query, "--top", "3"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(_OBSIDIAN_RETRIEVE.parent.parent),
+        )
+        if result.returncode != 0:
+            return ""
+        data = _json.loads(result.stdout)
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return ""
+        snippets = "\n---\n".join(c.get("snippet", "") for c in candidates if c.get("snippet"))
+        if not snippets:
+            return ""
+        return f"\n\n## Prior trade memory (similar {ticker} setups)\n{snippets}\n"
+    except Exception as exc:
+        logger.debug("trade memory retrieval failed for %s: %s", ticker, exc)
+        return ""
+
 _INTRADAY_STRATEGIES: frozenset[str] = frozenset({"momentum", "orb_equity", "news"})
 _OPTIONS_STRATEGIES: frozenset[str] = frozenset({"orb_options", "vol_options"})
 _THESIS_STRATEGIES: frozenset[str] = frozenset({"thesis", "recovery", "gap"})
@@ -698,7 +736,8 @@ class AlphaRuntime:
             vw_win_prob = self._vw_bandit.predict_context(strategy, regime)
             vw_context = agent_scorer.format_vw_context(vw_win_prob, self._vw_bandit.example_count)
             macro_context = self._macro_snapshot.format_for_prompt()
-            lessons_text = accuracy_context + vw_context + macro_context + lesson_store.format_for_prompt(relevant_lessons)
+            trade_memory = _fetch_trade_memory(ticker, strategy, regime)
+            lessons_text = accuracy_context + vw_context + macro_context + trade_memory + lesson_store.format_for_prompt(relevant_lessons)
 
             existing_shares = self._broker.get_position_shares(ticker)
             pnl_history = self._state_store.get_pnl_history()
