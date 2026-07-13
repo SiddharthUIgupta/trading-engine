@@ -45,7 +45,15 @@ claudian (role TBD — investigate on first Pi session)
 - **Integration point with trading-engine**: promoted factor values → `|factors` namespace in `vw_bandit.py`'s `_full_features()`. See Phase 2 for exact implementation.
 - **IC threshold for promotion**: Spearman IC > 0.03 at n≥300 → candidate. Below n=300 = "insufficient sample" — no conclusions. See signal lifecycle rules below.
 
-**claude-obsidian** (`~/Projects/claude-obsidian`) — *persistent knowledge wiki with hybrid retrieval*
+**claude-obsidian** (`~/Projects/claude-obsidian`) — *the system's long-term trading memory*
+
+**Why this matters for the trading system:**
+Right now, every trading decision starts from zero. The Risk Officer LLM doesn't know that the last 6 times we bought a tech stock at resistance in a bull regime, 4 of them stopped out at the same level. It doesn't know that NVDA thesis setups in neutral regime have an 80% hit rate but only when entered pre-market, not intraday. Without memory, the system is condemned to repeat its own losses.
+
+claude-obsidian is the memory layer. Every closed trade writes a structured post-mortem (ticker, regime, entry/exit, what each agent said, P&L, extracted lesson). These get indexed into a searchable BM25+semantic database. Before the Risk Officer makes a decision, the system queries: "what happened the last few times we were in a setup like this?" and prepends those results to the LLM prompt. The Risk Officer now has institutional memory — it can say "3 prior trades in this sector + this regime were losses, here's why" and vote accordingly.
+
+**The second use case — active research:** Drop any PDF, article, or transcript into `.raw/` and the `/autoresearch` skill extracts it into the wiki. Use this to ingest Sid's trading notes, earnings call transcripts, sector reports, or strategy documentation. The same retrieval API then surfaces this context in the Risk Officer prompt alongside trade post-mortems. The wiki grows every session.
+
 - Source: `AgriciDaniel/claude-obsidian` — self-organizing Obsidian vault + Claude Code plugin
 - Ingests any source document → extracts concepts/entities → builds cross-linked wiki in `wiki/`
 - **Vault structure**: `.raw/` (drop source docs here), `wiki/` (auto-generated pages), `.vault-meta/bm25/` (search index). Read `wiki/hot.md` first, then `wiki/index.md`, then domain `_index.md` files.
@@ -58,6 +66,12 @@ claudian (role TBD — investigate on first Pi session)
   ```
 - **Re-index after adding pages**: run `bash bin/setup-retrieve.sh` again (fast, incremental)
 - **Skills available inside the claude-obsidian directory**: `/wiki` (scaffold new topic), `/autoresearch [topic]` (3-round web research → files in wiki), `/wiki-retrieve` (ad-hoc search), `/think`, `/canvas`
+- **What to put in the vault** (drop into `.raw/` then run `/wiki`):
+  - Sid's post-trade notes ("bought MSFT thesis at 420, stopped at 415, resistance was the breakout level not support")
+  - Sector-level market structure notes ("tech in bull regime: wait for consolidation > 3 days before thesis entry")
+  - Earnings calendar context, Fed decision notes, any macro event that changes regime behaviour
+  - The trading-engine's own ARCHITECTURE.md and strategy documentation
+  - Auto-written post-mortems (these go directly into `vaults/trading/postmortems/` — see Phase 3)
 - **Integration point with trading-engine**:
   - Risk Officer prompt enrichment: `scripts/retrieve.py "TICKER SECTOR REGIME"` → prepend top-3 snippets to Risk Officer system prompt at `analyst_layer/agents/risk_officer_agent.py:44`
   - Post-mortem ingest: after each closed trade, write a markdown file to `vaults/trading/postmortems/TICKER-DATE.md` → BM25 index picks it up → future trades in the same setup get the memory
