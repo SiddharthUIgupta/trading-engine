@@ -76,9 +76,11 @@ def _fetch_trade_memory(ticker: str, strategy: str, regime: str) -> str:
     if not _OBSIDIAN_RETRIEVE.exists():
         return ""
     try:
-        query = f"{ticker} {strategy} {regime} trade setup"
+        # Include strategy explicitly so BM25 ranks same-strategy post-mortems
+        # above cross-strategy noise (e.g. a swing loss must not suppress thesis BUYs).
+        query = f"{ticker} strategy:{strategy} {regime} trade setup outcome"
         result = _subprocess.run(
-            ["python3", str(_OBSIDIAN_RETRIEVE), query, "--top", "3"],
+            ["python3", str(_OBSIDIAN_RETRIEVE), query, "--top", "2"],
             capture_output=True, text=True, timeout=5,
             cwd=str(_OBSIDIAN_RETRIEVE.parent.parent),
         )
