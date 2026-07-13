@@ -209,6 +209,17 @@ class AlphaRuntime:
             # (e.g. "thesis broken, exit early") must never be blocked by a
             # halted/tripped/profit-locked/globally-halted breaker.
             db_halted = self._state_store.is_breaker_halted(breaker.name)
+            # If in-memory says the breaker is clear (ensure_day_started() already
+            # ran for today) but DB still says halted, the DB value is stale from
+            # a prior trading day — profit-lock or trip from yesterday was never
+            # cleared because _sync_breaker_state_to_db() in the Protection Plane
+            # hadn't fired yet. Trust in-memory, write the correction immediately
+            # so subsequent reads don't hit the same stale value.
+            if db_halted and not breaker.is_stock_halted:
+                self._state_store.set_breaker_state(breaker.name, "halted", "false")
+                self._state_store.set_breaker_state(breaker.name, "profit_locked", "false")
+                db_halted = False
+                logger.info("[%s] cleared stale DB halt (in-memory reset already ran for today)", breaker.name)
             globally_halted, global_reason = GlobalRiskState.is_halted_in_db(self._state_store)
             if payload.proposal.action == Action.BUY and (breaker.is_stock_halted or db_halted or globally_halted):
                 logger.info("[%s] %s: breaker halted (in_memory=%s db=%s global=%s %s), skipping.",
