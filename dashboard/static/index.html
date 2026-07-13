@@ -166,6 +166,7 @@ tr:hover td{background:var(--surface2)}
     <option value="thesis">Thesis</option>
     <option value="swing">Swing</option>
     <option value="gap">Gap</option>
+    <option value="research">Vibe Research</option>
   </select>
   <button id="run-btn" class="run-btn" onclick="runTrigger()">▶ Run Scan</button>
   <span id="trigger-status" class="trigger-status"></span>
@@ -514,10 +515,18 @@ async function runTrigger() {
     status.className = 'trigger-status ok';
     status.textContent = d.message;
     input.value = '';
-    // Switch to candidates tab so user sees result arrive
-    switchTab('candidates');
-    // Refresh candidates after 18s (engine picks up in ≤15s, consensus ~5-30s more)
-    setTimeout(refresh, 18000);
+    if (scan === 'research') {
+      // Switch to research tab; poll every 30s for up to 5 min
+      switchTab('research');
+      let polls = 0;
+      const pollResearch = () => { if (++polls < 10) { refresh(); setTimeout(pollResearch, 30000); } };
+      setTimeout(pollResearch, 30000);
+    } else {
+      // Switch to candidates tab so user sees result arrive
+      switchTab('candidates');
+      // Refresh after 18s (engine picks up in ≤15s, consensus ~5-30s more)
+      setTimeout(refresh, 18000);
+    }
   } catch(e) {
     status.className = 'trigger-status err';
     status.textContent = 'Error: ' + e.message;

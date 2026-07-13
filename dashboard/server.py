@@ -11,12 +11,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -350,18 +351,73 @@ def api_performance():
     }
 
 
+# ── research job tracker (in-process, resets on restart) ─────────────────────
+_research_lock = threading.Lock()
+_research_running: list[str] = []   # tickers currently being researched
+_research_log: list[dict] = []      # recent completed jobs (last 20)
+
+
+def _run_research_background(tickers: list[str]) -> None:
+    """Run nightly swarm on `tickers` in a background thread."""
+    import sys
+    vibe_agent = Path.home() / "Projects" / "Vibe-Trading" / "agent"
+    if str(vibe_agent) not in sys.path:
+        sys.path.insert(0, str(vibe_agent))
+
+    from anthropic import Anthropic
+    from scripts.nightly_swarm import run_committee
+
+    client = Anthropic(api_key=_settings.anthropic_api_key)
+    haiku = _settings.anthropic_subagent_model
+    sonnet = _settings.anthropic_model
+
+    for ticker in tickers:
+        try:
+            verdict = run_committee(ticker, client, haiku, sonnet, dry_run=False)
+            with _research_lock:
+                _research_log.append({"ticker": ticker, "verdict": verdict[:120], "at": datetime.utcnow().isoformat()})
+                if len(_research_log) > 20:
+                    _research_log.pop(0)
+        except Exception as exc:
+            with _research_lock:
+                _research_log.append({"ticker": ticker, "verdict": f"ERROR: {exc}", "at": datetime.utcnow().isoformat()})
+        finally:
+            with _research_lock:
+                if ticker in _research_running:
+                    _research_running.remove(ticker)
+
+
 class TriggerRequest(BaseModel):
     scan: str = "thesis"
     tickers: list[str] = []
 
 
 @app.post("/api/trigger")
-def api_trigger(req: TriggerRequest):
-    """Write a manual trigger for the Alpha plane to pick up within 15 seconds."""
+def api_trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
+    tickers = [t.upper().strip() for t in req.tickers if t.strip()]
+
+    # Vibe Research — runs nightly swarm in background, bypasses alpha plane
+    if req.scan == "research":
+        if not tickers:
+            raise HTTPException(status_code=400, detail="Vibe Research requires at least one ticker")
+        with _research_lock:
+            already = [t for t in tickers if t in _research_running]
+            if already:
+                raise HTTPException(status_code=409, detail=f"Already researching: {', '.join(already)}")
+            _research_running.extend(tickers)
+        background_tasks.add_task(_run_research_background, tickers)
+        return {
+            "ok": True,
+            "scan": "research",
+            "tickers": tickers,
+            "queued_at": datetime.utcnow().isoformat(),
+            "message": f"Vibe Research running for {', '.join(tickers)} — results appear in Research tab in ~2 min per ticker",
+        }
+
+    # All other scans — write trigger file for the alpha plane
     from execution_layer.manual_trigger import write_trigger, VALID_SCANS
     if req.scan not in VALID_SCANS:
-        raise HTTPException(status_code=400, detail=f"scan must be one of {VALID_SCANS}")
-    tickers = [t.upper().strip() for t in req.tickers if t.strip()]
+        raise HTTPException(status_code=400, detail=f"scan must be one of: thesis, swing, gap, research")
     ts = write_trigger(req.scan, tickers or None)
     return {
         "ok": True,
@@ -375,7 +431,10 @@ def api_trigger(req: TriggerRequest):
 @app.get("/api/trigger/history")
 def api_trigger_history():
     from execution_layer.manual_trigger import read_trigger_history
-    return {"history": read_trigger_history()}
+    with _research_lock:
+        running = list(_research_running)
+        log = list(_research_log)
+    return {"history": read_trigger_history(), "research_running": running, "research_log": log}
 
 
 @app.get("/api/research")
