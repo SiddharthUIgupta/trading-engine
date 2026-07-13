@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import sys
+import threading
 from pathlib import Path
 
 from analyst_layer.prefilter import (
@@ -36,26 +37,30 @@ _VIBE_AGENT = Path.home() / "Projects" / "Vibe-Trading" / "agent"
 _sec_tool = None
 _fin_tool = None
 _vibe_loaded = False
+_vibe_lock = threading.Lock()
 
 
 def _load_vibe() -> bool:
     global _sec_tool, _fin_tool, _vibe_loaded
     if _vibe_loaded:
         return _sec_tool is not None
-    _vibe_loaded = True
-    if not _VIBE_AGENT.exists():
-        return False
-    if str(_VIBE_AGENT) not in sys.path:
-        sys.path.insert(0, str(_VIBE_AGENT))
-    try:
-        from src.tools.sec_filings_tool import SecFilingsTool
-        from src.tools.financial_statements_tool import FinancialStatementsTool
-        _sec_tool = SecFilingsTool()
-        _fin_tool = FinancialStatementsTool()
-        return True
-    except Exception as exc:
-        _log.debug("Vibe-Trading tools unavailable: %s", exc)
-        return False
+    with _vibe_lock:
+        if _vibe_loaded:
+            return _sec_tool is not None
+        _vibe_loaded = True
+        if not _VIBE_AGENT.exists():
+            return False
+        if str(_VIBE_AGENT) not in sys.path:
+            sys.path.insert(0, str(_VIBE_AGENT))
+        try:
+            from src.tools.sec_filings_tool import SecFilingsTool
+            from src.tools.financial_statements_tool import FinancialStatementsTool
+            _sec_tool = SecFilingsTool()
+            _fin_tool = FinancialStatementsTool()
+            return True
+        except Exception as exc:
+            _log.debug("Vibe-Trading tools unavailable: %s", exc)
+            return False
 
 
 def _parse(raw) -> dict | list:

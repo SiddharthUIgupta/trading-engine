@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, date, timezone
 from pathlib import Path
+
+_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +51,11 @@ def write_trigger(scan: str, tickers: list[str] | None = None) -> str:
     _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload: dict = {"scan": scan, "requested_at": ts}
     if tickers:
-        payload["tickers"] = [t.upper().strip() for t in tickers if t.strip()]
+        clean = [t.upper().strip() for t in tickers if t.strip()]
+        invalid = [t for t in clean if not _TICKER_RE.match(t)]
+        if invalid:
+            raise ValueError(f"Invalid ticker format (expected 1-5 uppercase letters): {invalid}")
+        payload["tickers"] = clean
     tmp = _TRIGGER_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload))
     tmp.replace(_TRIGGER_FILE)

@@ -132,7 +132,6 @@ class VWSignalBandit:
             return
         with self._lock:
             self._learn_unlocked(track, regime, signals, pnl, ticker, promoted_factors)
-            self._save_unlocked()
 
     def predict_context(self, track: str, regime: str) -> float | None:
         """Win-probability estimate using only track+regime (pre-consensus).
@@ -189,6 +188,8 @@ class VWSignalBandit:
         try:
             self._vw.learn(example_str)
             self._example_count += 1
+            if self._example_count % 10 == 0:
+                self._save_unlocked()
         except Exception as exc:  # noqa: BLE001
             logger.debug("VWSignalBandit.learn failed: %s", exc)
 

@@ -279,7 +279,9 @@ class StateStore:
             # existing table — needed for any database created before
             # stop_price/target_price (the ORB equity track) existed.
             existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            _MIGRATABLE = {"stop_price", "target_price"}
             for column in ("stop_price", "target_price"):
+                assert column in _MIGRATABLE, f"column {column!r} not in migration allowlist"
                 if column not in existing_columns:
                     conn.execute(f"ALTER TABLE positions ADD COLUMN {column} REAL")
             if "bracket_stop_order_id" not in existing_columns:

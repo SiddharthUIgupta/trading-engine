@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 from datetime import date, datetime
@@ -17,7 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+# Pre-insert Vibe-Trading agent path once at module load so background threads
+# don't race on sys.path mutation.
+_vibe_agent_path = str(Path.home() / "Projects" / "Vibe-Trading" / "agent")
+if _vibe_agent_path not in sys.path:
+    sys.path.insert(0, _vibe_agent_path)
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,7 +35,7 @@ from execution_layer.broker import AlpacaBroker
 from execution_layer.state_store import StateStore
 
 app = FastAPI(title="trading-engine dashboard", docs_url=None, redoc_url=None)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"])
 
 _settings = get_settings()
 _store = StateStore(_settings.state_db_path)
@@ -36,12 +43,38 @@ _static = Path(__file__).parent / "static"
 
 app.mount("/static", StaticFiles(directory=str(_static)), name="static")
 
+# Shared secret for mutating endpoints — set DASHBOARD_TOKEN in .env to enable.
+# If unset, mutations are localhost-only.
+_DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def _check_trigger_auth(request: Request) -> None:
+    """Restrict POST /api/trigger to localhost or valid token."""
+    client_ip = (request.client.host if request.client else "")
+    if client_ip in ("127.0.0.1", "::1"):
+        return
+    if _DASHBOARD_TOKEN and request.headers.get("X-Dashboard-Token") == _DASHBOARD_TOKEN:
+        return
+    raise HTTPException(status_code=403, detail="Forbidden: set X-Dashboard-Token or use localhost")
+
+
+# Cached broker singleton — one connection per process lifetime.
+_broker_instance: AlpacaBroker | None = None
+_broker_lock = threading.Lock()
+
 
 def _broker() -> AlpacaBroker | None:
-    try:
-        return AlpacaBroker.from_settings(_settings)
-    except Exception:
-        return None
+    global _broker_instance
+    if _broker_instance is not None:
+        return _broker_instance
+    with _broker_lock:
+        if _broker_instance is None:
+            try:
+                _broker_instance = AlpacaBroker.from_settings(_settings)
+            except Exception:
+                pass
+    return _broker_instance
 
 
 def _today() -> str:
@@ -359,10 +392,6 @@ _research_log: list[dict] = []      # recent completed jobs (last 20)
 
 def _run_research_background(tickers: list[str]) -> None:
     """Run nightly swarm on `tickers` in a background thread."""
-    import sys
-    vibe_agent = Path.home() / "Projects" / "Vibe-Trading" / "agent"
-    if str(vibe_agent) not in sys.path:
-        sys.path.insert(0, str(vibe_agent))
 
     from anthropic import Anthropic
     from scripts.nightly_swarm import run_committee
@@ -393,8 +422,12 @@ class TriggerRequest(BaseModel):
 
 
 @app.post("/api/trigger")
-def api_trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
+def api_trigger(req: TriggerRequest, background_tasks: BackgroundTasks, request: Request):
+    _check_trigger_auth(request)
     tickers = [t.upper().strip() for t in req.tickers if t.strip()]
+    invalid = [t for t in tickers if not _TICKER_RE.match(t)]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Invalid ticker format: {invalid}")
 
     # Vibe Research — runs nightly swarm in background, bypasses alpha plane
     if req.scan == "research":
