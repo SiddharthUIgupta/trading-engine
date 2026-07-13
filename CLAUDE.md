@@ -16,13 +16,13 @@ claude-obsidian  →  Vibe-Trading  →  trading-engine  →  Telegram alerts
       └──────── trade post-mortems ←─────────┘
 ```
 
-| Repo | Path | Role | Status |
-|------|------|------|--------|
-| trading-engine | `~/Projects/trading-engine` | Live executor (Pi) | Paper trading, STOPPED |
-| Vibe-Trading | `~/Projects/Vibe-Trading` | Research / backtest lab, 460 alpha factors | NOT configured (no API keys yet) |
-| claude-obsidian | `~/Projects/claude-obsidian` | Knowledge wiki (/autoresearch, BM25 retrieval) | NOT wired to trading |
-| cpr-compress-preserve-resume | `~/Projects/cpr-compress-preserve-resume` | Session context preservation (/preserve /compress /resume) | Installed here (see `.claude/commands/`) |
-| OpenMontage | `~/Projects/OpenMontage` | Video/report generation | Low priority |
+| Repo | Path | Source | Role | Status |
+|------|------|--------|------|--------|
+| trading-engine | `~/Projects/trading-engine` | SiddharthUIgupta/trading-engine | Live executor (Pi) | Paper trading, STOPPED |
+| Vibe-Trading | `~/Projects/Vibe-Trading` | HKUDS/Vibe-Trading | Research / backtest lab, 460 alpha factors | NOT configured (no API keys yet) |
+| claudian | `~/Projects/claudian` | YishenTu/claudian | Claude agent framework | NOT wired yet |
+| claude-obsidian | `~/Projects/claude-obsidian` | AgriciDaniel/claude-obsidian | Knowledge wiki (/autoresearch, BM25 retrieval) | NOT wired to trading |
+| cpr-compress-preserve-resume | `~/Projects/cpr-compress-preserve-resume` | EliaAlberti/cpr-compress-preserve-resume | Session context preservation (/preserve /compress /resume) | Installed here (see `.claude/commands/`) |
 
 ### Phase 1 — COMPLETE (committed 2026-07-12, commit 8fafd44)
 
@@ -40,13 +40,12 @@ All changes are on `master`. Pull on Pi, then do the Pi-only steps below.
 
 **Pi-only steps still required (cannot be done remotely):**
 ```bash
-# ── 0. Clone the other 4 repos (only needed once) ───────────────────────────
+# ── 0. Clone the other repos (only needed once) ─────────────────────────────
 mkdir -p ~/Projects && cd ~/Projects
-git clone https://github.com/SiddharthUIgupta/Vibe-Trading.git
-git clone https://github.com/SiddharthUIgupta/claude-obsidian.git
-git clone https://github.com/SiddharthUIgupta/cpr-compress-preserve-resume.git
-# OpenMontage — low priority, skip unless needed:
-# git clone https://github.com/SiddharthUIgupta/OpenMontage.git
+git clone https://github.com/HKUDS/Vibe-Trading.git
+git clone https://github.com/YishenTu/claudian.git
+git clone https://github.com/AgriciDaniel/claude-obsidian.git
+git clone https://github.com/EliaAlberti/cpr-compress-preserve-resume.git
 
 # ── 1. Pull trading-engine changes ──────────────────────────────────────────
 cd ~/Projects/trading-engine && git pull
