@@ -40,21 +40,29 @@ All changes are on `master`. Pull on Pi, then do the Pi-only steps below.
 
 **Pi-only steps still required (cannot be done remotely):**
 ```bash
-# 1. Pull the changes
+# ── 0. Clone the other 4 repos (only needed once) ───────────────────────────
+mkdir -p ~/Projects && cd ~/Projects
+git clone https://github.com/SiddharthUIgupta/Vibe-Trading.git
+git clone https://github.com/SiddharthUIgupta/claude-obsidian.git
+git clone https://github.com/SiddharthUIgupta/cpr-compress-preserve-resume.git
+# OpenMontage — low priority, skip unless needed:
+# git clone https://github.com/SiddharthUIgupta/OpenMontage.git
+
+# ── 1. Pull trading-engine changes ──────────────────────────────────────────
 cd ~/Projects/trading-engine && git pull
 
-# 2. Add to .env (get bot token from @BotFather on Telegram):
+# ── 2. Add to .env (get bot token from @BotFather on Telegram) ─────────────
 #    TELEGRAM_BOT_TOKEN=<token>
 #    TELEGRAM_CHAT_ID=<your chat id>
 #    EXTRA_WATCHLIST_TICKERS=SHAZ,NNBR,LAES,WULF,MARA   # Sid's manual watchlist
 
-# 3. Install new deps
+# ── 3. Install new deps ──────────────────────────────────────────────────────
 .venv/bin/pip install vowpalwabbit==9.11.2 akshare
 
-# 4. Bootstrap VW bandit from trade history (run once before restart)
+# ── 4. Bootstrap VW bandit from trade history (run once before restart) ─────
 .venv/bin/python scripts/vw_warmup.py
 
-# 5. Restart both services
+# ── 5. Restart both services ─────────────────────────────────────────────────
 sudo systemctl restart trading-engine-alpha trading-engine-protection
 ```
 
