@@ -1,5 +1,92 @@
 # Trading Engine — Claude Instructions
 
+---
+
+## Session Handoff — 2026-07-12 (PROTECTED)
+
+This section is the starting context for new sessions. Read it before anything else.
+
+### System overview
+
+This is one of 5 integrated repos at `~/Projects/`. They are **not independent** — the goal is to wire them together into a single AI-driven trading loop:
+
+```
+claude-obsidian  →  Vibe-Trading  →  trading-engine  →  Telegram alerts
+      ↑                                     ↓
+      └──────── trade post-mortems ←─────────┘
+```
+
+| Repo | Path | Role | Status |
+|------|------|------|--------|
+| trading-engine | `~/Projects/trading-engine` | Live executor (Pi) | Paper trading, STOPPED |
+| Vibe-Trading | `~/Projects/Vibe-Trading` | Research / backtest lab, 460 alpha factors | NOT configured (no API keys yet) |
+| claude-obsidian | `~/Projects/claude-obsidian` | Knowledge wiki (/autoresearch, BM25 retrieval) | NOT wired to trading |
+| cpr-compress-preserve-resume | `~/Projects/cpr-compress-preserve-resume` | Session context preservation (/preserve /compress /resume) | Installed here (see `.claude/commands/`) |
+| OpenMontage | `~/Projects/OpenMontage` | Video/report generation | Low priority |
+
+### Phase 1 — COMPLETE (committed 2026-07-12, commit 8fafd44)
+
+All changes are on `master`. Pull on Pi, then do the Pi-only steps below.
+
+**What was fixed:**
+| File | Change |
+|------|--------|
+| `pyproject.toml` | Added `vowpalwabbit>=9.11.2` (was missing → VW silently disabled on Pi) and `akshare>=1.0.0` (MacroSnapshot broken) |
+| `execution_layer/protection_plane.py` | Fixed VW bandit: `learn()` now fires for **every** closed trade — was gated behind `if not agent_signals` early-return, so 0 examples were ever recorded |
+| `config/settings.py` | `orb_equity_enabled` default `True→False` (PF 0.92, losing); `options_track_enabled` default `True→False` (30 losing positions); added `telegram_bot_token`, `telegram_chat_id`, `extra_watchlist_tickers` fields |
+| `execution_layer/alerting.py` | Added `_send_telegram()` + `_broadcast()` — all 9 alert functions now send to Telegram (primary) + Gmail (optional) |
+| `main_alpha.py` | Removed hardcoded `WATCHLIST` (CLAUDE.md violation); wired `GlobalRiskState` into all 4 Alpha Plane `RobustCircuitBreaker` instances (was missing, defence-in-depth gap vs Protection Plane) |
+| `.env.example` | Added `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EXTRA_WATCHLIST_TICKERS` |
+
+**Pi-only steps still required (cannot be done remotely):**
+```bash
+# 1. Pull the changes
+cd ~/Projects/trading-engine && git pull
+
+# 2. Add to .env (get bot token from @BotFather on Telegram):
+#    TELEGRAM_BOT_TOKEN=<token>
+#    TELEGRAM_CHAT_ID=<your chat id>
+#    EXTRA_WATCHLIST_TICKERS=SHAZ,NNBR,LAES,WULF,MARA   # Sid's manual watchlist
+
+# 3. Install new deps
+.venv/bin/pip install vowpalwabbit==9.11.2 akshare
+
+# 4. Bootstrap VW bandit from trade history (run once before restart)
+.venv/bin/python scripts/vw_warmup.py
+
+# 5. Restart both services
+sudo systemctl restart trading-engine-alpha trading-engine-protection
+```
+
+### Phase 2 — Next (NOT started)
+
+Goal: connect the research layer so Vibe-Trading's 460 alpha factors feed the VW bandit as richer features.
+
+1. **Configure Vibe-Trading**: copy API keys into `~/Projects/Vibe-Trading/.env` (Alpaca, Anthropic, Finnhub). Run `pip install -e .` in that repo.
+2. **Factor provider bridge**: create `analyst_layer/factor_provider.py` — thin wrapper that calls `Registry().compute(alpha_id, panel)` from Vibe-Trading and returns a feature dict for the VW bandit's `_full_features()`.
+3. **Enrich VW features**: in `vw_bandit.py`, call `factor_provider` in `_full_features()` to add e.g. `alpha101_001`, `gtja191_030`, `qlib158_vol` as VW namespace features.
+4. **Run alpha bench on thesis universe**: use Vibe-Trading's backtest CLI to identify which of the 460 factors have Spearman IC > 0.03 on the thesis universe — these become the promoted feature set.
+5. **VW `predict_full` → sizing**: `predict_full()` currently returns a win probability but the result is never used for sizing. Wire it: pass `vw_prob` to the Kelly sizing formula in `alpha_plane.py` as a multiplier cap (e.g. `kelly_size * min(1.0, vw_prob / 0.55)`).
+
+### Phase 3 — Future
+
+Goal: close the knowledge loop — trade outcomes feed back into the research base.
+
+1. **Trading vault in claude-obsidian**: create `~/Projects/claude-obsidian/vaults/trading/` with strategy pages and a post-mortem template.
+2. **Auto post-mortem ingest**: after `_run_reflection()` completes, write a markdown post-mortem to the vault (ticker, entry/exit, regime, what the agents said, P&L). Claude-obsidian's BM25 index will pick it up.
+3. **Wiki-retrieve in Risk Officer prompt**: before consensus, call `scripts/retrieve.py "ticker sector regime"` from the claude-obsidian repo and prepend the top-3 results to the Risk Officer system prompt. This gives the LLM memory of prior trades in the same setup.
+
+### Key architecture facts (do not re-derive without reading the code)
+
+- **Only thesis track has a proven backtest edge** (PF 1.49, 58% WR). ORB equity is disabled (PF 0.92). Options disabled (30 losing positions). Thesis + swing + recovery are the active tracks.
+- **VW bandit**: `analyst_layer/vw_bandit.py`. `_MIN_EXAMPLES = 20` — predictions suppressed below this count. `warm_start()` bootstraps from DB on first run. After Phase 1 fix + warmup script, should finally accumulate examples.
+- **Lesson store**: frozen (`FREEZE_LESSON_INJECTION=True` in settings) until 100 closed trades on fixed config. Do not unfreeze.
+- **GlobalRiskState**: DB-level halt for weekly/trailing drawdown. Now wired in both planes (as of Phase 1). The weekly halt resets on Monday; trailing requires manual `reset()`.
+- **Two-plane IPC**: Alpha writes `order_intents` table → Protection reads and executes. Never bypass with direct broker calls from Alpha. Never import scanners/LLM into Protection.
+- **CLAUDE.md invariant**: no hardcoded ticker lists — universe from OpenBB screens. Extra tickers go in `EXTRA_WATCHLIST_TICKERS` env var.
+
+---
+
 ## The most important rule
 
 **If the user says something, do exactly that. Never assume you know better. If anything is unclear, ask a question before writing a single line of code.**
