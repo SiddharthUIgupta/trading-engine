@@ -58,6 +58,24 @@ def _load_vibe() -> bool:
         return False
 
 
+def _parse(raw) -> dict | list:
+    """Both Vibe-Trading tools return JSON strings."""
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+def _fmt_usd(v) -> str:
+    if v is None:
+        return "N/A"
+    v = float(v)
+    if abs(v) >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"${v/1e6:.1f}M"
+    return f"${v:,.0f}"
+
+
 def fetch_sec_context(ticker: str) -> str:
     """Pull recent SEC filings + annual income statement for `ticker`.
 
@@ -68,35 +86,48 @@ def fetch_sec_context(ticker: str) -> str:
     if not _load_vibe():
         return ""
     try:
-        parts: list[str] = [f"## SEC EDGAR data for {ticker}"]
+        parts: list[str] = [f"\n## SEC EDGAR data for {ticker}"]
 
-        # Recent filings (10-K, 10-Q, 8-K)
+        # Recent filings — returned as {"ok": true, "data": {"ticker": ..., "filings": [...]}}
         try:
-            raw = _sec_tool.execute(ticker=ticker, limit=5)
-            filings = raw if isinstance(raw, list) else (raw.get("filings") or raw.get("results") or [])
+            parsed = _parse(_sec_tool.execute(ticker=ticker, limit=5))
+            filings = parsed.get("data", {}).get("filings", []) if isinstance(parsed, dict) else []
             if filings:
                 parts.append("\n### Recent SEC filings")
                 for f in filings[:5]:
-                    form = f.get("form") or f.get("filing_type") or "?"
-                    filed = f.get("filed") or f.get("filed_on") or f.get("date") or "?"
-                    desc = f.get("description") or f.get("summary") or ""
-                    parts.append(f"- {form} filed {filed}: {desc[:200]}")
+                    form = f.get("form", "?")
+                    filed = f.get("filing_date") or f.get("filed_on") or "?"
+                    desc = f.get("description") or ""
+                    parts.append(f"- {form} filed {filed}{': ' + desc[:120] if desc else ''}")
         except Exception as exc:
             _log.debug("SecFilingsTool failed for %s: %s", ticker, exc)
 
-        # Annual income statement (revenue, net income)
+        # Annual income statement — {"data": {"TICKER.US": {"periods": [...]}}}
         try:
-            raw = _fin_tool.execute(code=f"{ticker}.US", statement="income", period="annual")
-            rows = raw if isinstance(raw, list) else (raw.get("data") or raw.get("results") or [])
-            if rows:
-                parts.append("\n### Annual income statement (most recent 3 years)")
-                for row in rows[:3]:
-                    year = row.get("date") or row.get("period") or row.get("fiscal_date") or "?"
-                    rev = row.get("revenue") or row.get("totalRevenue") or None
-                    net = row.get("netIncome") or row.get("net_income") or None
-                    rev_str = f"${rev/1e9:.2f}B" if rev and abs(rev) >= 1e9 else (f"${rev/1e6:.1f}M" if rev else "N/A")
-                    net_str = f"${net/1e9:.2f}B" if net and abs(net) >= 1e9 else (f"${net/1e6:.1f}M" if net else "N/A")
-                    parts.append(f"- {year}: Revenue {rev_str}, Net income {net_str}")
+            parsed = _parse(_fin_tool.execute(code=f"{ticker}.US", statement="income", period="annual"))
+            ticker_data = parsed.get("data", {}) if isinstance(parsed, dict) else {}
+            periods = next(iter(ticker_data.values()), {}).get("periods", []) if ticker_data else []
+            # deduplicate by FISCAL_YEAR, keep most recent 3
+            seen: set[int] = set()
+            unique = []
+            for p in periods:
+                fy = p.get("FISCAL_YEAR")
+                if fy and fy not in seen:
+                    seen.add(fy)
+                    unique.append(p)
+            if unique:
+                parts.append("\n### Annual income (XBRL, most recent 3 fiscal years)")
+                for p in unique[:3]:
+                    fy = p.get("FISCAL_YEAR", "?")
+                    rev = p.get("RevenueFromContractWithCustomerExcludingAssessedTax") or p.get("Revenues")
+                    net = p.get("NetIncomeLoss")
+                    op = p.get("OperatingIncomeLoss")
+                    gp = p.get("GrossProfit")
+                    eps = p.get("EarningsPerShareDiluted")
+                    parts.append(
+                        f"- FY{fy}: Revenue {_fmt_usd(rev)}, Gross profit {_fmt_usd(gp)}, "
+                        f"Operating income {_fmt_usd(op)}, Net income {_fmt_usd(net)}, EPS {eps}"
+                    )
         except Exception as exc:
             _log.debug("FinancialStatementsTool failed for %s: %s", ticker, exc)
 
