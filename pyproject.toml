@@ -28,6 +28,13 @@ dependencies = [
     "huggingface_hub==0.33.1",
     "safetensors==0.6.2",
     "tqdm==4.67.1",
+    # VW contextual bandit for agent signal quality estimation (analyst_layer/vw_bandit.py).
+    # IMPORTANT on aarch64: pre-built wheels are available for aarch64 Linux from PyPI.
+    # If pip cannot find a wheel: pip install vowpalwabbit --no-binary :all: (builds from source,
+    # requires build-essential + cmake on the Pi).
+    "vowpalwabbit>=9.11.2",
+    # Macro snapshot data source (data_layer/akshare_client.py — US CPI, PMI, NFP etc).
+    "akshare>=1.0.0",
 ]
 
 [project.optional-dependencies]

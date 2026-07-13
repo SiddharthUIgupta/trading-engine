@@ -1,11 +1,10 @@
-"""Email alerting for critical trading engine events.
+"""Alerting for critical trading engine events.
 
-Sends HTML emails via Gmail SMTP for: trade executions, circuit breaker
-trips, profit locks, daily summaries, and crashes. Never raises — a broken
-alert must never crash the trading process.
+Sends to Telegram (primary) and Gmail SMTP (optional secondary).
+Never raises — a broken alert must never crash the trading process.
 
-Required env vars: GMAIL_USER, GMAIL_APP_PASSWORD
-Optional: ALERT_EMAIL_TO (defaults to GMAIL_USER)
+Telegram env vars (required for alerts to fire): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Gmail env vars (optional): GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_EMAIL_TO
 """
 from __future__ import annotations
 
@@ -24,6 +23,8 @@ logger = logging.getLogger(__name__)
 _GMAIL_USER = os.getenv("GMAIL_USER", "")
 _GMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 _TO = os.getenv("ALERT_EMAIL_TO") or _GMAIL_USER
+_TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 _HEALTHCHECKS_URL = os.getenv("HEALTHCHECKS_IO_URL", "")
 _HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "state/heartbeat.json"))
 
@@ -41,9 +42,30 @@ def _send(subject: str, html: str) -> None:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
             server.login(_GMAIL_USER, _GMAIL_PASSWORD)
             server.sendmail(_GMAIL_USER, _TO, msg.as_string())
-        logger.info("Alert sent: %s", subject)
+        logger.info("Email alert sent: %s", subject)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Alert delivery failed (%s): %s", subject, exc)
+        logger.warning("Email alert delivery failed (%s): %s", subject, exc)
+
+
+def _send_telegram(text: str) -> None:
+    if not _TELEGRAM_TOKEN or not _TELEGRAM_CHAT_ID:
+        logger.debug("Telegram alert skipped — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured")
+        return
+    try:
+        payload = json.dumps({"chat_id": _TELEGRAM_CHAT_ID, "text": text}).encode()
+        url = f"https://api.telegram.org/bot{_TELEGRAM_TOKEN}/sendMessage"
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)  # noqa: S310
+        logger.info("Telegram alert sent: %s", text[:60])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Telegram alert delivery failed: %s", exc)
+
+
+def _broadcast(subject: str, html: str, brief: str | None = None) -> None:
+    """Send to all configured transports. brief is the Telegram plain-text message;
+    defaults to subject when not provided."""
+    _send(subject, html)
+    _send_telegram(brief if brief is not None else subject)
 
 
 def _now() -> str:
@@ -85,7 +107,7 @@ def alert_buy(
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"BUY {ticker}: {shares} shares @ ${price:.2f} (${total:,.0f}) [{strategy}]")
 
 
 def alert_option_buy(
@@ -114,7 +136,7 @@ def alert_option_buy(
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"OPTIONS BUY {contract_symbol} ({underlying}): {contracts}x @ ${premium:.2f} (${total:,.0f}) [{strategy}]")
 
 
 def alert_circuit_breaker(reason: str, equity: float = 0.0) -> None:
@@ -131,7 +153,7 @@ def alert_circuit_breaker(reason: str, equity: float = 0.0) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"CIRCUIT BREAKER: {reason[:120]}")
 
 
 def alert_profit_locked(equity: float, gain: float) -> None:
@@ -148,7 +170,7 @@ def alert_profit_locked(equity: float, gain: float) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"PROFIT LOCKED: +${gain:,.2f} today | equity ${equity:,.2f}")
 
 
 def alert_daily_summary(equity: float, realized_pnl: float, open_positions: int) -> None:
@@ -167,7 +189,7 @@ def alert_daily_summary(equity: float, realized_pnl: float, open_positions: int)
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"DAILY: {sign}${realized_pnl:,.2f} | equity ${equity:,.2f} | {open_positions} open")
 
 
 def alert_signal_uplift_summary(lines: list[str]) -> None:
@@ -187,7 +209,8 @@ def alert_signal_uplift_summary(lines: list[str]) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    brief_lines = "\n".join(lines[:5]) or "No signal data yet."
+    _broadcast(subject, html, f"SIGNAL REPORT ({len(lines)} signals):\n{brief_lines}")
 
 
 def alert_startup(equity: float, env: str) -> None:
@@ -203,7 +226,7 @@ def alert_startup(equity: float, env: str) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"ENGINE STARTED: {env.upper()} | equity ${equity:,.2f}")
 
 
 def alert_crash(exc: str) -> None:
@@ -217,7 +240,7 @@ def alert_crash(exc: str) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"ENGINE CRASHED: {exc[:200]}")
 
 
 def alert_zero_buy_streak(strategy: str, streak: int) -> None:
@@ -236,7 +259,7 @@ def alert_zero_buy_streak(strategy: str, streak: int) -> None:
       Trading Engine · Raspberry Pi · SiddharthUIgupta/trading-engine
     </p>
     """
-    _send(subject, html)
+    _broadcast(subject, html, f"SILENT ENGINE: {strategy} — 0 buys for {streak} sessions")
 
 
 def ping_heartbeat(job_name: str) -> None:

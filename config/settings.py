@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # --- Finnhub (financial news) ---
     finnhub_api_key: str = Field(default="", alias="FINNHUB_API_KEY")
 
+    # --- Telegram alerts ---
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+
     # --- Alpaca ---
     alpaca_api_key: str = Field(default="", alias="ALPACA_API_KEY")
     alpaca_secret_key: str = Field(default="", alias="ALPACA_SECRET_KEY")
@@ -93,6 +97,12 @@ class Settings(BaseSettings):
     filter_sentiment_abs_threshold: float = Field(default=0.3, alias="FILTER_SENTIMENT_ABS_THRESHOLD")
     filter_recent_filing_days: int = Field(default=3, alias="FILTER_RECENT_FILING_DAYS")
 
+    # --- Static watchlist supplement ---
+    # Env-configurable tickers appended to the dynamic discovery universe.
+    # Comma-separated: EXTRA_WATCHLIST_TICKERS=AAPL,MSFT,NVDA
+    # Default is empty — universe comes from OpenBB screens per CLAUDE.md invariant.
+    extra_watchlist_tickers: list[str] = Field(default_factory=list, alias="EXTRA_WATCHLIST_TICKERS")
+
     # --- Dynamic universe (replaces a fixed watchlist) ---
     # Built daily from OpenBB's active/gainers/losers discovery screens
     # instead of a fixed ticker list. prerank_limit bounds how many raw
@@ -117,7 +127,7 @@ class Settings(BaseSettings):
     # --- ORB equity track ---
     # Disabled: backtest shows 46% win rate / -0.07% avg return (negative before slippage).
     # All intraday capital is redirected to thesis track.
-    orb_equity_enabled: bool = Field(default=True, alias="ORB_EQUITY_ENABLED")
+    orb_equity_enabled: bool = Field(default=False, alias="ORB_EQUITY_ENABLED")
 
     # --- Lesson injection freeze ---
     # When True, past lessons are NOT injected into LLM consensus prompts.
@@ -296,7 +306,7 @@ class Settings(BaseSettings):
     # ORB is an intraday signal but we were holding 30-45 DTE contracts. The
     # intraday exit (OPTIONS_INTRADAY_STOP_PCT) partially fixes this, but the
     # core edge is weak. Re-enable only with a clear backtested thesis.
-    options_track_enabled: bool = Field(default=True, alias="OPTIONS_TRACK_ENABLED")
+    options_track_enabled: bool = Field(default=False, alias="OPTIONS_TRACK_ENABLED")
     # 30-45 DTE for swing trading: gives the trade room to work over days
     # without being destroyed by theta in the final week. Previously 5-10
     # DTE which was essentially a same-week lottery ticket.
@@ -360,6 +370,13 @@ class Settings(BaseSettings):
     # downgraded to IRON_CONDOR in the greeks_risk_node before execution.
     vol_options_allow_uncovered: bool = Field(default=False, alias="VOL_OPTIONS_ALLOW_UNCOVERED")
     vol_options_uncovered_confirm: str = Field(default="", alias="VOL_OPTIONS_UNCOVERED_CONFIRM")
+
+    @field_validator("extra_watchlist_tickers", mode="before")
+    @classmethod
+    def _parse_csv_tickers(cls, v: object) -> list[str]:
+        if isinstance(v, str):
+            return [t.strip().upper() for t in v.split(",") if t.strip()]
+        return v  # type: ignore[return-value]
 
     @field_validator("max_position_size_pct", "max_daily_drawdown_pct", "options_max_risk_pct", "options_stop_loss_pct", "vol_options_max_risk_pct", "vol_options_profit_target_pct", "exit_trailing_stop_activation_pct", "exit_trailing_stop_pct", "exit_stop_loss_pct", "vol_universe_max_spread_pct", "intraday_capital_pct", "options_capital_pct", "thesis_capital_pct", "swing_capital_pct", "swing_stop_loss_pct", "swing_trailing_stop_pct", "swing_trailing_stop_activation_pct")
     @classmethod

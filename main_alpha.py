@@ -43,18 +43,12 @@ from anthropic import Anthropic
 from config.settings import get_settings
 from data_layer.openbb_client import OpenBBDataClient
 from execution_layer.broker import AlpacaBroker
-from execution_layer.guardrails import RobustCircuitBreaker
+from execution_layer.guardrails import GlobalRiskState, RobustCircuitBreaker
 from execution_layer.state_store import StateStore
 from execution_layer.alpha_plane import AlphaRuntime
 from execution_layer import alerting
 
 ET = "America/New_York"
-
-WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "SPY", "QQQ", "AMZN", "META", "TSLA",
-    # Added 2026-07-06, Sid's watch list from an external source (not a discovery screen).
-    "SHAZ", "NNBR", "LAES", "WULF", "MARA",
-]
 
 settings = get_settings()
 state_store = StateStore(settings.state_db_path)
@@ -62,12 +56,18 @@ broker = AlpacaBroker.from_settings(settings)
 anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
 data_client = OpenBBDataClient(pat=settings.openbb_pat or None)
 
+global_risk_state = GlobalRiskState(
+    max_weekly_drawdown_pct=settings.max_weekly_drawdown_pct,
+    max_trailing_drawdown_pct=settings.max_trailing_drawdown_pct,
+)
+
 intraday_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
     max_daily_drawdown_pct=settings.max_daily_drawdown_pct,
     capital_limit_pct=settings.intraday_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="intraday",
+    global_state=global_risk_state,
 )
 options_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -75,6 +75,7 @@ options_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.options_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="options",
+    global_state=global_risk_state,
 )
 thesis_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -82,6 +83,7 @@ thesis_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.thesis_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="thesis",
+    global_state=global_risk_state,
 )
 swing_breaker = RobustCircuitBreaker(
     max_position_size_pct=settings.max_position_size_pct,
@@ -89,9 +91,10 @@ swing_breaker = RobustCircuitBreaker(
     capital_limit_pct=settings.swing_capital_pct,
     daily_profit_target_usd=settings.daily_profit_target_usd,
     name="swing",
+    global_state=global_risk_state,
 )
 
-watchlist = WATCHLIST
+watchlist = settings.extra_watchlist_tickers
 
 runtime = AlphaRuntime(
     settings=settings,

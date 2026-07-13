@@ -1106,15 +1106,26 @@ class ProtectionRuntime:
                     ]
                     break
 
+            regime_at_entry = self._state_store.get_entry_regime(ticker) or "unknown"
+
+            # VW learns track×regime from every trade, even when no agent signals are
+            # available (e.g. legacy trades, manual entries). Full agent features are
+            # added when signals are present; context-only features are used otherwise.
+            self._vw_bandit.learn(
+                track=strategy,
+                regime=regime_at_entry,
+                signals=agent_signals,
+                pnl=pnl,
+            )
+
             if not agent_signals:
-                logger.debug("_run_reflection: no BUY run found for %s — skipping", ticker)
+                logger.debug("_run_reflection: no BUY run found for %s — skipping reflection", ticker)
                 return
 
             buy_payload = next(
                 (r["payload"] for r in runs if r["payload"].get("proposal", {}).get("action") == "BUY"),
                 {},
             )
-            regime_at_entry = self._state_store.get_entry_regime(ticker) or "unknown"
             market_context = {
                 "strategy": strategy,
                 "regime_at_entry": regime_at_entry,
@@ -1144,10 +1155,6 @@ class ProtectionRuntime:
             )
             self._state_store.score_agent_signals(ticker, pnl)
             self._state_store.score_lesson_injections(ticker, pnl)
-            if agent_signals:
-                self._vw_bandit.learn(
-                    track=strategy, regime=regime_at_entry, signals=agent_signals, pnl=pnl,
-                )
 
             strategy_breaker = (
                 self._intraday_breaker if strategy in _INTRADAY_STRATEGIES
