@@ -8,21 +8,72 @@ This section is the starting context for new sessions. Read it before anything e
 
 ### System overview
 
-This is one of 5 integrated repos at `~/Projects/`. They are **not independent** — the goal is to wire them together into a single AI-driven trading loop:
+This is a 5-repo integrated AI trading system. The repos are **not independent** — they form a research-to-execution-to-memory loop. Do not treat them as isolated projects.
 
 ```
-claude-obsidian  →  Vibe-Trading  →  trading-engine  →  Telegram alerts
-      ↑                                     ↓
-      └──────── trade post-mortems ←─────────┘
+claude-obsidian ──► Vibe-Trading ──► trading-engine ──► Telegram alerts
+      ▲                                     │
+      └──────── trade post-mortems ◄────────┘
+claudian (role TBD — investigate on first Pi session)
 ```
 
-| Repo | Path | Source | Role | Status |
-|------|------|--------|------|--------|
-| trading-engine | `~/Projects/trading-engine` | SiddharthUIgupta/trading-engine | Live executor (Pi) | Paper trading, STOPPED |
-| Vibe-Trading | `~/Projects/Vibe-Trading` | HKUDS/Vibe-Trading | Research / backtest lab, 460 alpha factors | NOT configured (no API keys yet) |
-| claudian | `~/Projects/claudian` | YishenTu/claudian | Claude agent framework | NOT wired yet |
-| claude-obsidian | `~/Projects/claude-obsidian` | AgriciDaniel/claude-obsidian | Knowledge wiki (/autoresearch, BM25 retrieval) | NOT wired to trading |
-| cpr-compress-preserve-resume | `~/Projects/cpr-compress-preserve-resume` | EliaAlberti/cpr-compress-preserve-resume | Session context preservation (/preserve /compress /resume) | Installed here (see `.claude/commands/`) |
+**Goal:** Vibe-Trading researches and validates alpha factors → trading-engine executes trades using those factors via the VW bandit → every closed trade writes a post-mortem to claude-obsidian → the wiki feeds context back into the Risk Officer's LLM prompt → loop closes.
+
+---
+
+### What each repo does
+
+**trading-engine** (`~/Projects/trading-engine`) — *this repo, the live executor*
+- Two-plane architecture: Alpha Plane (scans + LLM consensus + order intent writes) + Protection Plane (exits + brackets + reconciliation)
+- IPC via SQLite WAL — Alpha writes `order_intents` table, Protection reads and executes
+- 4-agent LLM consensus: sentiment + fundamental + technical analysts + Risk Officer (Claude Sonnet)
+- VW bandit (`analyst_layer/vw_bandit.py`): online contextual bandit learning `track × regime × agent_votes → win_probability`. Currently has 0 examples (fixed in Phase 1 — needs warmup run)
+- Strategies: thesis (PF 1.49 — only one with real edge), swing, recovery, ORB equity (disabled, PF 0.92), options (disabled, 30 losses)
+- Broker: Alpaca paper/live. DB: `state/trading_engine.sqlite3`
+- Services on Pi: `trading-engine-alpha` and `trading-engine-protection` (systemd)
+
+**Vibe-Trading** (`~/Projects/Vibe-Trading`) — *research and backtest lab*
+- Source: `HKUDS/Vibe-Trading`, install as package: `pip install vibe-trading-ai` (NOT `pip install -e .`)
+- **460 pre-built alpha factors** grouped as: alpha101 (Qlib — 101 price/volume), gtja191 (GTJA — 191 factors), qlib158 (quant lib academic), and additional academic set. All point-in-time safe.
+- **Alpha bench**: `from src.tools.alpha_bench_tool import run_alpha_bench` — call with `(universe=tickers, start=..., end=...)`, returns list of `{factor_id, ic, n}` rows. IC = Spearman correlation of factor rank vs next-day return.
+- **Factor compute pattern**: `Registry().compute(alpha_id, panel)` where `panel = {ticker: OHLCV_DataFrame}`. Returns a DataFrame indexed by date with ticker columns. Find `Registry` class with: `grep -r "class Registry" ~/Projects/Vibe-Trading/src/`
+- **Multi-agent swarm**: natural-language research goals run by an investment committee agent
+- **MCP server**: `vibe-trading-mcp` (stdio), 54+ tools — can be added to `.mcp.json` for use in Claude Code sessions
+- CLI: `vibe-trading` (interactive REPL), `vibe-trading serve --port 8899` (web UI at localhost:8899)
+- Config search order: `~/.vibe-trading/.env` → `agent/.env` → `$CWD/.env`. Interactive setup: `vibe-trading init`
+- Needs: `ANTHROPIC_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`
+- **Integration point with trading-engine**: promoted factor values → `|factors` namespace in `vw_bandit.py`'s `_full_features()`. See Phase 2 for exact implementation.
+- **IC threshold for promotion**: Spearman IC > 0.03 at n≥300 → candidate. Below n=300 = "insufficient sample" — no conclusions. See signal lifecycle rules below.
+
+**claude-obsidian** (`~/Projects/claude-obsidian`) — *persistent knowledge wiki with hybrid retrieval*
+- Source: `AgriciDaniel/claude-obsidian` — self-organizing Obsidian vault + Claude Code plugin
+- Ingests any source document → extracts concepts/entities → builds cross-linked wiki in `wiki/`
+- **Vault structure**: `.raw/` (drop source docs here), `wiki/` (auto-generated pages), `.vault-meta/bm25/` (search index). Read `wiki/hot.md` first, then `wiki/index.md`, then domain `_index.md` files.
+- **Hybrid retrieval API** (the key integration): `python3 scripts/retrieve.py "your query"` → JSON: `{"candidates": [{"page_path": "wiki/...", "snippet": "..."}]}`. Combines BM25 keyword match with cosine semantic rerank. Top-K=3 is the sweet spot for LLM context injection.
+- **Setup (one-time on Pi)**:
+  ```bash
+  cd ~/Projects/claude-obsidian
+  bash bin/setup-vault.sh       # configures Obsidian vault symlinks
+  bash bin/setup-retrieve.sh    # builds BM25 index from wiki/ content
+  ```
+- **Re-index after adding pages**: run `bash bin/setup-retrieve.sh` again (fast, incremental)
+- **Skills available inside the claude-obsidian directory**: `/wiki` (scaffold new topic), `/autoresearch [topic]` (3-round web research → files in wiki), `/wiki-retrieve` (ad-hoc search), `/think`, `/canvas`
+- **Integration point with trading-engine**:
+  - Risk Officer prompt enrichment: `scripts/retrieve.py "TICKER SECTOR REGIME"` → prepend top-3 snippets to Risk Officer system prompt at `analyst_layer/agents/risk_officer_agent.py:44`
+  - Post-mortem ingest: after each closed trade, write a markdown file to `vaults/trading/postmortems/TICKER-DATE.md` → BM25 index picks it up → future trades in the same setup get the memory
+  - See Phase 3 for exact implementation.
+
+**claudian** (`~/Projects/claudian`) — *unknown — investigate on first Pi session*
+- Source: `YishenTu/claudian` — not yet cloned on Mac, role not yet determined
+- **First action on Pi**: `cat ~/Projects/claudian/README.md` — read it, understand what it does, then update this CLAUDE.md section via `/preserve` with what you learned and where it fits in the integration plan
+
+**cpr-compress-preserve-resume** (`~/Projects/cpr-compress-preserve-resume`) — *session context preservation*
+- Source: `EliaAlberti/cpr-compress-preserve-resume`
+- Already installed in this repo as `.claude/commands/` — gives you `/compress`, `/preserve`, `/resume`
+- **Use at end of every Pi session**: run `/compress` to save full session log to `CC-Session-Logs/`, then `/preserve` to update this CLAUDE.md with what changed. Next session starts with full context.
+- `/resume` loads the most recent session log back into context when starting fresh
+
+---
 
 ### Phase 1 — COMPLETE (committed 2026-07-12, commit 8fafd44)
 
@@ -67,21 +118,268 @@ sudo systemctl restart trading-engine-alpha trading-engine-protection
 
 ### Phase 2 — Next (NOT started)
 
-Goal: connect the research layer so Vibe-Trading's 460 alpha factors feed the VW bandit as richer features.
+**Why:** The VW bandit currently learns from only 3 feature namespaces: `track`, `regime`, and `agent_votes`. These are high-level categorical signals. Vibe-Trading has 460 pre-built quantitative alpha factors (momentum, reversal, vol-adjusted, cross-sectional rank) that are point-in-time safe. Adding these as VW feature namespaces gives the bandit richer context → better win-probability estimates → less Kelly-size waste on low-confidence setups. The alpha bench step ensures we only promote factors with proven IC on our actual thesis universe, satisfying the "no strategy without a backtest artifact" invariant.
 
-1. **Configure Vibe-Trading**: copy API keys into `~/Projects/Vibe-Trading/.env` (Alpaca, Anthropic, Finnhub). Run `pip install -e .` in that repo.
-2. **Factor provider bridge**: create `analyst_layer/factor_provider.py` — thin wrapper that calls `Registry().compute(alpha_id, panel)` from Vibe-Trading and returns a feature dict for the VW bandit's `_full_features()`.
-3. **Enrich VW features**: in `vw_bandit.py`, call `factor_provider` in `_full_features()` to add e.g. `alpha101_001`, `gtja191_030`, `qlib158_vol` as VW namespace features.
-4. **Run alpha bench on thesis universe**: use Vibe-Trading's backtest CLI to identify which of the 460 factors have Spearman IC > 0.03 on the thesis universe — these become the promoted feature set.
-5. **VW `predict_full` → sizing**: `predict_full()` currently returns a win probability but the result is never used for sizing. Wire it: pass `vw_prob` to the Kelly sizing formula in `alpha_plane.py` as a multiplier cap (e.g. `kelly_size * min(1.0, vw_prob / 0.55)`).
+**Pre-conditions:** Phase 1 complete. VW bandit has ≥20 examples (after warmup script). At least 100 closed thesis trades in the ledger.
+
+**Step 1 — Install and configure Vibe-Trading on Pi**
+
+```bash
+# Install as pip package (do NOT pip install -e . — the package is on PyPI)
+cd ~/Projects/Vibe-Trading
+~/Projects/trading-engine/.venv/bin/pip install vibe-trading-ai
+
+# Interactive setup — writes keys to ~/.vibe-trading/.env
+vibe-trading init
+# Prompts for: ANTHROPIC_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY, FINNHUB_API_KEY
+# Keys must also exist in ~/Projects/trading-engine/.env (already set for the engine)
+
+# Verify install
+vibe-trading --help    # should print CLI help
+```
+
+**Step 2 — Discover which factors have edge on thesis universe**
+
+Run the alpha bench against the thesis universe (100+ closed trade tickers). This step determines the `PROMOTED_FACTORS` list used in Step 4.
+
+```bash
+# Run bench from Vibe-Trading repo (use trading-engine .venv which has the package)
+cd ~/Projects/Vibe-Trading
+~/Projects/trading-engine/.venv/bin/python - <<'EOF'
+from src.tools.alpha_bench_tool import run_alpha_bench
+# thesis_universe: list of tickers from your closed trades
+# Fetch from DB: SELECT DISTINCT ticker FROM realized_sales
+import sqlite3
+conn = sqlite3.connect("/home/sid/Projects/trading-engine/state/trading_engine.sqlite3")
+tickers = [r[0] for r in conn.execute("SELECT DISTINCT ticker FROM realized_sales").fetchall()]
+conn.close()
+
+# IC threshold: Spearman IC > 0.03 at n≥300 = candidate for promotion
+results = run_alpha_bench(universe=tickers, start="2024-01-01", end="2025-12-31")
+# Print factors above threshold
+for row in results:
+    if row["ic"] > 0.03 and row["n"] >= 300:
+        print(row["factor_id"], row["ic"])
+EOF
+```
+Copy the printed factor IDs — these become `PROMOTED_FACTORS` in `settings.py`.
+
+**Step 3 — Add promoted_factors setting to settings.py**
+
+In `config/settings.py`, add alongside the other fields:
+```python
+promoted_vw_factors: list[str] = Field(
+    default_factory=list, alias="PROMOTED_VW_FACTORS"
+)
+
+@field_validator("promoted_vw_factors", mode="before")
+@classmethod
+def _parse_csv_factors(cls, v: object) -> list[str]:
+    if isinstance(v, str):
+        return [f.strip() for f in v.split(",") if f.strip()]
+    return v
+```
+Then add to `.env`: `PROMOTED_VW_FACTORS=alpha101_001,gtja191_030,...` (from Step 2 output).
+
+**Step 4 — Create factor_provider.py**
+
+Create `analyst_layer/factor_provider.py`:
+```python
+from __future__ import annotations
+import logging, sys
+from pathlib import Path
+import pandas as pd
+
+_VIBE_PATH = Path.home() / "Projects" / "Vibe-Trading"
+_log = logging.getLogger(__name__)
+
+def compute_factor_features(ticker: str, factor_ids: list[str]) -> dict[str, float]:
+    """Returns {factor_id: latest_value} for each promoted factor. Empty dict on failure."""
+    if not factor_ids or not (_VIBE_PATH / "src").exists():
+        return {}
+    try:
+        sys.path.insert(0, str(_VIBE_PATH))
+        from src.alpha.factor_registry import Registry  # confirmed location in Vibe-Trading repo
+        reg = Registry()
+        # panel = {ticker: OHLCV DataFrame for last 252 trading days}
+        # Vibe-Trading's data adapters wrap yfinance — use the same period as backtest
+        import yfinance as yf
+        raw = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
+        panel = {ticker: raw}
+        out: dict[str, float] = {}
+        for fid in factor_ids:
+            try:
+                result: pd.DataFrame = reg.compute(fid, panel)
+                latest = float(result[ticker].dropna().iloc[-1])
+                out[fid] = latest
+            except Exception as exc:
+                _log.debug("factor %s failed for %s: %s", fid, ticker, exc)
+        return out
+    except Exception as exc:
+        _log.warning("factor_provider unavailable: %s", exc)
+        return {}
+```
+If the exact import path `src.alpha.factor_registry.Registry` doesn't exist, run `grep -r "class Registry" ~/Projects/Vibe-Trading/` to find it before writing this file.
+
+**Step 5 — Enrich VW bandit features in vw_bandit.py**
+
+In `analyst_layer/vw_bandit.py`, find the `_full_features()` method. Add a `|factors` namespace after the existing namespaces:
+
+```python
+# At top of vw_bandit.py — add import
+from analyst_layer.factor_provider import compute_factor_features
+
+# Inside _full_features(self, ctx: dict) — add AFTER existing namespaces:
+promoted = getattr(settings, "promoted_vw_factors", [])
+if promoted:
+    factor_vals = compute_factor_features(ctx.get("ticker", ""), promoted)
+    if factor_vals:
+        factor_ns = " ".join(f"{k}:{v:.4f}" for k, v in factor_vals.items())
+        vw_str += f" |factors {factor_ns}"
+```
+This adds a `|factors` VW namespace with the promoted factor values. VW learns weights per feature automatically.
+
+**Step 6 — Wire vw_prob into Kelly sizing (alpha_plane.py)**
+
+In `main_alpha.py` or `alpha_plane.py`, find where `vw_bandit.predict_full(ctx)` is called and where Kelly fraction is computed. Currently `predict_full()` is called but the result is unused for sizing. The change:
+
+```python
+# After vw_bandit.predict_full(ctx):
+vw_prob = vw_bandit.predict_full(ctx)  # 0.0–1.0 win probability
+
+# Find the kelly fraction calculation (grep for "kelly" in alpha_plane.py / main_alpha.py)
+# Add a multiplier cap so low-confidence VW predictions reduce size:
+# If vw_prob < 0.50 → scale down; vw_prob ≥ 0.55 → full Kelly
+VW_CONFIDENCE_THRESHOLD = 0.55
+kelly_fraction = kelly_fraction * min(1.0, vw_prob / VW_CONFIDENCE_THRESHOLD)
+# Log this so we can audit it: logger.info("VW prob %.2f → kelly scale %.2f", vw_prob, ...)
+```
+Do NOT implement this step until ≥300 closed trades exist and `scripts/signal_uplift.py` shows VW features have edge. Until then, `predict_full()` runs in shadow mode (logged but not used). This is the "shadow first" invariant.
+
+---
 
 ### Phase 3 — Future
 
-Goal: close the knowledge loop — trade outcomes feed back into the research base.
+**Why:** The Risk Officer makes decisions in a vacuum. It doesn't know that the last 4 times we bought MSFT in a bull regime at resistance, we got stopped out. claude-obsidian is a hybrid-retrieval knowledge system that builds a searchable wiki from trade post-mortems. By wiring it into the Risk Officer system prompt, the LLM gets memory of prior trades in the same setup — reducing repeated mistakes. This closes the loop: live trades → markdown post-mortems → BM25 index → LLM context → better decisions.
 
-1. **Trading vault in claude-obsidian**: create `~/Projects/claude-obsidian/vaults/trading/` with strategy pages and a post-mortem template.
-2. **Auto post-mortem ingest**: after `_run_reflection()` completes, write a markdown post-mortem to the vault (ticker, entry/exit, regime, what the agents said, P&L). Claude-obsidian's BM25 index will pick it up.
-3. **Wiki-retrieve in Risk Officer prompt**: before consensus, call `scripts/retrieve.py "ticker sector regime"` from the claude-obsidian repo and prepend the top-3 results to the Risk Officer system prompt. This gives the LLM memory of prior trades in the same setup.
+**Why claudian matters here (TBD):** YishenTu/claudian's role is not yet known. It may be a Claude agent orchestration framework that could replace or augment the 4-agent consensus. Investigate before Phase 3 begins.
+
+**Pre-conditions:** claude-obsidian cloned on Pi. At least 50 closed trades exist (enough post-mortems to make retrieval useful).
+
+**Step 1 — Set up claude-obsidian trading vault**
+
+```bash
+cd ~/Projects/claude-obsidian
+
+# One-time Obsidian config setup (creates .obsidian/ symlinks)
+bash bin/setup-vault.sh
+
+# One-time BM25 index build (run again after adding new pages)
+bash bin/setup-retrieve.sh
+
+# Create the trading vault directory
+mkdir -p vaults/trading/postmortems
+
+# Test retrieval works
+python3 scripts/retrieve.py "MSFT thesis bull"
+# Should return JSON: {"candidates": [{"page_path": "...", "snippet": "..."}]}
+```
+
+**Step 2 — Auto post-mortem writer in protection_plane.py**
+
+In `execution_layer/protection_plane.py`, find `_run_reflection()` — the method called after a position closes to extract lessons. After it runs, add a call to write a structured markdown post-mortem:
+
+Create helper `execution_layer/postmortem_writer.py`:
+```python
+from __future__ import annotations
+import logging, subprocess
+from datetime import date
+from pathlib import Path
+
+_VAULT = Path.home() / "Projects" / "claude-obsidian" / "vaults" / "trading" / "postmortems"
+_RETRIEVE_SCRIPT = Path.home() / "Projects" / "claude-obsidian" / "scripts" / "retrieve.py"
+_log = logging.getLogger(__name__)
+
+def write_postmortem(
+    ticker: str, strategy: str, regime: str,
+    entry: float, exit: float, pnl: float,
+    agent_stances: dict[str, str],  # {"sentiment": "BUY", "risk_officer": "PASS"}
+    lessons: list[str],
+) -> None:
+    if not _VAULT.exists():
+        return  # vault not set up — skip silently
+    date_str = date.today().isoformat()
+    outcome = "WIN" if pnl > 0 else "LOSS"
+    md = [
+        f"# {ticker} {date_str} {outcome}",
+        f"\nStrategy: {strategy}  Regime: {regime}",
+        f"Entry: {entry:.2f}  Exit: {exit:.2f}  PnL: {pnl:+.2f}",
+        "\n## Agent stances",
+        *[f"- {agent}: {stance}" for agent, stance in agent_stances.items()],
+        "\n## Lessons",
+        *[f"- {l}" for l in lessons],
+    ]
+    path = _VAULT / f"{ticker}-{date_str}.md"
+    path.write_text("\n".join(md))
+    _log.info("post-mortem written: %s", path)
+    # Re-index BM25 so retrieval picks up the new page immediately
+    try:
+        subprocess.run(["python3", str(_RETRIEVE_SCRIPT.parent.parent / "bin" / "index.py")],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass  # index update is best-effort; retrieval still works on next full re-index
+```
+
+In `protection_plane.py`, after `self._run_reflection(ticker, ...)`, add:
+```python
+from execution_layer.postmortem_writer import write_postmortem
+write_postmortem(
+    ticker=ticker, strategy=position.strategy, regime=current_regime,
+    entry=position.avg_entry_price, exit=exit_price, pnl=realized_pnl,
+    agent_stances=agent_stances_at_entry,  # store these on the position when entering
+    lessons=extracted_lessons,
+)
+```
+
+**Step 3 — Wiki-retrieve in Risk Officer system prompt**
+
+In `analyst_layer/agents/risk_officer_agent.py`, `def system_prompt(self)` starts at line 44. Add a retrieval call before assembling the prompt:
+
+```python
+import subprocess, json
+from pathlib import Path
+
+def _fetch_trade_memory(ticker: str, sector: str, regime: str) -> str:
+    script = Path.home() / "Projects" / "claude-obsidian" / "scripts" / "retrieve.py"
+    if not script.exists():
+        return ""
+    try:
+        query = f"{ticker} {sector} {regime} trade setup"
+        r = subprocess.run(["python3", str(script), query],
+                           capture_output=True, text=True, timeout=5)
+        candidates = json.loads(r.stdout).get("candidates", [])[:3]
+        if not candidates:
+            return ""
+        snippets = "\n---\n".join(c["snippet"] for c in candidates)
+        return f"\n\n## Prior trade memory (similar setups)\n{snippets}"
+    except Exception:
+        return ""
+
+# In system_prompt(self):
+memory_context = _fetch_trade_memory(self.ticker, self.sector, self.regime)
+# Prepend to the existing prompt text — before the "You are the Risk Officer" block
+return memory_context + existing_prompt_text
+```
+
+**Step 4 — Investigate claudian and update plan**
+
+```bash
+cat ~/Projects/claudian/README.md
+# Read it. Determine: is it an agent SDK, a Claude wrapper, a UI framework?
+# Then run /preserve to update this CLAUDE.md section with what it does and where it fits.
+```
+
+If claudian turns out to be an agent orchestration layer, it may be able to replace the manual 4-agent loop in `analyst_layer/` — but do not integrate until you fully understand its threading/async model and confirm it doesn't violate the "Protection never imports LLM clients" invariant.
 
 ### Key architecture facts (do not re-derive without reading the code)
 
