@@ -148,6 +148,10 @@ class AlphaRuntime:
         existing_tickers = {p["ticker"] for p in state_store.get_positions() if p["quantity"] > 0}
         self._scanned_tickers_today: set[str] = set(existing_tickers)
         self._executed_tickers_today: set[str] = set(existing_tickers)
+        # Factor-driven direction override: "bullish" → calls, "bearish" → puts.
+        # Set by _build_thesis_candidates for bottom-ranked (short) candidates.
+        # Takes priority over market_trend and stock momentum in _open_directional_option.
+        self._factor_directions: dict[str, str] = {}
 
         today_str = date.today().isoformat()
         for run in state_store.get_run_history(limit=100):
@@ -228,7 +232,6 @@ class AlphaRuntime:
                             breaker.name, ticker, breaker.is_stock_halted, db_halted, globally_halted, global_reason)
                 continue
 
-            self._executed_tickers_today.add(ticker)
             if not payload.is_executable:
                 logger.info("%s: not executable (verdict=%s) — skipping.", ticker, payload.risk_review.verdict.value)
                 continue
@@ -251,20 +254,33 @@ class AlphaRuntime:
                 logger.error("Circuit breaker blocked intent for %s: %s", ticker, exc)
                 continue
 
-            # Write intent for Protection to execute
-            from execution_layer.broker import _order_id
-            client_order_id = _order_id(today.isoformat(), ticker, proposal.action.value, str(proposal.quantity))
-            self._state_store.write_order_intent(
-                client_order_id=client_order_id,
-                strategy=strategy,
-                ticker=ticker,
-                action=proposal.action.value,
-                quantity=proposal.quantity,
-                limit_price=proposal.limit_price,
-                stop_price=None,  # Protection computes stop from settings
-            )
-            logger.info("%s: queued intent → Protection will submit (strategy=%s, qty=%d @ %.2f)",
-                        ticker, strategy, proposal.quantity, proposal.limit_price)
+            # Directional options mode: buy calls/puts on the thesis-screened stock
+            # instead of equity. _open_directional_option handles the executed mark.
+            if (
+                self._settings.directional_options_enabled
+                and strategy in _THESIS_STRATEGIES
+                and proposal.action == Action.BUY
+            ):
+                market_trend = (self._daily_regime.market_trend if self._daily_regime else "neutral")
+                self._open_directional_option(ticker, market_trend, equity, today)
+            else:
+                # Mark executed only when we actually write an order intent — HOLD verdicts
+                # must not block the same ticker from buying on a subsequent scan today.
+                self._executed_tickers_today.add(ticker)
+                # Write intent for Protection to execute
+                from execution_layer.broker import _order_id
+                client_order_id = _order_id(today.isoformat(), ticker, proposal.action.value, str(proposal.quantity))
+                self._state_store.write_order_intent(
+                    client_order_id=client_order_id,
+                    strategy=strategy,
+                    ticker=ticker,
+                    action=proposal.action.value,
+                    quantity=proposal.quantity,
+                    limit_price=proposal.limit_price,
+                    stop_price=None,  # Protection computes stop from settings
+                )
+                logger.info("%s: queued intent → Protection will submit (strategy=%s, qty=%d @ %.2f)",
+                            ticker, strategy, proposal.quantity, proposal.limit_price)
 
             if proposal.action == Action.BUY and strategy in _THESIS_STRATEGIES:
                 self._thesis_session_buys += 1
@@ -718,6 +734,10 @@ class AlphaRuntime:
             return
 
         if scan == "thesis":
+            # Manual re-trigger: clear today's scan history so all candidates
+            # are re-evaluated with current market conditions.
+            self._scanned_tickers_today.clear()
+            self._factor_directions.clear()
             self.thesis_scan_and_trade()
         elif scan == "swing":
             self.swing_scan_and_trade()
@@ -732,6 +752,30 @@ class AlphaRuntime:
         for ticker in candidates:
             self._scanned_tickers_today.add(ticker)
             self._pending_strategies[ticker] = strategy
+
+            # Fast liquidity gate: skip LLM entirely when no liquid options exist
+            # in our DTE window. Saves 4 LLM calls per illiquid ticker.
+            if (
+                self._settings.directional_options_enabled
+                and strategy in _THESIS_STRATEGIES
+            ):
+                try:
+                    chain = self._data_client.get_option_chain(ticker)
+                    s = self._settings
+                    liquid = [
+                        c for c in chain
+                        if s.directional_options_min_dte <= c.dte <= s.directional_options_max_dte
+                        and c.bid > 0 and c.ask > 0
+                    ]
+                    if not liquid:
+                        logger.info(
+                            "%s: no liquid options %d-%d DTE — skipping LLM.",
+                            ticker, s.directional_options_min_dte, s.directional_options_max_dte,
+                        )
+                        continue
+                except DataLayerError:
+                    pass  # chain fetch failed — let LLM run anyway
+
             try:
                 sentiment = self._data_client.get_sentiment(ticker)
                 fundamentals = self._data_client.get_fundamentals(ticker)
@@ -958,27 +1002,50 @@ class AlphaRuntime:
             logger.error("vol universe refresh failed — keeping existing universe: %s", exc)
 
     def _build_thesis_candidates(self, today: date, universe=None) -> list[str]:
+        from analyst_layer.factor_screen import rank_candidates
+
         source = universe or []
-        passed: list[tuple[str, float]] = []
-        for candidate in source:
-            symbol = candidate.symbol
-            if symbol in self._scanned_tickers_today:
+        top_n = self._settings.thesis_max_daily_candidates
+        short_n = max(top_n // 2, 5)  # half as many short candidates as long
+
+        # Stage 1: cheap pre-rank using data already in ThesisCandidate (no download).
+        # Take both top AND bottom of the MA50 distribution — top for long candidates,
+        # bottom for short candidates. Cap total at 150 so factor_screen download stays fast.
+        pre_rank_cap = max(top_n * 5, 100)
+        pre_scored: list[tuple[str, float]] = []
+        for c in source:
+            if c.symbol in self._scanned_tickers_today:
                 continue
-            signal = thesis_scanner.evaluate_thesis_candidate(
-                candidate,
-                self._settings.thesis_min_pullback_pct,
-                self._settings.thesis_max_pullback_pct,
-            )
-            if signal.passed:
-                logger.info("%s: thesis scan PASSED (%s)", symbol, "; ".join(signal.reasons))
-                passed.append((symbol, signal.score))
-        passed.sort(key=lambda pair: pair[1], reverse=True)
-        capped = [ticker for ticker, _ in passed[: self._settings.thesis_max_daily_candidates]]
+            if c.ma50 and c.ma50 > 0:
+                score = c.price / c.ma50
+            else:
+                score = c.price / c.year_low if c.year_low and c.year_low > 0 else 0.5
+            pre_scored.append((c.symbol, score))
+        pre_scored.sort(key=lambda x: x[1], reverse=True)
+        long_pool = [sym for sym, _ in pre_scored[:pre_rank_cap]]
+        short_pool = [sym for sym, _ in pre_scored[-pre_rank_cap:] if sym not in long_pool]
+        shortlist = long_pool + short_pool
+
+        # Stage 2: full factor ranking on the combined shortlist.
+        factor_ids = list(self._settings.promoted_vw_factors) or None
+        ranked = rank_candidates(shortlist, factor_ids=factor_ids, top_n=top_n, short_n=short_n)
+
+        # Register factor-driven directions so _open_directional_option uses them.
+        for ticker in ranked.longs:
+            self._factor_directions[ticker] = "bullish"
+        for ticker in ranked.shorts:
+            self._factor_directions[ticker] = "bearish"
+
+        all_candidates = ranked.longs + [t for t in ranked.shorts if t not in ranked.longs]
         self._state_store.record_event(
             event_type="thesis_scan_summary",
-            detail=f"passed={len(passed)}/{len(source)} thesis-universe candidates, capped to {len(capped)}",
+            detail=(
+                f"factor-ranked: {len(ranked.longs)} longs + {len(ranked.shorts)} shorts "
+                f"from {len(shortlist)} shortlist "
+                f"(factors={'Registry:' + ','.join(factor_ids) if factor_ids else 'local:mom20/vol_surge/risk_adj'})"
+            ),
         )
-        return capped
+        return all_candidates
 
     def _build_recovery_candidates(self, today: date, universe=None) -> list[str]:
         source = universe or []
@@ -1319,6 +1386,121 @@ class AlphaRuntime:
                 logger.info("PROFIT LOCK after options trade on %s, equity=%.2f", ticker, new_equity)
         except CircuitBreakerTripped as exc:
             logger.error("Circuit breaker blocked options order for %s: %s", ticker, exc)
+
+    def _stock_momentum_direction(self, ticker: str) -> Action | None:
+        """20-day return → BUY (calls) if positive, SELL (puts) if negative, None if flat (<2%)."""
+        try:
+            import yfinance as yf
+            raw = yf.download(ticker, period="2mo", auto_adjust=True, progress=False)
+            if raw is None or raw.empty or len(raw) < 21:
+                return None
+            mom20 = float(raw["Close"].iloc[-1] / raw["Close"].iloc[-21] - 1)
+            if mom20 > 0.02:
+                return Action.BUY
+            if mom20 < -0.02:
+                return Action.SELL
+            return None
+        except Exception as exc:
+            logger.debug("%s: momentum direction check failed: %s", ticker, exc)
+            return None
+
+    def _open_directional_option(
+        self, ticker: str, market_trend: str, equity: float, today: date
+    ) -> None:
+        """Regime-driven long call (bull) or put (bear) on a thesis-screened stock.
+
+        Called instead of write_order_intent when directional_options_enabled=True.
+        Uses 60-90 DTE to avoid theta decay. Sized at 1% equity risk per position.
+        """
+        s = self._settings
+        open_option_positions = len(self._state_store.get_option_positions())
+        if open_option_positions >= s.directional_options_max_positions:
+            logger.info(
+                "%s: directional options at cap (%d/%d) — skipping.",
+                ticker, open_option_positions, s.directional_options_max_positions,
+            )
+            return
+
+        # Factor-driven direction takes priority over market regime.
+        factor_dir = self._factor_directions.get(ticker)
+        if factor_dir == "bullish":
+            direction = Action.BUY
+        elif factor_dir == "bearish":
+            direction = Action.SELL
+        elif market_trend == "bullish":
+            direction = Action.BUY
+        elif market_trend == "bearish":
+            direction = Action.SELL
+        else:
+            # Neutral market: use stock's own 20-day momentum to pick direction.
+            direction = self._stock_momentum_direction(ticker)
+            if direction is None:
+                logger.info("%s: neutral regime + flat stock momentum — skipping.", ticker)
+                return
+            logger.info("%s: neutral regime → using stock momentum direction=%s", ticker, direction.value)
+
+        if factor_dir:
+            logger.info("%s: factor direction=%s overrides market_trend=%s", ticker, factor_dir, market_trend)
+
+        try:
+            chain = self._data_client.get_option_chain(ticker)
+        except DataLayerError as exc:
+            logger.error("%s: option chain fetch failed for directional options: %s", ticker, exc)
+            return
+
+        selection = options_structurer.select_contract(
+            chain, direction,
+            min_dte=s.directional_options_min_dte,
+            max_dte=s.directional_options_max_dte,
+        )
+        if not selection.selected:
+            logger.info("%s: no directional contract found (%s)", ticker, "; ".join(selection.reasons))
+            return
+
+        contract = selection.contract
+        max_risk_dollars = equity * s.directional_options_risk_pct
+        contracts = math.floor(max_risk_dollars / (contract.ask * 100)) if contract.ask > 0 else 0
+        if contracts <= 0:
+            logger.info(
+                "%s: directional option too expensive (ask=%.2f, risk_budget=%.0f) — skipping.",
+                ticker, contract.ask, max_risk_dollars,
+            )
+            return
+
+        try:
+            self._assert_not_globally_halted()
+            self._options_breaker.assert_options_trading_allowed()
+            result = self._broker.submit_option_order(
+                contract.contract_symbol, side=Action.BUY, contracts=contracts, limit_price=contract.ask
+            )
+            logger.info(
+                "%s: directional %s %s x%d @ %.2f → %s",
+                ticker, market_trend.upper(), contract.contract_symbol,
+                contracts, contract.ask, result.get("order_status", "unknown"),
+            )
+            self._state_store.record_event(
+                event_type="directional_option_buy",
+                detail=(
+                    f"{contract.contract_symbol}: {market_trend.upper()} "
+                    f"x{contracts} @ {contract.ask:.2f} dte={contract.dte}"
+                ),
+            )
+            detail = self._broker.get_position_detail(contract.contract_symbol)
+            qty = int(detail["qty"]) if detail else contracts
+            avg_price = detail["avg_entry_price"] if detail else contract.ask
+            self._state_store.upsert_option_position(
+                contract.contract_symbol, contract.underlying_symbol, contract.option_type.value,
+                contract.strike, contract.expiration.isoformat(), qty, avg_price,
+                opened_at=today.isoformat(),
+                strategy="directional_options",
+            )
+            alerting.alert_option_buy(
+                contract_symbol=contract.contract_symbol, underlying=contract.underlying_symbol,
+                contracts=qty, premium=avg_price, strategy="directional_options",
+            )
+            self._executed_tickers_today.add(ticker)
+        except CircuitBreakerTripped as exc:
+            logger.error("Circuit breaker blocked directional option for %s: %s", ticker, exc)
 
     def _fetch_vix_context(self, today: date) -> VixContext:
         try:
